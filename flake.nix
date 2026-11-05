@@ -11,7 +11,7 @@
   };
 
   outputs =
-    { nixpkgs, ... }:
+    { nixpkgs, crane, ... }:
     let
       system = "aarch64-darwin";
       overlay = import ./nix/overlay.nix;
@@ -19,9 +19,43 @@
         inherit system;
         overlays = [ overlay ];
       };
+      craneLib = crane.mkLib pkgs;
+      build = import ./nix/packages.nix { inherit pkgs craneLib; };
+      inherit (build) packages;
+
+      daemonApp =
+        cmd:
+        let
+          script = pkgs.writeShellApplication {
+            name = "daemon-${cmd}";
+            text = ''exec ${packages.default}/bin/plamo-translate daemon ${cmd} "$@"'';
+          };
+        in
+        {
+          type = "app";
+          program = "${script}/bin/daemon-${cmd}";
+          meta.description = "Run plamo-translate daemon ${cmd}";
+        };
     in
     {
       overlays.default = overlay;
+
+      packages.${system} = packages;
+
+      apps.${system} = nixpkgs.lib.genAttrs' [
+        "install"
+        "uninstall"
+        "start"
+        "stop"
+        "restart"
+        "status"
+        "logs"
+      ] (cmd: nixpkgs.lib.nameValuePair "daemon-${cmd}" (daemonApp cmd));
+
+      checks.${system} = import ./nix/checks.nix {
+        inherit craneLib packages;
+        inherit (build) cargoArgs cargoArtifacts;
+      };
 
       devShells.${system}.default = pkgs.mkShell {
         packages = [

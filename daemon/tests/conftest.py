@@ -1,6 +1,11 @@
+import shutil
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator
+from pathlib import Path
+
+import pytest
 
 from plamo_translated.engine import Engine, ProgressEvent
 from plamo_translated.protocol import DaemonError, TranslateRequest
@@ -62,3 +67,11 @@ class FakeEngine(Engine):
                 self.saw_cancel = True
                 return
             yield token
+
+
+# AF_UNIX paths must stay under 104 bytes; pytest's tmp_path (and the Nix build TMPDIR) can exceed that.
+@pytest.fixture
+def short_dir():
+    d = Path(tempfile.mkdtemp(prefix="pt", dir="/tmp"))
+    yield d
+    shutil.rmtree(d, ignore_errors=True)

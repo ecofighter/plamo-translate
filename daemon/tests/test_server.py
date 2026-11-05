@@ -17,9 +17,9 @@ _started: list[tuple[Server, asyncio.Task]] = []
 
 
 @pytest.fixture(autouse=True)
-async def server_cleanup(tmp_path):
+async def server_cleanup(short_dir):
     global _sock_dir
-    _sock_dir = tmp_path
+    _sock_dir = short_dir
     _started.clear()
     yield
     for server, task in _started:

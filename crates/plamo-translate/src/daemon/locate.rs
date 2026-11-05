@@ -5,17 +5,24 @@ use std::path::{Path, PathBuf};
 pub const DAEMON_BIN_NAME: &str = "plamo-translated";
 
 /// Candidates are returned as found, without resolving symlinks, so a `nix profile`
-/// path stays valid in the plist after the profile is upgraded.
+/// path stays valid in the plist after the profile is upgraded. The resolved CLI
+/// location is tried only after the unresolved one, for profiles that link `bin`
+/// but not `libexec` (e.g. a `buildEnv` with a narrow `pathsToLink`).
 pub fn locate_daemon(
     explicit: Option<&Path>,
     env_bin: Option<&OsStr>,
     current_exe: &Path,
     path_var: Option<&OsStr>,
 ) -> Option<PathBuf> {
-    let libexec = current_exe
-        .parent()
-        .and_then(Path::parent)
-        .map(|prefix| prefix.join("libexec/bin").join(DAEMON_BIN_NAME));
+    let libexec_of = |exe: &Path| {
+        exe.parent()
+            .and_then(Path::parent)
+            .map(|prefix| prefix.join("libexec/bin").join(DAEMON_BIN_NAME))
+    };
+    let libexec = libexec_of(current_exe);
+    let resolved_libexec = std::fs::canonicalize(current_exe)
+        .ok()
+        .and_then(|exe| libexec_of(&exe));
     let on_path = path_var
         .into_iter()
         .flat_map(std::env::split_paths)
@@ -26,6 +33,7 @@ pub fn locate_daemon(
         .into_iter()
         .chain(env_bin.filter(|v| !v.is_empty()).map(PathBuf::from))
         .chain(libexec)
+        .chain(resolved_libexec)
         .chain(on_path)
         .find(|p| is_executable(p))
 }
@@ -107,5 +115,42 @@ mod tests {
         );
         let path_var = profile_bin.into_os_string();
         assert_eq!(locate_daemon(None, None, &exe, Some(&path_var)), Some(link));
+    }
+
+    #[test]
+    fn locate_prefers_profile_libexec_over_resolved_exe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_exe = tmp.path().join("store/bin/plamo-translate");
+        executable(&store_exe);
+        let store_daemon = tmp.path().join("store/libexec/bin/plamo-translated");
+        executable(&store_daemon);
+        let profile_exe = tmp.path().join("profile/bin/plamo-translate");
+        std::fs::create_dir_all(profile_exe.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&store_exe, &profile_exe).unwrap();
+        let profile_daemon = tmp.path().join("profile/libexec/bin/plamo-translated");
+        std::fs::create_dir_all(profile_daemon.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&store_daemon, &profile_daemon).unwrap();
+
+        assert_eq!(
+            locate_daemon(None, None, &profile_exe, None),
+            Some(profile_daemon)
+        );
+    }
+
+    #[test]
+    fn locate_falls_back_to_resolved_exe_when_profile_lacks_libexec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store_exe = tmp.path().join("store/bin/plamo-translate");
+        executable(&store_exe);
+        let store_daemon = tmp.path().join("store/libexec/bin/plamo-translated");
+        executable(&store_daemon);
+        let profile_exe = tmp.path().join("profile/bin/plamo-translate");
+        std::fs::create_dir_all(profile_exe.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&store_exe, &profile_exe).unwrap();
+
+        assert_eq!(
+            locate_daemon(None, None, &profile_exe, None),
+            Some(std::fs::canonicalize(&store_daemon).unwrap())
+        );
     }
 }

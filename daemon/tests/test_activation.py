@@ -1,10 +1,8 @@
 import json
 import logging
 import os
-import shutil
 import socket
 import stat
-import tempfile
 import threading
 import time
 from logging.handlers import RotatingFileHandler
@@ -18,13 +16,6 @@ from huggingface_hub.utils import logging as hl
 from conftest import FakeEngine
 from plamo_translated import __main__ as entry
 from plamo_translated.activation import bind_socket, launchd_socket
-
-
-@pytest.fixture
-def short_dir():
-    d = Path(tempfile.mkdtemp(prefix="pt", dir="/tmp"))
-    yield d
-    shutil.rmtree(d, ignore_errors=True)
 
 
 def test_bind_socket_sets_mode_0600(short_dir):
