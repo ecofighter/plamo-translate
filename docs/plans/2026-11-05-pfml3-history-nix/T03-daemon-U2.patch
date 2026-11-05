@@ -1,0 +1,429 @@
+From a53b69f46f3bacd308b0f2274d367461244c6eda Mon Sep 17 00:00:00 2001
+From: s <s@x>
+Date: Thu, 5 Nov 2026 23:27:09 +0900
+Subject: [PATCH 2/8] U2
+
+---
+ daemon/src/plamo_translated/pfml3.py | 122 ++++++++++++++++++
+ daemon/tests/conftest.py             |  25 ++++
+ daemon/tests/pfml3_cases.py          |  51 ++++++++
+ daemon/tests/test_pfml3.py           | 184 +++++++++++++++++++++++++++
+ 4 files changed, 382 insertions(+)
+ create mode 100644 daemon/src/plamo_translated/pfml3.py
+ create mode 100644 daemon/tests/pfml3_cases.py
+ create mode 100644 daemon/tests/test_pfml3.py
+
+diff --git a/daemon/src/plamo_translated/pfml3.py b/daemon/src/plamo_translated/pfml3.py
+new file mode 100644
+index 0000000..44933d8
+--- /dev/null
++++ b/daemon/src/plamo_translated/pfml3.py
+@@ -0,0 +1,122 @@
++"""PFML3 prompt rules: request validation, prompt construction, tokenizer checks.
++
++Mirrors the model's bundled chat_template.jinja, which stays the oracle (slow tests).
++"""
++
++from __future__ import annotations
++
++import hashlib
++import re
++from pathlib import Path
++
++from .protocol import DaemonError, TranslateRequest
++
++BOS = "<|plamo:bos|>"
++TAG = "<|plamo:tag|>"
++KEY = "<|plamo:key|>"
++VAL = "<|plamo:val|>"
++MSG = "<|plamo:msg|>"
++INDEX = "<|plamo:index|>"
++ITEM = "<|plamo:item|>"
++CONTROL_TOKENS = (BOS, TAG, KEY, VAL, MSG, INDEX, ITEM)
++STOP_TOKENS = (TAG, BOS)
++RESERVED_PREFIX = "<|plamo:"
++
++TEMPLATE_FILE = "chat_template.jinja"
++# sha256 of chat_template.jinja at the pinned 2b revision; update only after `pytest -m slow` passes.
++TEMPLATE_SHA256 = "cd49e7e0dfa8ec847c163db88dfca89b280dddbb73ddc60ba38c62a420eaced2"
++
++_LANG_CODE = re.compile(r"[a-z]{2,3}(-[a-z]{4})?")
++_LANG_MESSAGE = "must be a lowercase language code, e.g. en, ja, zh-hans, or ja(easy)."
++_TOKENIZER_MESSAGE = "model tokenizer does not expose the PFML3 control tokens expected by the prompt builder: "
++
++
++def _invalid(message: str) -> DaemonError:
++    return DaemonError("invalid_request", message)
++
++
++def is_lang_code(value: str) -> bool:
++    # fullmatch, not match with $: "$" also matches before a trailing newline.
++    return value == "ja(easy)" or _LANG_CODE.fullmatch(value) is not None
++
++
++def _check_text(value: str, name: str, allow_empty: bool = False) -> None:
++    if not allow_empty and not value.strip():
++        raise _invalid(f"{name} must not be empty.")
++    if RESERVED_PREFIX in value:
++        raise _invalid(f"{name} must not contain reserved PFML tokens (<|plamo:...).")
++
++
++def validate(req: TranslateRequest) -> None:
++    """Raises invalid_request for the first rule the request breaks, in chat-template order."""
++    for i, pair in enumerate(req.history):
++        _check_text(pair.source, f"history[{i}].source")
++        _check_text(pair.translation, f"history[{i}].translation")
++    _check_text(req.text, "text")
++    if not is_lang_code(req.target_lang):
++        raise _invalid(f"target_lang {_LANG_MESSAGE}")
++    if req.source_lang is not None and not is_lang_code(req.source_lang):
++        raise _invalid(f"source_lang {_LANG_MESSAGE}")
++    if req.context is not None:
++        _check_text(req.context, "context", allow_empty=True)
++    if req.form is not None and (req.form not in ("polite", "plain") or req.target_lang != "ja"):
++        raise _invalid('form must be polite or plain and requires target_lang="ja".')
++    for i, entry in enumerate(req.glossary):
++        _check_text(entry.source, f"glossary[{i}].source")
++        _check_text(entry.target, f"glossary[{i}].target")
++
++
++def build_prompt(req: TranslateRequest) -> str:
++    """The PFML3 prompt for a validated request, BOS included; user text is copied verbatim."""
++    source = f"{KEY}lang{VAL}{req.source_lang}" if req.source_lang is not None else ""
++    output = f"{TAG}output{KEY}lang{VAL}{req.target_lang}"
++    parts = [BOS, TAG, "dataset", MSG, "translation"]
++    if req.context:
++        parts += [TAG, "context", MSG, req.context]
++    for pair in req.history:
++        parts += [TAG, "input", source, MSG, pair.source, output, MSG, pair.translation]
++    if req.glossary:
++        parts += [TAG, "glossary"]
++        for entry in req.glossary:
++            parts += [INDEX, entry.source, ITEM, entry.target]
++    parts += [TAG, "input", source, MSG, req.text, output]
++    if req.form is not None:
++        parts += [KEY, "form", VAL, req.form]
++    parts.append(MSG)
++    return "".join(parts)
++
++
++def prompt_ids(tokenizer, req: TranslateRequest) -> list[int]:
++    # The prompt already starts with the BOS string; add_special_tokens would prepend a second one.
++    return tokenizer.encode(build_prompt(req), add_special_tokens=False)
++
++
++def strip_stop_token(text: str) -> str:
++    """Removes one trailing stop-token string, which mlx-lm normally never emits."""
++    for token in STOP_TOKENS:
++        if text.endswith(token):
++            return text[: -len(token)]
++    return text
++
++
++def check_tokenizer(tokenizer) -> None:
++    """Raises model_load_failed unless every control string is one known id and the stop tokens are eos ids."""
++    ids: dict[str, int] = {}
++    for token in CONTROL_TOKENS:
++        encoded = tokenizer.encode(token, add_special_tokens=False)
++        if len(encoded) != 1:
++            raise DaemonError("model_load_failed", f"{_TOKENIZER_MESSAGE}{token} encodes to {encoded}")
++        if encoded[0] == tokenizer.unk_token_id:
++            raise DaemonError("model_load_failed", f"{_TOKENIZER_MESSAGE}{token} encodes to the unk id {encoded[0]}")
++        ids[token] = encoded[0]
++    for token in STOP_TOKENS:
++        if ids[token] not in tokenizer.eos_token_ids:
++            raise DaemonError("model_load_failed", f"{_TOKENIZER_MESSAGE}{token} (id {ids[token]}) is not an eos id")
++
++
++def template_verified(snapshot: Path) -> bool:
++    try:
++        data = (snapshot / TEMPLATE_FILE).read_bytes()
++    except OSError:
++        return False
++    return hashlib.sha256(data).hexdigest() == TEMPLATE_SHA256
+diff --git a/daemon/tests/conftest.py b/daemon/tests/conftest.py
+index e42651d..42b3987 100644
+--- a/daemon/tests/conftest.py
++++ b/daemon/tests/conftest.py
+@@ -69,6 +69,31 @@ class FakeEngine(Engine):
+             yield token
+ 
+ 
++class StubTokenizer:
++    """Maps each control string to one id and every other character to its code point."""
++
++    def __init__(self, ids=None, eos_token_ids=frozenset({1, 16}), unk_token_id=0):
++        self.ids = {"<|plamo:bos|>": 1, "<|plamo:tag|>": 16, "<|plamo:key|>": 17, "<|plamo:val|>": 18,
++                    "<|plamo:msg|>": 19, "<|plamo:index|>": 20, "<|plamo:item|>": 21} if ids is None else ids
++        self.eos_token_ids = eos_token_ids
++        self.unk_token_id = unk_token_id
++        self.calls = []
++
++    def encode(self, text, add_special_tokens=True):
++        self.calls.append(add_special_tokens)
++        out, i = [], 0
++        while i < len(text):
++            for token, token_id in self.ids.items():
++                if text.startswith(token, i):
++                    out.append(token_id)
++                    i += len(token)
++                    break
++            else:
++                out.append(ord(text[i]))
++                i += 1
++        return out
++
++
+ # AF_UNIX paths must stay under 104 bytes; pytest's tmp_path (and the Nix build TMPDIR) can exceed that.
+ @pytest.fixture
+ def short_dir():
+diff --git a/daemon/tests/pfml3_cases.py b/daemon/tests/pfml3_cases.py
+new file mode 100644
+index 0000000..583be73
+--- /dev/null
++++ b/daemon/tests/pfml3_cases.py
+@@ -0,0 +1,51 @@
++"""Requests covering every optional PFML3 element; shared by the golden (fast) and oracle (slow) tests."""
++
++from plamo_translated.protocol import GlossaryEntry, HistoryEntry, TranslateRequest
++
++H = HistoryEntry
++G = GlossaryEntry
++
++CASES: dict[str, TranslateRequest] = {
++    "minimal": TranslateRequest(text="会議は来週の月曜日に変更されました。", target_lang="en"),
++    "source_lang": TranslateRequest(text="Hello", target_lang="ja", source_lang="en"),
++    "history_1": TranslateRequest(text="b", target_lang="en", history=(H("a", "A"),)),
++    "history_3_source_lang": TranslateRequest(
++        text="オーナーでフィルタリングすることもできます。",
++        target_lang="en",
++        source_lang="ja",
++        history=(
++            H("プロジェクトの管理画面を開きます。", "Open the project dashboard."),
++            H("進行中のタスクがすべて表示されます。", "It lists all active tasks."),
++            H("期限切れのタスクは赤で表示されます。", "Overdue tasks are shown in red."),
++        ),
++    ),
++    "all_fields": TranslateRequest(
++        text="Hello  world",
++        target_lang="ja",
++        source_lang="en",
++        context="Software manual",
++        form="polite",
++        history=(H("Open it.", "開いてください。"),),
++        glossary=(G("dashboard", "ダッシュボード"), G("task", "タスク")),
++    ),
++    "context_empty": TranslateRequest(text="x", target_lang="en", context=""),
++    "context_whitespace": TranslateRequest(text="x", target_lang="en", context=" \n "),
++    "whitespace_text": TranslateRequest(text=" spaced \n text ", target_lang="zh-hans", source_lang="en"),
++    "form_plain": TranslateRequest(text="Thanks", target_lang="ja", form="plain"),
++    "ja_easy": TranslateRequest(text="Thanks", target_lang="ja(easy)", source_lang="en"),
++}
++
++
++def template_arguments(req: TranslateRequest) -> tuple[list[dict], dict]:
++    """The equivalent apply_chat_template(messages, **kwargs) call for a request."""
++    messages = []
++    for pair in req.history:
++        messages += [{"role": "user", "content": pair.source}, {"role": "assistant", "content": pair.translation}]
++    messages.append({"role": "user", "content": req.text})
++    kwargs: dict = {"target_lang": req.target_lang}
++    for key in ("source_lang", "context", "form"):
++        if getattr(req, key) is not None:
++            kwargs[key] = getattr(req, key)
++    if req.glossary:
++        kwargs["glossary"] = [{"source": g.source, "target": g.target} for g in req.glossary]
++    return messages, kwargs
+diff --git a/daemon/tests/test_pfml3.py b/daemon/tests/test_pfml3.py
+new file mode 100644
+index 0000000..64517a6
+--- /dev/null
++++ b/daemon/tests/test_pfml3.py
+@@ -0,0 +1,184 @@
++import hashlib
++
++import pytest
++
++from conftest import StubTokenizer
++from pfml3_cases import CASES
++from plamo_translated.pfml3 import (
++    CONTROL_TOKENS,
++    build_prompt,
++    check_tokenizer,
++    is_lang_code,
++    prompt_ids,
++    strip_stop_token,
++    template_verified,
++    validate,
++)
++from plamo_translated.protocol import DaemonError, GlossaryEntry, HistoryEntry, TranslateRequest
++
++GOLDEN = {
++    "minimal": "<|plamo:bos|><|plamo:tag|>dataset<|plamo:msg|>translation<|plamo:tag|>input<|plamo:msg|>会議は来週の月曜日に変更されました。<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>en<|plamo:msg|>",
++    "source_lang": "<|plamo:bos|><|plamo:tag|>dataset<|plamo:msg|>translation<|plamo:tag|>input<|plamo:key|>lang<|plamo:val|>en<|plamo:msg|>Hello<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>ja<|plamo:msg|>",
++    "history_1": "<|plamo:bos|><|plamo:tag|>dataset<|plamo:msg|>translation<|plamo:tag|>input<|plamo:msg|>a<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>en<|plamo:msg|>A<|plamo:tag|>input<|plamo:msg|>b<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>en<|plamo:msg|>",
++    "history_3_source_lang": "<|plamo:bos|><|plamo:tag|>dataset<|plamo:msg|>translation<|plamo:tag|>input<|plamo:key|>lang<|plamo:val|>ja<|plamo:msg|>プロジェクトの管理画面を開きます。<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>en<|plamo:msg|>Open the project dashboard.<|plamo:tag|>input<|plamo:key|>lang<|plamo:val|>ja<|plamo:msg|>進行中のタスクがすべて表示されます。<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>en<|plamo:msg|>It lists all active tasks.<|plamo:tag|>input<|plamo:key|>lang<|plamo:val|>ja<|plamo:msg|>期限切れのタスクは赤で表示されます。<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>en<|plamo:msg|>Overdue tasks are shown in red.<|plamo:tag|>input<|plamo:key|>lang<|plamo:val|>ja<|plamo:msg|>オーナーでフィルタリングすることもできます。<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>en<|plamo:msg|>",
++    "all_fields": "<|plamo:bos|><|plamo:tag|>dataset<|plamo:msg|>translation<|plamo:tag|>context<|plamo:msg|>Software manual<|plamo:tag|>input<|plamo:key|>lang<|plamo:val|>en<|plamo:msg|>Open it.<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>ja<|plamo:msg|>開いてください。<|plamo:tag|>glossary<|plamo:index|>dashboard<|plamo:item|>ダッシュボード<|plamo:index|>task<|plamo:item|>タスク<|plamo:tag|>input<|plamo:key|>lang<|plamo:val|>en<|plamo:msg|>Hello  world<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>ja<|plamo:key|>form<|plamo:val|>polite<|plamo:msg|>",
++    "context_empty": "<|plamo:bos|><|plamo:tag|>dataset<|plamo:msg|>translation<|plamo:tag|>input<|plamo:msg|>x<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>en<|plamo:msg|>",
++    "context_whitespace": "<|plamo:bos|><|plamo:tag|>dataset<|plamo:msg|>translation<|plamo:tag|>context<|plamo:msg|> \n <|plamo:tag|>input<|plamo:msg|>x<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>en<|plamo:msg|>",
++    "whitespace_text": "<|plamo:bos|><|plamo:tag|>dataset<|plamo:msg|>translation<|plamo:tag|>input<|plamo:key|>lang<|plamo:val|>en<|plamo:msg|> spaced \n text <|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>zh-hans<|plamo:msg|>",
++    "form_plain": "<|plamo:bos|><|plamo:tag|>dataset<|plamo:msg|>translation<|plamo:tag|>input<|plamo:msg|>Thanks<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>ja<|plamo:key|>form<|plamo:val|>plain<|plamo:msg|>",
++    "ja_easy": "<|plamo:bos|><|plamo:tag|>dataset<|plamo:msg|>translation<|plamo:tag|>input<|plamo:key|>lang<|plamo:val|>en<|plamo:msg|>Thanks<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>ja(easy)<|plamo:msg|>",
++}
++
++RESERVED = "text must not contain reserved PFML tokens (<|plamo:...)."
++LANG = "must be a lowercase language code, e.g. en, ja, zh-hans, or ja(easy)."
++FORM = 'form must be polite or plain and requires target_lang="ja".'
++
++
++def test_golden_covers_every_case():
++    assert set(GOLDEN) == set(CASES)
++
++
++@pytest.mark.parametrize("name", sorted(CASES))
++def test_build_prompt_golden(name):
++    assert build_prompt(CASES[name]) == GOLDEN[name]
++
++
++@pytest.mark.parametrize("name", sorted(CASES))
++def test_golden_cases_are_valid(name):
++    validate(CASES[name])
++
++
++def test_build_prompt_null_and_empty_context_are_identical():
++    assert build_prompt(TranslateRequest(text="x", target_lang="en", context="")) == build_prompt(
++        TranslateRequest(text="x", target_lang="en")
++    )
++
++
++def test_prompt_ids_encode_once_without_special_tokens():
++    tok = StubTokenizer()
++    ids = prompt_ids(tok, CASES["minimal"])
++    assert tok.calls == [False]
++    assert ids[0] == 1 and 1 not in ids[1:]
++
++
++def test_check_tokenizer_accepts_plamo3_ids():
++    check_tokenizer(StubTokenizer())
++
++
++@pytest.mark.parametrize(("tok", "detail"), [
++    (StubTokenizer(ids={t: i for i, t in enumerate(CONTROL_TOKENS, 1) if t != "<|plamo:msg|>"}),
++     "<|plamo:msg|> encodes to [60, 124, 112, 108, 97, 109, 111, 58, 109, 115, 103, 124, 62]"),
++    (StubTokenizer(unk_token_id=17), "<|plamo:key|> encodes to the unk id 17"),
++    (StubTokenizer(eos_token_ids={1}), "<|plamo:tag|> (id 16) is not an eos id"),
++    (StubTokenizer(eos_token_ids={16}), "<|plamo:bos|> (id 1) is not an eos id"),
++])
++def test_check_tokenizer_rejects_incompatible_tokenizers(tok, detail):
++    with pytest.raises(DaemonError) as e:
++        check_tokenizer(tok)
++    assert e.value.code == "model_load_failed"
++    assert e.value.message == (
++        "model tokenizer does not expose the PFML3 control tokens expected by the prompt builder: " + detail
++    )
++
++
++
++
++def test_template_verified(tmp_path):
++    (tmp_path / "chat_template.jinja").write_bytes(b"{{ x }}")
++    assert template_verified(tmp_path) is False
++    assert template_verified(tmp_path / "missing") is False
++
++
++def test_template_verified_matches_pinned_hash(tmp_path, monkeypatch):
++    content = b"pinned"
++    monkeypatch.setattr("plamo_translated.pfml3.TEMPLATE_SHA256", hashlib.sha256(content).hexdigest())
++    (tmp_path / "chat_template.jinja").write_bytes(content)
++    assert template_verified(tmp_path) is True
++
++
++@pytest.mark.parametrize(("text", "expected"), [
++    ("a<|plamo:tag|>", "a"),
++    ("a<|plamo:bos|>", "a"),
++    ("a<|plamo:tag|><|plamo:tag|>", "a<|plamo:tag|>"),
++    ("<|plamo:tag|>a", "<|plamo:tag|>a"),
++    ("a<|plamo:msg|>", "a<|plamo:msg|>"),
++    (" a \n", " a \n"),
++    ("", ""),
++])
++def test_strip_stop_token(text, expected):
++    assert strip_stop_token(text) == expected
++
++
++@pytest.mark.parametrize(("value", "ok"), [
++    ("en", True), ("ja", True), ("abc", True), ("zh-hans", True), ("ja(easy)", True),
++    ("en\n", False), ("EN", False), ("zh-Hans", False), ("auto", False), ("en-us", False),
++    ("e", False), ("", False), ("abcd", False), ("en-", False), ("ja(easy)\n", False), (" en", False),
++])
++def test_lang_code(value, ok):
++    assert is_lang_code(value) is ok
++
++
++@pytest.mark.parametrize("field", ["target_lang", "source_lang"])
++@pytest.mark.parametrize("value", ["en\n", "EN", "zh-Hans", "auto", "en-us", "e", ""])
++def test_lang_code_rejected_by_validate(field, value):
++    req = TranslateRequest(text="x", **{"target_lang": "en", field: value})
++    with pytest.raises(DaemonError) as e:
++        validate(req)
++    assert (e.value.code, e.value.message) == ("invalid_request", f"{field} {LANG}")
++
++
++def _req(**kw) -> TranslateRequest:
++    return TranslateRequest(**{"text": "x", "target_lang": "ja", **kw})
++
++
++@pytest.mark.parametrize(("req", "message"), [
++    (_req(history=(HistoryEntry(" \n", "A"),)), "history[0].source must not be empty."),
++    (_req(history=(HistoryEntry("a<|plamo:x", "A"),)), "history[0].source must not contain reserved PFML tokens (<|plamo:...)."),
++    (_req(history=(HistoryEntry("a", "A"), HistoryEntry("b", ""))), "history[1].translation must not be empty."),
++    (_req(history=(HistoryEntry("a", "<|plamo:tag|>"),)), "history[0].translation must not contain reserved PFML tokens (<|plamo:...)."),
++    (_req(text="\t"), "text must not be empty."),
++    (_req(text="a<|plamo:msg|>b"), RESERVED),
++    (_req(text="<|plamo:foo|>"), RESERVED),
++    (_req(target_lang="EN"), f"target_lang {LANG}"),
++    (_req(source_lang="auto"), f"source_lang {LANG}"),
++    (_req(context="<|plamo:"), "context must not contain reserved PFML tokens (<|plamo:...)."),
++    (_req(form="formal"), FORM),
++    (_req(target_lang="en", form="polite"), FORM),
++    (_req(target_lang="ja(easy)", form="plain"), FORM),
++    (_req(glossary=(GlossaryEntry(" ", "t"),)), "glossary[0].source must not be empty."),
++    (_req(glossary=(GlossaryEntry("s", "t"), GlossaryEntry("s", "<|plamo:item|>"))), "glossary[1].target must not contain reserved PFML tokens (<|plamo:...)."),
++    (_req(glossary=(GlossaryEntry("<|plamo:index|>", "t"),)), "glossary[0].source must not contain reserved PFML tokens (<|plamo:...)."),
++    (_req(glossary=(GlossaryEntry("s", "\n"),)), "glossary[0].target must not be empty."),
++])
++def test_validate_messages(req, message):
++    with pytest.raises(DaemonError) as e:
++        validate(req)
++    assert (e.value.code, e.value.message) == ("invalid_request", message)
++
++
++@pytest.mark.parametrize("req", [
++    _req(context=""), _req(context=" "), _req(text="<|PLAMO:tag|>"), _req(text="<|plamo"), _req(form="plain"),
++    _req(history=(HistoryEntry(" a ", " b "),)),
++])
++def test_validate_accepts(req):
++    validate(req)
++
++
++@pytest.mark.parametrize(("req", "message"), [
++    # every field broken: the first history field wins
++    (TranslateRequest(text="", target_lang="EN", source_lang="x", context="<|plamo:", form="x",
++                      history=(HistoryEntry("", "<|plamo:"),), glossary=(GlossaryEntry("", ""),)),
++     "history[0].source must not be empty."),
++    (_req(history=(HistoryEntry("a", "A"), HistoryEntry("<|plamo:", ""))), "history[1].source must not contain reserved PFML tokens (<|plamo:...)."),
++    (_req(text=" <|plamo:tag|>"), RESERVED),
++    (_req(text="", target_lang="EN"), "text must not be empty."),
++    (_req(target_lang="EN", source_lang="EN"), f"target_lang {LANG}"),
++    (_req(source_lang="EN", context="<|plamo:"), f"source_lang {LANG}"),
++    (_req(context="<|plamo:", form="x"), "context must not contain reserved PFML tokens (<|plamo:...)."),
++    (_req(form="x", glossary=(GlossaryEntry("", ""),)), FORM),
++    (_req(glossary=(GlossaryEntry("s", ""), GlossaryEntry("", "t"))), "glossary[0].target must not be empty."),
++])
++def test_validate_precedence(req, message):
++    with pytest.raises(DaemonError) as e:
++        validate(req)
++    assert e.value.message == message
+-- 
+2.56.0
+

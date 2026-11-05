@@ -1,0 +1,198 @@
+diff --git a/flake.lock b/flake.lock
+index cf4334f..d60c9be 100644
+--- a/flake.lock
++++ b/flake.lock
+@@ -1,20 +1,5 @@
+ {
+   "nodes": {
+-    "crane": {
+-      "locked": {
+-        "lastModified": 1793836618,
+-        "narHash": "sha256-TREenflwEjxOSq292FYwbc3kEm7TDRtXCZRNWEdjBmg=",
+-        "owner": "ipetkov",
+-        "repo": "crane",
+-        "rev": "79fd63528501446749c09f08cad486a58c7d173e",
+-        "type": "github"
+-      },
+-      "original": {
+-        "owner": "ipetkov",
+-        "repo": "crane",
+-        "type": "github"
+-      }
+-    },
+     "home-manager": {
+       "inputs": {
+         "nixpkgs": [
+@@ -53,7 +38,6 @@
+     },
+     "root": {
+       "inputs": {
+-        "crane": "crane",
+         "home-manager": "home-manager",
+         "nixpkgs": "nixpkgs"
+       }
+diff --git a/flake.nix b/flake.nix
+index dbcff3a..a6f4514 100644
+--- a/flake.nix
++++ b/flake.nix
+@@ -3,7 +3,6 @@
+ 
+   inputs = {
+     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+-    crane.url = "github:ipetkov/crane";
+     home-manager = {
+       url = "github:nix-community/home-manager";
+       inputs.nixpkgs.follows = "nixpkgs";
+@@ -14,7 +13,6 @@
+     {
+       self,
+       nixpkgs,
+-      crane,
+       home-manager,
+       ...
+     }:
+@@ -25,8 +23,7 @@
+         inherit system;
+         overlays = [ overlay ];
+       };
+-      craneLib = crane.mkLib pkgs;
+-      build = import ./nix/packages.nix { inherit pkgs craneLib; };
++      build = import ./nix/packages.nix { inherit pkgs; };
+       inherit (build) packages;
+ 
+       daemonApp =
+@@ -61,10 +58,9 @@
+       ] (cmd: nixpkgs.lib.nameValuePair "daemon-${cmd}" (daemonApp cmd));
+ 
+       checks.${system} = import ./nix/checks.nix {
+-        inherit pkgs craneLib packages;
+-        inherit home-manager;
++        inherit pkgs packages home-manager;
+         hmModule = self.homeManagerModules.default;
+-        inherit (build) cargoArgs cargoArtifacts;
++        inherit (build) rustArgs;
+       };
+ 
+       devShells.${system}.default = pkgs.mkShell {
+diff --git a/nix/checks.nix b/nix/checks.nix
+index 77907fd..e789841 100644
+--- a/nix/checks.nix
++++ b/nix/checks.nix
+@@ -1,11 +1,9 @@
+ {
+   pkgs,
+-  craneLib,
+   home-manager,
+   hmModule,
+   packages,
+-  cargoArgs,
+-  cargoArtifacts,
++  rustArgs,
+ }:
+ 
+ let
+@@ -103,13 +101,34 @@ let
+       '';
+ in
+ {
+-  cargo-test = craneLib.cargoTest (cargoArgs // { inherit cargoArtifacts; });
++  # Debug profile, like `cargo test --workspace` in the justfile: a third of the release compile
++  # time, and overflow checks stay on. No build phase: `cargo test` builds the binaries the tests run.
++  # The checks ship no binaries, so cargo-auditable has nothing to embed.
++  cargo-test = pkgs.rustPlatform.buildRustPackage (
++    rustArgs
++    // {
++      pname = "plamo-translate-cargo-test";
++      buildType = "debug";
++      auditable = false;
++      dontCargoBuild = true;
++      cargoTestFlags = [ "--workspace" ];
++      installPhase = "touch $out";
++    }
++  );
+ 
+-  clippy = craneLib.cargoClippy (
+-    cargoArgs
++  clippy = pkgs.rustPlatform.buildRustPackage (
++    rustArgs
+     // {
+-      inherit cargoArtifacts;
+-      cargoClippyExtraArgs = "--workspace --all-targets -- -D warnings";
++      pname = "plamo-translate-clippy";
++      auditable = false;
++      nativeBuildInputs = [ pkgs.clippy ];
++      buildPhase = ''
++        runHook preBuild
++        cargo clippy -j "$NIX_BUILD_CORES" --offline --locked --workspace --all-targets -- -D warnings
++        runHook postBuild
++      '';
++      doCheck = false;
++      installPhase = "touch $out";
+     }
+   );
+ 
+diff --git a/nix/packages.nix b/nix/packages.nix
+index fdae48b..0a7edb2 100644
+--- a/nix/packages.nix
++++ b/nix/packages.nix
+@@ -1,4 +1,4 @@
+-{ pkgs, craneLib }:
++{ pkgs }:
+ 
+ let
+   inherit (pkgs) lib;
+@@ -30,30 +30,35 @@ let
+     meta.mainProgram = "plamo-translated";
+   };
+ 
++  # Everything under crates/ is Rust sources, tests, fixtures, or insta snapshots; taking the whole
++  # directory keeps new crates and fixture files working without touching this list.
++  # Pending insta snapshots (*.snap.new, *.pending-snap) are excluded so a stray one cannot change
++  # the build inputs. plamo-client's fixture test reads ../protocol/fixtures relative to its manifest.
+   cargoSrc = lib.fileset.toSource {
+     root = ../.;
+     fileset = lib.fileset.unions [
+-      (craneLib.fileset.commonCargoSources ../.)
++      ../Cargo.toml
++      ../Cargo.lock
++      (lib.fileset.difference ../crates (
++        lib.fileset.fileFilter (
++          f: f.hasExt "new" || f.hasExt "pending-snap" || f.name == ".DS_Store"
++        ) ../crates
++      ))
+       ../protocol/fixtures
+-      ../crates/plamo-translate/tests/fixtures
+-      ../crates/plamo-translate/src/daemon/snapshots
+     ];
+   };
+ 
+-  cargoArgs = {
+-    src = cargoSrc;
++  rustArgs = {
+     pname = "plamo-translate";
+     version = "0.1.0";
+-    strictDeps = true;
++    src = cargoSrc;
++    cargoLock.lockFile = ../Cargo.lock;
+   };
+ 
+-  cargoArtifacts = craneLib.buildDepsOnly cargoArgs;
+-
+-  plamo-translate = craneLib.buildPackage (
+-    cargoArgs
++  plamo-translate = pkgs.rustPlatform.buildRustPackage (
++    rustArgs
+     // {
+-      inherit cargoArtifacts;
+-      # The cargo-test check runs the suite; avoid running it twice.
++      # checks.cargo-test runs the suite; avoid running it twice.
+       doCheck = false;
+       postInstall = ''
+         mkdir -p $out/libexec/bin
+@@ -68,5 +73,5 @@ in
+     inherit plamo-translated plamo-translate;
+     default = plamo-translate;
+   };
+-  inherit cargoArgs cargoArtifacts;
++  inherit rustArgs;
+ }

@@ -1,0 +1,164 @@
+From c3b922acc08ab0b4d40833c6db412f2dc08ab618 Mon Sep 17 00:00:00 2001
+From: s <s@x>
+Date: Thu, 5 Nov 2026 23:29:26 +0900
+Subject: [PATCH 8/8] U8
+
+---
+ .../2026-11-05-pfml3-tokenizer-findings.md    | 27 +++++++++++++++
+ .../plans/2026-11-05-plamo-translate.md       |  2 ++
+ .../2026-11-05-plamo-translate-design.md      | 33 +++++++++++++------
+ 3 files changed, 52 insertions(+), 10 deletions(-)
+ create mode 100644 docs/superpowers/notes/2026-11-05-pfml3-tokenizer-findings.md
+
+diff --git a/docs/superpowers/notes/2026-11-05-pfml3-tokenizer-findings.md b/docs/superpowers/notes/2026-11-05-pfml3-tokenizer-findings.md
+new file mode 100644
+index 0000000..0e81c60
+--- /dev/null
++++ b/docs/superpowers/notes/2026-11-05-pfml3-tokenizer-findings.md
+@@ -0,0 +1,27 @@
++# PFML3 と tokenizer の調査結果（デーモンでのプロンプト構築）
++
++対象: `pfnet/plamo-3-translate-2b-MLX-4bit@63777ddc6dc80aacacd92a1bf6966105f2f6270c` と `pfnet/plamo-3-translate-0.8b-MLX-4bit@e5fe5b7f26ebaeae48db0ce644b932d1d9b91aaa`、transformers 5.22.1、mlx-lm 0.32.2。どちらのスナップショットも `chat_template.jinja` と `tokenizer_config.json` は同一で、`chat_template.jinja` の sha256 は `cd49e7e0dfa8ec847c163db88dfca89b280dddbb73ddc60ba38c62a420eaced2`。
++
++## 制御トークン
++- id: `<|plamo:bos|>`=1、`<|plamo:tag|>`=16、`<|plamo:key|>`=17、`<|plamo:val|>`=18、`<|plamo:msg|>`=19、`<|plamo:index|>`=20、`<|plamo:item|>`=21。unk の id は 0。
++- mlx-lm は `config.json` の `eos_token_id` を eos として読み、`eos_token_ids` は `{1, 16}` になる。
++
++## 予約トークンを拒否する理由
++- `Plamo3Tokenizer` は Unigram の分割より前に `AhoCorasick.encode` で `<\|plamo:[^|\s]{,64}\|>` に一致する部分を切り出し、語彙にあればその制御 id にする。`"a<|plamo:tag|>b"` は `[97, 16, 98]`、`"a<|plamo:bos|>b"` は `[97, 1, 98]`、`"a<|plamo:reserved:0x106|>b"` は `[97, 262, 98]` になる。`split_special_tokens=True` でも変わらず、無効にする引数はない。
++- 語彙にない形（`<|plamo:foo|>`、`<|plamo:` だけ、`<|plamo:tag|`、`<|plamo: tag|>`、`<|PLAMO:tag|>`）は普通の文字列として扱われる。
++- したがって安全にエスケープする方法はなく、`text`、`context`、`history`、`glossary` に `<|plamo:` を含む要求は拒否する（chat template と同じ規則）。語彙は revision ごとに変わりうるので、語彙を見ずに部分文字列で判定する。
++- `U+EE00`（`BOUNDARY_CHAR`）は tokenizer が黙って捨てる。拒否も文書化もしていない。
++
++## プロンプトの同一性
++- `pfml3.build_prompt` の文字列は `apply_chat_template(..., add_generation_prompt=True, tokenize=False)` と一致し、`add_special_tokens=False` で encode した id 列は `apply_chat_template(..., tokenize=True, return_dict=False)` と一致する（`daemon/tests/test_pfml3_oracle_slow.py`、10 ケース × 2 モデル）。
++- 先頭の `<|plamo:bos|>` は文字列としてプロンプトに含めるので、encode では `add_special_tokens=False` にする。id 列の先頭は BOS 1個で、以降に BOS は現れない。
++- 区切りごとに encode して連結した結果と、全体を1回で encode した結果は同じ。
++- 言語コードの検査は `re.fullmatch` を使う。`re.match(r"^...$")` は `"en\n"` を通してしまう（`$` が末尾の改行の前にも一致するため）。
++
++## 出力の扱い
++- mlx-lm 0.32.2 の `stream_generate` は、トークンが eos なら detokenizer に渡す前にループを抜ける。そのため停止トークンの文字列は通常 `response.text` に現れない。最後の `GenerationResponse` の `finish_reason` は、最後のトークンが eos なら `"stop"`、そうでなければ `"length"`（`max_tokens` 個目が eos の場合も `"stop"`）。
++- デーモンは念のため `done.text` の末尾の `<|plamo:tag|>` / `<|plamo:bos|>` を1個だけ取り除く。
++
++## 観察
++- 2b のスナップショットのキャッシュは mlx-lm の `DEFAULT_ALLOW_PATTERNS` で取得された形で、ハブの一覧上 8 ファイル（`.gitattributes`、`LICENSE.mlx-lm`、`LICENSE/en`、`LICENSE/ja`、`README.md`、`README_ja.md` など）が無い。全ファイル対象の `snapshot_download(local_files_only=True)` は `IncompleteSnapshotError`（`LocalEntryNotFoundError` の派生）になり、以前のデーモンはオフラインでロードできなかった。`MlxEngine._resolve_snapshot` は `allow_patterns=MODEL_FILE_PATTERNS`（= `DEFAULT_ALLOW_PATTERNS`）で確認するように直した。mlx-lm 自身の `hf_repo_to_path` も同じ理由で同じ指定をしている。
++- tokenizer のエンコードは軽い（0.8b の tokenizer で 12,020 トークンのプロンプトに 14 ms）。`count_tokens` と `stream` で2回エンコードしてもキャッシュは要らない。
+diff --git a/docs/superpowers/plans/2026-11-05-plamo-translate.md b/docs/superpowers/plans/2026-11-05-plamo-translate.md
+index a266213..c0568e9 100644
+--- a/docs/superpowers/plans/2026-11-05-plamo-translate.md
++++ b/docs/superpowers/plans/2026-11-05-plamo-translate.md
+@@ -1,5 +1,7 @@
+ # plamo-translate Implementation Plan
+ 
++> **履歴としての注記:** この計画は v1 の初期実装時のもの。その後、PFML3 プロンプトの構築と入力の検証は chat template からデーモンの `pfml3` モジュールへ移り、`Engine.stream` は `TextStream` を返すようになった。現在の仕様は `docs/superpowers/specs/2026-11-05-plamo-translate-design.md` §5 と `docs/superpowers/notes/2026-11-05-pfml3-tokenizer-findings.md` を正とする。以下の記述は当時のまま残す。
++
+ > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+ 
+ **Goal:** PLaMo-3-translate (MLX) を launchd の socket activation でオンデマンドに常駐させる Python デーモンと、それを使う Rust 製の CLI と MCP server を作り、home-manager モジュール経由で nix-darwin から導入できるようにする。
+diff --git a/docs/superpowers/specs/2026-11-05-plamo-translate-design.md b/docs/superpowers/specs/2026-11-05-plamo-translate-design.md
+index 22d7f49..6ea42ee 100644
+--- a/docs/superpowers/specs/2026-11-05-plamo-translate-design.md
++++ b/docs/superpowers/specs/2026-11-05-plamo-translate-design.md
+@@ -34,7 +34,6 @@
+ - Intel Mac と Linux への対応
+ - 長文の自動分割（上限を超えたらエラーにする）
+ - 複数モデルの同時常駐、リクエストごとのモデル切り替え
+-- 翻訳履歴（モデルの chat template が対応する、過去の原文と訳文のペア）の受け渡し
+ - ファイルの一括翻訳、GUI、リモートからのアクセス
+ - Homebrew tap と nix-darwin 専用モジュール（§8 に将来の拡張として方針だけを残す）
+ 
+@@ -56,7 +55,7 @@
+ | `plamo-translate-mcp` | Rust | stdio の MCP server（`translate` tool） | plamo-client、rmcp |
+ | `flake.nix` | Nix | パッケージ、home-manager モジュール、操作 app、devShell、checks | nixpkgs、home-manager |
+ 
+-責務の境界は「デーモン = 推論とモデル管理、Rust = UX と launchd 操作」とする。PFML3 プロンプトの生成と入力の意味的な検証は、モデル同梱の chat template を使うデーモン側だけが行う。
++責務の境界は「デーモン = 推論とモデル管理、Rust = UX と launchd 操作」とする。PFML3 プロンプトの生成と入力の意味的な検証は、デーモン側だけが行う（モデル同梱の chat template と同じ規則を Python で実装し、template はテストの正解として使う）。
+ 
+ ### リポジトリ構成
+ ```
+@@ -110,15 +109,23 @@ socket_path = "~/Library/Application Support/plamo-translate/daemon.sock"
+ ### モジュール構成
+ - `activation`: launchd の `launch_activate_socket("Listeners", int**, size_t*)`（`launch.h`、libSystem）を ctypes で呼び、listen 済みの fd を受け取る。返された fd 配列は `free()` で解放する。呼び出しは名前ごとに1回だけ。`--socket PATH` が与えられたら自分で bind する（開発用・テスト用）。
+ - `config`: 上記の探索順で TOML（`tomllib`）を読み、dataclass に変換する。
++- `pfml3`: PFML3 の規則を持つ純粋関数のモジュール（mlx を import しない）。
++  - `validate(req)`: 意味的な検証。`parse_request` の直後に `server` が呼ぶ。順序は history の各組（`source`、`translation`）、`text`、`target_lang`、`source_lang`、`context`、`form`、glossary の各項目（`source`、`target`）で、各テキスト項目は空の検査を予約トークンの検査より先に行う。最初の違反を `invalid_request` で返す。メッセージは chat template の文言に項目名（`history[0].source` など）を入れたもの。`<|plamo:` を含むテキストは拒否する（tokenizer がこの文字列を制御トークンに変換し、無効化する手段がないため。経緯は `docs/superpowers/notes/2026-11-05-pfml3-tokenizer-findings.md`）。言語コードは `re.fullmatch(r"[a-z]{2,3}(-[a-z]{4})?", value)` または `ja(easy)`。
++  - `build_prompt(req)`: BOS を含む PFML3 文字列。要素の順序は `dataset`、`context`（空文字列でなければ）、history の各組の `input` と `output`、`glossary`（空でなければ）、今回の `input`、`output`（`form` があれば付ける）と `<|plamo:msg|>`。空白は一切加えず、削らない。
++  - `prompt_ids(tokenizer, req)`: `build_prompt` の結果を `add_special_tokens=False` で1回だけ encode する（先頭は BOS 1個）。
++  - `check_tokenizer(tokenizer)`: 7つの制御文字列（`<|plamo:bos|>`、`tag`、`key`、`val`、`msg`、`index`、`item`）がそれぞれ unk でない1個の id になり、`tag` と `bos` の id が eos id に含まれることを確認する。満たさなければ `model_load_failed`。
++  - `template_verified(snapshot)`: `chat_template.jinja` の sha256 が `TEMPLATE_SHA256`（固定リビジョンの template）と一致するか。
+ - `engine`: `Engine` プロトコルの定義と、その実装 `MlxEngine`。
+-  - `ensure_loaded(progress_cb)`: まず `snapshot_download(local_files_only=True)` を試し、ローカルに無ければダウンロードする（ネットワーク確認を毎回しないため）。ダウンロードの進捗は、`snapshot_download` に独自の `tqdm_class` を渡してバイト数を集計し、`progress_cb` で通知する。その後、モデルの README と同じ `mlx_lm.load(path, trust_remote_code=True, tokenizer_config={"trust_remote_code": True})` でロードする（`trust_remote_code` は `load()` の引数であり、`model_config` に入れても効かない）。ロード後に `mx.default_device()` が GPU であることを確認し、CPU なら起動ログにエラーを出す。
+-  - `count_tokens(req)` と `stream(req) -> Iterator[str]`: `tokenizer.apply_chat_template(messages=[{"role":"user","content":text}], add_generation_prompt=True, tokenize=False, target_lang=..., source_lang=..., context=..., glossary=..., form=...)` でプロンプトを作り、`mlx_lm.stream_generate` を temp 0（`make_sampler(temp=0)`）で回す。`TokenizerWrapper.apply_chat_template` は追加の kwargs を HF tokenizer にそのまま渡す。停止条件は独自に実装しない。モデルの `generation_config.json` の `eos_token_id: [1, 16]`（`<|plamo:bos|>`、`<|plamo:tag|>`）を mlx-lm が読み込み、`stream_generate` がそこで止まるため。
+-  - chat template の `raise_exception` が出す例外（`jinja2.TemplateError`。transformers 5 系でこの型になることを段階0で確認する）は `invalid_request` に変換し、template のメッセージをそのまま返す。
++  - `ensure_loaded(progress_cb)`: まず `snapshot_download(local_files_only=True, allow_patterns=MODEL_FILE_PATTERNS)` を試し（`MODEL_FILE_PATTERNS` は mlx-lm の `DEFAULT_ALLOW_PATTERNS`。mlx-lm が取得したキャッシュには README やライセンスが無く、全ファイルを対象にすると `IncompleteSnapshotError` で毎回ダウンロード経路に入るため）、ローカルに無ければダウンロードする（ネットワーク確認を毎回しないため）。ダウンロードの進捗は、`snapshot_download` に独自の `tqdm_class` を渡してバイト数を集計し、`progress_cb` で通知する。その後、モデルの README と同じ `mlx_lm.load(path, trust_remote_code=True, tokenizer_config={"trust_remote_code": True})` でロードする（`trust_remote_code` は `load()` の引数であり、`model_config` に入れても効かない）。ロード後に `pfml3.check_tokenizer` を通し（失敗は `model_load_failed`。同じプロセスでは結果が変わらないので失敗を覚えておき、以後の要求はロードせずに同じエラーを返す）、`template_verified` を計算する。一致しなければ WARNING を1回ログに出すが、使用は止めない。値は `status.template_verified` で見える。その後 `mx.default_device()` が GPU であることを確認し、CPU なら起動ログにエラーを出す。
++  - `count_tokens(req)` と `stream(req, max_tokens, cancelled) -> TextStream`: `pfml3.prompt_ids` の id 列で `mlx_lm.stream_generate` を temp 0（`make_sampler(temp=0)`）で回す。`TextStream` は空でない訳文の断片を返すイテレータで、生成が自然に終わると `finish_reason`（mlx-lm の `"stop"` / `"length"` をそのまま）を持つ。キャンセルで止まった場合は `None` のまま。停止条件は独自に実装しない。モデルの `generation_config.json` の `eos_token_id: [1, 16]`（`<|plamo:bos|>`、`<|plamo:tag|>`）を mlx-lm が読み込み、`stream_generate` がそこで止まるため。
++  - モデル同梱の `chat_template.jinja` は正解（oracle）として残す。`slow` テストが、固定リビジョンの 2b と 0.8b について、`build_prompt` の文字列と `prompt_ids` の id 列が `apply_chat_template` の結果と一致することを確かめる（`PLAMO_ORACLE_MODELS` で別のモデルも指定できる）。リビジョンを上げるときは `pytest -m slow` が通ってから `TEMPLATE_SHA256` を更新する。8b と 31b はテストせず、ロード時の検査と hash の警告だけで守る。
+   - モデル同梱の `serve.py` と同じ MLX 環境変数（`MLX_ENABLE_TF32=0` など）を、import 前に `setdefault` で設定する。`serving_memory.py` のパッチはプロンプトキャッシュ用なので使わない。
+ - `server`: asyncio の UDS サーバー。
+   - 接続の受け付けは並行に行う。生成は GPU を1本しか使わないため、単一ワーカーが FIFO キューから1件ずつ処理する。
+   - ロードと推論は、専用のスレッド1本の `ThreadPoolExecutor(max_workers=1)` で実行する。mlx-lm の生成ストリームはスレッドローカルなので、`asyncio.to_thread` のようにスレッドが入れ替わる実行方式は避ける。ワーカーから接続ハンドラへのトークンの受け渡しは `loop.call_soon_threadsafe(queue.put_nowait, …)` で行う（`asyncio.Queue` はスレッドセーフではないため）。
++  - `op: translate` のリクエストは、`parse_request` の直後に `pfml3.validate` を通す。`shutting_down` と `busy` の判定より前、キューに入れる前に行うので、不正な要求が順番待ちをしたりモデルのロードを起こしたりしない。
+   - キューが 8 件に達していたら、新しい要求には即座に `busy` を返す。
++  - `done.text` は生成された断片の連結から、末尾の `<|plamo:tag|>` または `<|plamo:bos|>` を1個だけ取り除いたもの（mlx-lm は通常これを出さない）。それ以外の加工（trim など）はしない。
+   - 切断の検知: 接続ハンドラはリクエスト行を読んだ後も読み取りを続け、EOF または読み取りエラーを切断とみなす。待ち行列にいれば取り除き、生成中ならキャンセルフラグを立ててトークン単位で中断する。
+   - アイドル監視: 「処理中の要求なし、キュー空、接続なし」の状態が `idle_timeout_secs` 続いたら、まず `server.close()` で新規の受け付けを止める。その直前に受け付けた接続があれば、それを処理し終えてから `exit(0)` する。受け付けを止めた後に来た接続は launchd 側の backlog に残り、プロセスの再起動を引き起こす。
+   - SIGTERM を受けたら、処理中の要求に `error: shutting_down` を送ってから終了する。
+@@ -131,30 +138,35 @@ socket_path = "~/Library/Application Support/plamo-translate/daemon.sock"
+ ```json
+ {"v":1,"op":"translate","text":"…","target_lang":"en","source_lang":null,
+  "context":null,"glossary":[{"source":"推論","target":"inference"}],
+- "form":null,"stream":true,"max_tokens":null}
++ "form":null,"stream":true,"max_tokens":null,
++ "history":[{"source":"プロジェクトの管理画面を開きます。","translation":"Open the project dashboard."}]}
+ {"v":1,"op":"status"}
+ {"v":1,"op":"load"}
+ ```
+ - `op` が `load` の場合は、モデルのダウンロードとロードだけを行い、`progress` と `done` を返す（`model pull` 用）。
+ - `max_tokens` が null の場合は、`min(4 * 入力トークン数 + 256, 32768 - 入力トークン数)` を使う。
+ - `target_lang` に `"auto"` は渡さない（auto の解決はクライアント側で行う）。
++- `history` は省略可能。過去の原文と訳文の組を古い順に並べる。省略、`null`、`[]` は同じ扱い。要素の未知のキーは無視する。デーモンは組を削らず、プロンプト全体（history を含む）と `max_tokens` の合計が 32,768 を超えたら `context_too_long` を返す。組を減らして再送するかはクライアントが決める。
+ 
+ **レスポンス**（デーモンから複数行）
+ ```json
+ {"type":"progress","stage":"downloading","done_bytes":123,"total_bytes":2420000000}
+ {"type":"progress","stage":"loading"}
+ {"type":"delta","text":"The meeting"}
+-{"type":"done","text":"<全文>","usage":{"input_tokens":12,"output_tokens":9},"model":"…","revision":"…"}
+-{"type":"status","model":"…","revision":"…","loaded":true,"uptime_secs":42,"idle_timeout_secs":600,"queue_len":0,"version":"0.1.0","protocol":1}
++{"type":"done","text":"<全文>","finish_reason":"stop","usage":{"input_tokens":12,"output_tokens":9},"model":"…","revision":"…"}
++{"type":"status","model":"…","revision":"…","loaded":true,"uptime_secs":42,"idle_timeout_secs":600,"queue_len":0,"version":"0.1.0","protocol":1,"features":["history"],"template_verified":true}
+ {"type":"error","code":"…","message":"…"}
+ ```
+ - `delta` は `stream:true` のときだけ送る。`done`、`status`、`error` は終端イベントで、送った後にデーモンが接続を閉じる。
+ - `done.text` は常に訳文の全文を持つ。ストリーミングの有無にかかわらず、受信側は `done.text` を正とする。
++- `done.finish_reason` は `translate` の `done` にだけ付く（`"stop"` / `"length"`）。`load` の `done` には付かない。
++- `status.features` はリクエスト側の機能の一覧（現在は `["history"]`）。`status.template_verified` はモデルのロード後にだけ付く。
++- 版の規則: 省略可能なリクエスト項目やイベント項目の追加は `v: 1` のまま行う。デーモンは未知のリクエスト項目を、クライアントは未知のイベント項目を無視する。リクエスト側の機能は `status.features` で告知し、クライアントはそれに依存する要求を送る前に確認する。`v` を上げるのは互換性のない変更のときだけ。
+ - エラーコードは次のとおり。
+ 
+ | code | 意味 |
+ |---|---|
+-| `invalid_request` | JSON の不正、必須項目の欠落、chat template の検証エラー |
++| `invalid_request` | JSON の不正、型の誤り、必須項目の欠落、意味的な検証エラー（PFML3 の制約） |
+ | `unsupported_version` | `v` が非対応 |
+ | `context_too_long` | 入力トークン数と `max_tokens` の合計が 32,768 を超える（生成前に判定する） |
+ | `busy` | キューが満杯 |
+@@ -268,7 +280,7 @@ plamo-translate daemon {start|stop|restart|status|logs [-f]}
+ 
+ ## 10. テスト方針
+ - **プロトコル fixtures**: `protocol/fixtures/` に、リクエストとレスポンス列の組を NDJSON で置く（正常系、stream:false、各エラーコード、未知フィールド）。pytest（デーモンが fixture どおりに応答するか）と Rust（クライアントが fixture を正しく解釈するか）の両方から読む。
+-- **デーモン**（pytest + pytest-asyncio）: `FakeEngine` を差し込んで、FIFO の直列化、`busy`、切断時の中断（待ち行列中・生成中・`stream:false` の各場合）、アイドル時の exit（終了直前に受け付けた接続を取りこぼさないこと）、SIGTERM、`context_too_long`、template 例外の変換を確認する。`activation` は `--socket` 経路だけをテストする（launchd 経路は手動確認）。実モデル（`0.8b-MLX-4bit`）を使う結合テストは `@pytest.mark.slow` を付ける。
++- **デーモン**（pytest + pytest-asyncio）: `FakeEngine` を差し込んで、FIFO の直列化、`busy`、切断時の中断（待ち行列中・生成中・`stream:false` の各場合）、アイドル時の exit（終了直前に受け付けた接続を取りこぼさないこと）、SIGTERM、`context_too_long`、検証がキューとロードより先に行われること、`done.text` の末尾の処理と `finish_reason` を確認する。`pfml3` は golden 文字列と検証規則の単体テストで確認する。`activation` は `--socket` 経路だけをテストする（launchd 経路は手動確認）。実モデル（`0.8b-MLX-4bit`）を使う結合テストは `@pytest.mark.slow` を付ける。
+ - **plamo-client**: tokio のフェイク UDS サーバーで fixture を再生する。`resolve_target` と TSV パーサーは単体テストで確認する。
+ - **CLI**: `assert_cmd` に `PLAMO_TRANSLATE_SOCKET` でフェイクサーバーを渡す。plist の生成は `insta` のスナップショットで、launchctl の呼び出しはフェイクの `Launchctl` で、デーモン実行ファイルの探索順は単体テストで確認する。
+ - **MCP**: rmcp のインプロセスクライアントで `tools/list` と `tools/call` を確認する。
+@@ -290,5 +302,6 @@ plamo-translate daemon {start|stop|restart|status|logs [-f]}
+ | MLX 系パッケージの版のずれ（nixpkgs の `mlx-bin` / `mlx-metal` が `mlx-lm` の要求より古い、`mlx` と `mlx-metal` の不一致） | ビルド時の依存チェックで失敗する、または実行時に Metal カーネルが合わない | `nix/mlx-versions.nix` で3つを同時に最新版へ固定し、`just bump-mlx` で追従する（§7） |
+ | モデルのコードが transformers 4.57.1 向けで、nixpkgs は 5 系 | tokenizer の import やテンプレート処理が失敗する | 段階0で確認する。失敗したら overlay で transformers を 4.57 系に固定できるかを検討する（mlx-lm 0.32.2 は transformers 5.7 以上を要求するので、mlx-lm の版も合わせて見直す） |
+ | 上流の remote code の変更 | 予期しない挙動 | revision を固定する（§4） |
++| 上流の chat template や tokenizer の変更（既定以外のモデルや revision を含む） | デーモンの PFML3 プロンプトが学習時の形式からずれる | ロード時に制御トークンを検査して不一致なら `model_load_failed`、template の hash が違えば WARNING と `status.template_verified: false`。`slow` の oracle テストで確認してから `TEMPLATE_SHA256` を更新する（§5） |
+ | 作者の nix-darwin 構成に home-manager が未導入 | 導入の初回に構成変更が必要 | 段階5で `home-manager.darwinModules.home-manager` を追加する手順を書く。既存の `users.users.<user>.packages` などと競合しないか確認する |
+ | launchd の socket activation と Python の相性 | 起動できない | 段階0で確認する。駄目なら `--socket` で自分で bind し、`KeepAlive` で常駐させる方式に退避する（アイドル時の終了はモデルのアンロードに読み替える） |
+-- 
+2.56.0
+

@@ -1,0 +1,455 @@
+From 938bfc5f5c2845ae77fbb4fda920a974b6f46bb4 Mon Sep 17 00:00:00 2001
+From: s <s@x>
+Date: Thu, 5 Nov 2026 23:28:10 +0900
+Subject: [PATCH 5/8] U5
+
+---
+ daemon/src/plamo_translated/engine.py         |   7 +-
+ daemon/src/plamo_translated/mlx_engine.py     |  64 +++++-----
+ daemon/tests/conftest.py                      |   4 +
+ .../tests/test_engine_fakes_and_progress.py   |   7 ++
+ daemon/tests/test_mlx_engine_load_checks.py   |  69 +++++++++++
+ daemon/tests/test_mlx_engine_slow.py          |  32 +++--
+ daemon/tests/test_pfml3_oracle_slow.py        | 117 ++++++++++++++++++
+ 7 files changed, 261 insertions(+), 39 deletions(-)
+ create mode 100644 daemon/tests/test_mlx_engine_load_checks.py
+ create mode 100644 daemon/tests/test_pfml3_oracle_slow.py
+
+diff --git a/daemon/src/plamo_translated/engine.py b/daemon/src/plamo_translated/engine.py
+index 7fda5d2..0abf168 100644
+--- a/daemon/src/plamo_translated/engine.py
++++ b/daemon/src/plamo_translated/engine.py
+@@ -38,13 +38,16 @@ class TextStream(Iterator[str]):
+ class Engine(Protocol):
+     """Model backend driven by the server's single worker thread.
+ 
+-    Every failure is raised as DaemonError: `model_load_failed` for download or
+-    load problems, `invalid_request` for chat template validation errors.
++    Requests reach the engine already validated (pfml3.validate). Every failure
++    is raised as DaemonError, `model_load_failed` for download, load or
++    tokenizer-compatibility problems.
+     """
+ 
+     model: str
+     revision: str
+     loaded: bool
++    # Whether the loaded snapshot's chat template is the one the PFML3 builder was verified against; None until loaded.
++    template_verified: bool | None
+ 
+     def ensure_loaded(self, progress: Callable[[ProgressEvent], None]) -> None:
+         """Download (if needed) and load the model; a no-op once loaded.
+diff --git a/daemon/src/plamo_translated/mlx_engine.py b/daemon/src/plamo_translated/mlx_engine.py
+index 84565b7..6b55905 100644
+--- a/daemon/src/plamo_translated/mlx_engine.py
++++ b/daemon/src/plamo_translated/mlx_engine.py
+@@ -13,7 +13,6 @@ from collections.abc import Callable, Iterator  # noqa: E402
+ from contextlib import closing  # noqa: E402
+ from pathlib import Path  # noqa: E402
+ 
+-import jinja2.exceptions  # noqa: E402
+ import mlx.core as mx  # noqa: E402
+ from huggingface_hub import snapshot_download  # noqa: E402
+ from huggingface_hub.errors import LocalEntryNotFoundError  # noqa: E402
+@@ -21,6 +20,7 @@ from mlx_lm import load, stream_generate  # noqa: E402
+ from mlx_lm.sample_utils import make_sampler  # noqa: E402
+ from tqdm.std import tqdm  # noqa: E402
+ 
++from . import pfml3  # noqa: E402
+ from .engine import Engine, ProgressEvent, TextStream  # noqa: E402
+ from .protocol import DaemonError, TranslateRequest  # noqa: E402
+ 
+@@ -97,35 +97,62 @@ class _NullWriter:
+         pass
+ 
+ 
++TEMPLATE_DRIFT_WARNING = (
++    "bundled chat template differs from the one the PFML3 builder was verified against "
++    "(re-run the slow oracle tests)"
++)
++
++
+ class MlxEngine(Engine):
+     def __init__(self, model: str, revision: str, hub_cache: Path):
+         self.model = model
+         self.revision = revision
+         self.hub_cache = hub_cache
+         self.loaded = False
++        self.template_verified: bool | None = None
++        # Set when the tokenizer fails the PFML3 checks; the snapshot cannot change within the process.
++        self._incompatible: str | None = None
+         self._model = None
+         self._tokenizer = None
+ 
+     def ensure_loaded(self, progress: Callable[[ProgressEvent], None]) -> None:
+         if self.loaded:
+             return
++        if self._incompatible is not None:
++            raise DaemonError("model_load_failed", self._incompatible)
+         try:
+             path = self._resolve_snapshot(progress)
+             progress(ProgressEvent("loading"))
+-            self._model, self._tokenizer = load(
++            model, tokenizer = load(
+                 path, trust_remote_code=True, tokenizer_config={"trust_remote_code": True}
+             )
+         except Exception as e:
+             raise DaemonError("model_load_failed", f"{type(e).__name__}: {e}") from e
++        try:
++            pfml3.check_tokenizer(tokenizer)
++        except DaemonError as e:
++            self._incompatible = e.message
++            raise
++        template_verified = pfml3.template_verified(Path(path))
++        if not template_verified:
++            log.warning(TEMPLATE_DRIFT_WARNING)
++        self._warn_unless_gpu()
++        self._model, self._tokenizer = model, tokenizer
++        self.template_verified = template_verified
++        self.loaded = True
++
++    def _warn_unless_gpu(self) -> None:
+         device = mx.default_device()
+         if device.type != mx.gpu:
+             log.error("MLX default device is %s, not GPU; generation will be very slow", device)
+-        self.loaded = True
+ 
+     def _resolve_snapshot(self, progress: Callable[[ProgressEvent], None]) -> str:
+         try:
+             return snapshot_download(
+-                self.model, revision=self.revision, cache_dir=self.hub_cache, local_files_only=True
++                self.model,
++                revision=self.revision,
++                cache_dir=self.hub_cache,
++                local_files_only=True,
+             )
+         except LocalEntryNotFoundError:
+             pass
+@@ -140,36 +167,17 @@ class MlxEngine(Engine):
+         download_progress.finish()
+         return path
+ 
+-    def _prompt_tokens(self, req: TranslateRequest) -> list[int]:
++    def _prompt_ids(self, req: TranslateRequest) -> list[int]:
+         if not self.loaded:
+             raise DaemonError("internal", "model is not loaded")
+-        kwargs: dict = {"target_lang": req.target_lang}
+-        for key in ("source_lang", "context", "form"):
+-            value = getattr(req, key)
+-            if value is not None:
+-                kwargs[key] = value
+-        if req.glossary:
+-            kwargs["glossary"] = [{"source": g.source, "target": g.target} for g in req.glossary]
+-        try:
+-            prompt = self._tokenizer.apply_chat_template(
+-                [{"role": "user", "content": req.text}],
+-                add_generation_prompt=True,
+-                tokenize=False,
+-                **kwargs,
+-            )
+-        except jinja2.exceptions.TemplateError as e:
+-            raise DaemonError("invalid_request", str(e)) from e
+-        # Same rule as stream_generate for string prompts, so the count matches what is generated from.
+-        bos = self._tokenizer.bos_token
+-        add_special_tokens = bos is None or not prompt.startswith(bos)
+-        return self._tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
++        return pfml3.prompt_ids(self._tokenizer, req)
+ 
+     def count_tokens(self, req: TranslateRequest) -> int:
+-        return len(self._prompt_tokens(req))
++        return len(self._prompt_ids(req))
+ 
+     def stream(self, req: TranslateRequest, max_tokens: int, cancelled: threading.Event) -> TextStream:
+-        # Not a generator itself, so template errors surface at the call rather than on first next().
+-        return TextStream(self._generate(self._prompt_tokens(req), max_tokens, cancelled))
++        # Not a generator itself, so encoding errors surface at the call rather than on first next().
++        return TextStream(self._generate(self._prompt_ids(req), max_tokens, cancelled))
+ 
+     def _generate(
+         self, prompt: list[int], max_tokens: int, cancelled: threading.Event
+diff --git a/daemon/tests/conftest.py b/daemon/tests/conftest.py
+index b121379..68064e1 100644
+--- a/daemon/tests/conftest.py
++++ b/daemon/tests/conftest.py
+@@ -35,6 +35,10 @@ class FakeEngine(Engine):
+         self.calls: list[TranslateRequest] = []
+         self.saw_cancel = False
+ 
++    @property
++    def template_verified(self) -> bool | None:
++        return True if self.loaded else None
++
+     @classmethod
+     def from_fixture(cls, d: dict) -> "FakeEngine":
+         keys = ("tokens", "input_tokens", "load_error", "download")
+diff --git a/daemon/tests/test_engine_fakes_and_progress.py b/daemon/tests/test_engine_fakes_and_progress.py
+index b5ad89c..bce8084 100644
+--- a/daemon/tests/test_engine_fakes_and_progress.py
++++ b/daemon/tests/test_engine_fakes_and_progress.py
+@@ -144,3 +144,10 @@ def test_fake_engine_cancelled_stream_has_no_finish_reason():
+ def test_text_stream_skips_empty_pieces_and_keeps_finish_reason():
+     s = TextStream([("a", None), ("", None), ("b", None), ("", "stop")])
+     assert list(s) == ["a", "b"] and s.finish_reason == "stop"
++
++
++def test_fake_engine_template_verified_once_loaded():
++    e = FakeEngine()
++    assert e.template_verified is None
++    e.ensure_loaded(lambda p: None)
++    assert e.template_verified is True
+diff --git a/daemon/tests/test_mlx_engine_load_checks.py b/daemon/tests/test_mlx_engine_load_checks.py
+new file mode 100644
+index 0000000..b8545d0
+--- /dev/null
++++ b/daemon/tests/test_mlx_engine_load_checks.py
+@@ -0,0 +1,69 @@
++import hashlib
++import logging
++
++import pytest
++
++from conftest import StubTokenizer
++from plamo_translated import mlx_engine
++from plamo_translated.mlx_engine import TEMPLATE_DRIFT_WARNING, MlxEngine
++from plamo_translated.pfml3 import CONTROL_TOKENS, TEMPLATE_FILE, TEMPLATE_SHA256
++from plamo_translated.protocol import DaemonError
++
++# Any bytes will do: the pinned hash is patched to this template's hash.
++TEMPLATE = b"{{- bos_token -}}"
++
++
++@pytest.fixture
++def snapshot(tmp_path, monkeypatch):
++    (tmp_path / TEMPLATE_FILE).write_bytes(TEMPLATE)
++    monkeypatch.setattr("plamo_translated.pfml3.TEMPLATE_SHA256", hashlib.sha256(TEMPLATE).hexdigest())
++    monkeypatch.setattr(MlxEngine, "_resolve_snapshot", lambda self, progress: str(tmp_path))
++    monkeypatch.setattr(MlxEngine, "_warn_unless_gpu", lambda self: None)
++    return tmp_path
++
++
++def use_tokenizer(monkeypatch, tok):
++    monkeypatch.setattr(mlx_engine, "load", lambda path, **kw: (object(), tok))
++
++
++def test_load_reports_verified_template(snapshot, monkeypatch, caplog):
++    use_tokenizer(monkeypatch, StubTokenizer())
++    e = MlxEngine("m", "r", snapshot)
++    assert e.template_verified is None
++    with caplog.at_level(logging.WARNING):
++        e.ensure_loaded(lambda p: None)
++    assert (e.loaded, e.template_verified) == (True, True)
++    assert TEMPLATE_DRIFT_WARNING not in caplog.text
++
++
++@pytest.mark.parametrize("alter", [lambda p: p.write_bytes(TEMPLATE + b"\n"), lambda p: p.unlink()])
++def test_altered_or_missing_template_loads_unverified_with_one_warning(snapshot, monkeypatch, caplog, alter):
++    alter(snapshot / TEMPLATE_FILE)
++    use_tokenizer(monkeypatch, StubTokenizer())
++    e = MlxEngine("m", "r", snapshot)
++    with caplog.at_level(logging.WARNING):
++        e.ensure_loaded(lambda p: None)
++        e.ensure_loaded(lambda p: None)
++    assert (e.loaded, e.template_verified) == (True, False)
++    assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == [TEMPLATE_DRIFT_WARNING]
++
++
++def test_tokenizer_without_msg_token_fails_load_once_per_process(snapshot, monkeypatch):
++    ids = {t: i for i, t in enumerate(CONTROL_TOKENS, 1) if t != "<|plamo:msg|>"}
++    loads = []
++    monkeypatch.setattr(mlx_engine, "load", lambda path, **kw: loads.append(path) or (object(), StubTokenizer(ids=ids)))
++    e = MlxEngine("m", "r", snapshot)
++    errors = []
++    for _ in range(2):
++        with pytest.raises(DaemonError) as ex:
++            e.ensure_loaded(lambda p: None)
++        errors.append((ex.value.code, ex.value.message))
++    assert errors[0] == errors[1]
++    assert errors[0][0] == "model_load_failed"
++    assert errors[0][1].startswith("model tokenizer does not expose the PFML3 control tokens")
++    assert len(loads) == 1
++    assert (e.loaded, e.template_verified) == (False, None)
++
++
++def test_template_sha256_is_the_pinned_value():
++    assert TEMPLATE_SHA256 == "cd49e7e0dfa8ec847c163db88dfca89b280dddbb73ddc60ba38c62a420eaced2"
+diff --git a/daemon/tests/test_mlx_engine_slow.py b/daemon/tests/test_mlx_engine_slow.py
+index 0703cfe..dc48bfd 100644
+--- a/daemon/tests/test_mlx_engine_slow.py
++++ b/daemon/tests/test_mlx_engine_slow.py
+@@ -5,7 +5,7 @@ import pytest
+ 
+ from plamo_translated.config import paths
+ from plamo_translated.mlx_engine import MlxEngine
+-from plamo_translated.protocol import DaemonError, TranslateRequest
++from plamo_translated.protocol import DaemonError, HistoryEntry, TranslateRequest
+ 
+ pytestmark = pytest.mark.slow
+ 
+@@ -30,16 +30,29 @@ def test_mlx_engine_japanese_output_has_no_replacement_chars(engine):
+     assert all("�" not in p for p in parts) and "月曜" in "".join(parts)
+ 
+ 
+-def test_reserved_token_input_is_invalid_request(engine):
+-    with pytest.raises(DaemonError) as e:
+-        engine.count_tokens(TranslateRequest(text="<|plamo:tag|>x", target_lang="en"))
+-    assert e.value.code == "invalid_request" and "reserved PFML tokens" in e.value.message
++def test_mlx_engine_reports_stop_and_verified_template(engine):
++    stream = engine.stream(TranslateRequest(text="おはようございます。", target_lang="en"), 128, threading.Event())
++    out = "".join(stream)
++    assert stream.finish_reason == "stop" and out.strip() and "<|plamo" not in out
++    assert engine.template_verified is True
+ 
+ 
+-def test_form_requires_ja_target(engine):
+-    with pytest.raises(DaemonError) as e:
+-        engine.count_tokens(TranslateRequest(text="hi", target_lang="en", form="polite"))
+-    assert e.value.code == "invalid_request"
++def test_mlx_engine_reports_length_when_truncated(engine):
++    stream = engine.stream(TranslateRequest(text="長い文章です。" * 20, target_lang="en"), 3, threading.Event())
++    assert len(list(stream)) <= 3 and stream.finish_reason == "length"
++
++
++def test_mlx_engine_translates_with_history(engine):
++    req = TranslateRequest(
++        text="オーナーでフィルタリングすることもできます。",
++        target_lang="en",
++        source_lang="ja",
++        history=(HistoryEntry("プロジェクトの管理画面を開きます。", "Open the project dashboard."),),
++    )
++    stream = engine.stream(req, 128, threading.Event())
++    out = "".join(stream)
++    assert stream.finish_reason == "stop" and "owner" in out.lower()
++    assert engine.count_tokens(req) > engine.count_tokens(TranslateRequest(text=req.text, target_lang="en", source_lang="ja"))
+ 
+ 
+ def test_cancel_stops_stream(engine):
+@@ -55,3 +68,4 @@ def test_load_failure_maps_to_model_load_failed(tmp_path):
+     with pytest.raises(DaemonError) as ex:
+         e.ensure_loaded(lambda p: None)
+     assert ex.value.code == "model_load_failed"
++
+diff --git a/daemon/tests/test_pfml3_oracle_slow.py b/daemon/tests/test_pfml3_oracle_slow.py
+new file mode 100644
+index 0000000..a064346
+--- /dev/null
++++ b/daemon/tests/test_pfml3_oracle_slow.py
+@@ -0,0 +1,117 @@
++"""The bundled chat_template.jinja is the oracle for the PFML3 builder.
++
++PLAMO_ORACLE_MODELS overrides the snapshots: comma-separated `repo@revision`, resolved
++from the daemon's hub cache without network access.
++"""
++
++import os
++from pathlib import Path
++
++import pytest
++from huggingface_hub import snapshot_download
++from mlx_lm.utils import load_config, load_tokenizer
++
++from pfml3_cases import CASES, template_arguments
++from plamo_translated.config import DEFAULT_MODEL, DEFAULT_REVISION, paths
++from plamo_translated.pfml3 import build_prompt, check_tokenizer, prompt_ids, validate
++from plamo_translated.protocol import DaemonError, GlossaryEntry, HistoryEntry, TranslateRequest
++
++pytestmark = pytest.mark.slow
++
++DEFAULT_ORACLE_MODELS = (
++    f"{DEFAULT_MODEL}@{DEFAULT_REVISION},"
++    "pfnet/plamo-3-translate-0.8b-MLX-4bit@e5fe5b7f26ebaeae48db0ce644b932d1d9b91aaa"
++)
++# The tokenizer and template files only; the 2b weights may be absent or partial in the cache.
++TOKENIZER_FILES = ["*.json", "*.py", "*.jinja", "*.jsonl"]
++MODELS = os.environ.get("PLAMO_ORACLE_MODELS", DEFAULT_ORACLE_MODELS).split(",")
++
++
++@pytest.fixture(scope="module", params=MODELS)
++def tokenizer(request):
++    repo, revision = request.param.split("@")
++    snapshot = Path(
++        snapshot_download(
++            repo,
++            revision=revision,
++            cache_dir=paths(Path.home()).hub_cache,
++            local_files_only=True,
++            allow_patterns=TOKENIZER_FILES,
++        )
++    )
++    # Same tokenizer construction as mlx_lm.load in MlxEngine, without loading weights.
++    return load_tokenizer(
++        snapshot, {"trust_remote_code": True}, eos_token_ids=load_config(snapshot).get("eos_token_id")
++    )
++
++
++@pytest.mark.parametrize("name", sorted(CASES))
++def test_oracle_prompt_string(tokenizer, name):
++    messages, kwargs = template_arguments(CASES[name])
++    expected = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False, **kwargs)
++    assert build_prompt(CASES[name]) == expected
++
++
++@pytest.mark.parametrize("name", sorted(CASES))
++def test_oracle_prompt_ids(tokenizer, name):
++    messages, kwargs = template_arguments(CASES[name])
++    expected = tokenizer.apply_chat_template(
++        messages, add_generation_prompt=True, tokenize=True, return_dict=False, **kwargs
++    )
++    ids = prompt_ids(tokenizer, CASES[name])
++    assert ids == list(expected)
++    assert ids[0] == tokenizer.bos_token_id and tokenizer.bos_token_id not in ids[1:]
++
++
++def test_oracle_tokenizer_invariants(tokenizer):
++    check_tokenizer(tokenizer)
++
++
++def _req(**kw) -> TranslateRequest:
++    return TranslateRequest(**{"text": "x", "target_lang": "ja", **kw})
++
++
++# Accept/reject agreement with the template (messages differ by design: field names and indexes).
++AGREEMENT = {
++    "text_ideographic_space": (_req(text="\u3000"), False),
++    "text_nbsp": (_req(text="\u00a0\n"), False),
++    "text_unicode_padded": (_req(text="\u3000a\u00a0"), True),
++    "text_reserved": (_req(text="a<|plamo:"), False),
++    "text_reserved_case": (_req(text="<|PLAMO:tag|>"), True),
++    "target_newline": (_req(target_lang="en\n"), False),
++    "target_upper": (_req(target_lang="EN"), False),
++    "target_region_case": (_req(target_lang="zh-Hans"), False),
++    "target_auto": (_req(target_lang="auto"), False),
++    "target_empty": (_req(target_lang=""), False),
++    "target_three": (_req(target_lang="abc"), True),
++    "source_bad": (_req(source_lang="en-us"), False),
++    "context_reserved": (_req(context="<|plamo:x"), False),
++    "context_ideographic_space": (_req(context="\u3000"), True),
++    "form_en": (_req(target_lang="en", form="polite"), False),
++    "form_easy": (_req(target_lang="ja(easy)", form="plain"), False),
++    "form_unknown": (_req(form="formal"), False),
++    "glossary_empty_target": (_req(glossary=(GlossaryEntry("s", "\u3000"),)), False),
++    "glossary_reserved": (_req(glossary=(GlossaryEntry("<|plamo:item|>", "t"),)), False),
++    "history_empty_translation": (_req(history=(HistoryEntry("a", " "),)), False),
++    "history_reserved_source": (_req(history=(HistoryEntry("<|plamo:msg|>", "A"),)), False),
++}
++
++
++def _accepts(fn) -> bool:
++    try:
++        fn()
++    except DaemonError:
++        return False
++    except Exception as e:  # the template raises jinja2.TemplateError
++        if type(e).__name__ != "TemplateError":
++            raise
++        return False
++    return True
++
++
++@pytest.mark.parametrize("name", sorted(AGREEMENT))
++def test_oracle_validate_agrees_with_template(tokenizer, name):
++    req, accepted = AGREEMENT[name]
++    messages, kwargs = template_arguments(req)
++    template = _accepts(lambda: tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False, **kwargs))
++    assert (_accepts(lambda: validate(req)), template) == (accepted, accepted)
+-- 
+2.56.0
+
