@@ -11,7 +11,13 @@
   };
 
   outputs =
-    { nixpkgs, crane, ... }:
+    {
+      self,
+      nixpkgs,
+      crane,
+      home-manager,
+      ...
+    }:
     let
       system = "aarch64-darwin";
       overlay = import ./nix/overlay.nix;
@@ -40,6 +46,8 @@
     {
       overlays.default = overlay;
 
+      homeManagerModules.default = import ./nix/hm-module.nix { inherit self; };
+
       packages.${system} = packages;
 
       apps.${system} = nixpkgs.lib.genAttrs' [
@@ -53,7 +61,9 @@
       ] (cmd: nixpkgs.lib.nameValuePair "daemon-${cmd}" (daemonApp cmd));
 
       checks.${system} = import ./nix/checks.nix {
-        inherit craneLib packages;
+        inherit pkgs craneLib packages;
+        inherit home-manager;
+        hmModule = self.homeManagerModules.default;
         inherit (build) cargoArgs cargoArtifacts;
       };
 
