@@ -125,3 +125,6 @@ def test_route_library_logging_sends_records_to_root_not_stderr(capfd):
     messages = [r.getMessage() for r in records]
     assert "from-transformers" in messages and "from-hub" in messages
     assert capfd.readouterr().err == ""
+    for name in ("transformers", "huggingface_hub"):
+        # Library handlers hold the stderr stream captured at import time, so check them directly.
+        assert [h for h in logging.getLogger(name).handlers if type(h) is logging.StreamHandler] == []
