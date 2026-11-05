@@ -14,7 +14,6 @@ rmcp = { version = "=3.8.0", features = ["server", "transport-io", "macros"] }
 schemars = "1"
 serde = { version = "1.0.229", features = ["derive"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "io-std"] }
-tokio-util = "0.7.20"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 
