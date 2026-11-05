@@ -13,6 +13,12 @@ class GlossaryEntry:
 
 
 @dataclass(frozen=True)
+class HistoryEntry:
+    source: str
+    translation: str
+
+
+@dataclass(frozen=True)
 class TranslateRequest:
     text: str
     target_lang: str
@@ -22,6 +28,7 @@ class TranslateRequest:
     form: str | None = None
     stream: bool = True
     max_tokens: int | None = None
+    history: tuple[HistoryEntry, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -72,6 +79,22 @@ def _parse_glossary(raw) -> tuple[GlossaryEntry, ...]:
     return tuple(entries)
 
 
+def _parse_history(raw) -> tuple[HistoryEntry, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise _invalid("field history must be an array")
+    entries = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise _invalid("history entries must be objects")
+        source, translation = item.get("source"), item.get("translation")
+        if not isinstance(source, str) or not isinstance(translation, str):
+            raise _invalid("history entries need string source and translation")
+        entries.append(HistoryEntry(source, translation))
+    return tuple(entries)
+
+
 def parse_request(line: bytes) -> TranslateRequest | StatusRequest | LoadRequest:
     if len(line) > MAX_LINE_BYTES:
         raise _invalid("request line exceeds 4 MiB")
@@ -112,6 +135,7 @@ def parse_request(line: bytes) -> TranslateRequest | StatusRequest | LoadRequest
         form=_str_field(obj, "form"),
         stream=stream,
         max_tokens=max_tokens,
+        history=_parse_history(obj.get("history")),
     )
 
 
@@ -135,10 +159,18 @@ def delta(text: str) -> dict:
     return _event("delta", text=text)
 
 
-def done(text: str, input_tokens: int, output_tokens: int, model: str, revision: str) -> dict:
+def done(
+    text: str,
+    input_tokens: int,
+    output_tokens: int,
+    model: str,
+    revision: str,
+    finish_reason: str | None = None,
+) -> dict:
     return _event(
         "done",
         text=text,
+        finish_reason=finish_reason,
         usage={"input_tokens": input_tokens, "output_tokens": output_tokens},
         model=model,
         revision=revision,

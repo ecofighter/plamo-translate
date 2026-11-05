@@ -6,6 +6,7 @@ import pytest
 from plamo_translated.protocol import (
     DaemonError,
     GlossaryEntry,
+    HistoryEntry,
     LoadRequest,
     StatusRequest,
     TranslateRequest,
@@ -30,6 +31,41 @@ def test_parse_translate_minimal():
 def test_parse_glossary_entries():
     r = parse_request('{"v":1,"op":"translate","text":"x","target_lang":"en","glossary":[{"source":"推論","target":"inference"}]}'.encode())
     assert r.glossary == (GlossaryEntry("推論", "inference"),)
+
+
+def test_parse_history_entries_in_order_ignoring_extra_keys():
+    r = parse_request('{"v":1,"op":"translate","text":"x","target_lang":"en","history":[{"source":"a","translation":"A","note":1},{"source":"b","translation":"B"}]}'.encode())
+    assert r.history == (HistoryEntry("a", "A"), HistoryEntry("b", "B"))
+
+
+@pytest.mark.parametrize("history", ["", ',"history":null', ',"history":[]'])
+def test_parse_absent_null_and_empty_history_are_equal(history):
+    line = f'{{"v":1,"op":"translate","text":"x","target_lang":"en"{history}}}'.encode()
+    assert parse_request(line) == TranslateRequest(text="x", target_lang="en")
+
+
+@pytest.mark.parametrize(("history", "message"), [
+    ('"x"', "field history must be an array"),
+    ('{"source":"a","translation":"A"}', "field history must be an array"),
+    ('["a"]', "history entries must be objects"),
+    ('[{"source":"a"}]', "history entries need string source and translation"),
+    ('[{"source":"a","translation":1}]', "history entries need string source and translation"),
+    ('[{"source":"a","target":"A"}]', "history entries need string source and translation"),
+])
+def test_parse_rejects_malformed_history(history, message):
+    with pytest.raises(DaemonError) as e:
+        parse_request(f'{{"v":1,"op":"translate","text":"x","target_lang":"en","history":{history}}}'.encode())
+    assert (e.value.code, e.value.message) == ("invalid_request", message)
+
+
+def test_parse_type_errors_precede_history_errors():
+    with pytest.raises(DaemonError) as e:
+        parse_request(b'{"v":1,"op":"translate","text":"x","target_lang":"en","form":1,"history":"x"}')
+    assert e.value.message == "field form must be a string"
+
+
+def test_done_carries_finish_reason_after_text():
+    assert list(done("t", 1, 2, "m", "r", finish_reason="stop")) == ["type", "text", "finish_reason", "usage", "model", "revision"]
 
 
 def test_parse_load():
