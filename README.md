@@ -106,6 +106,51 @@ claude mcp add plamo-translate -- plamo-translate-mcp
 
 1 回の呼び出しのタイムアウトは 300 秒 (初回のダウンロードを含むため)。環境変数 `PLAMO_TRANSLATE_MCP_TIMEOUT_SECS` で秒数を変更できる。
 
+## Claude Code の日英レイヤ (`plamo-ja-bridge`)
+
+Claude Code の mod。日本語で入力すると英訳して Claude に送り、Claude の英語の応答を段落ごとに和訳して表示する。Claude には英文だけが届き、transcript にも英文が残る。翻訳には `plamo-translate` CLI を使うので、CLI とデーモンを先に導入しておく。Claude Code v2.1.317 で動作を確かめた。
+
+```
+/plugin install plamo-ja-bridge --marketplace ecofighter/plamo-translate
+```
+
+開発中のチェックアウトから読み込むときは `claude --plugin-dir ./claude-plugin` を使う。
+
+### 使い方
+
+| 入力 | 動き |
+|---|---|
+| `/ja` | オンとオフを切り替える |
+| `/ja on` / `/ja off` | 明示的に切り替える |
+| `/ja status` | オン・オフ、対訳の組数、翻訳に使う CLI を表示する |
+
+オンの間はプロンプトの下に `ja⇄en` が表示される。日本語を含むプロンプトを送ると、英訳が確認ダイアログに出る。「この英訳で送る」「原文のまま送る」「やめる」から選ぶか、英文を自分で入力して送る。`/` や `!` で始まる入力と、日本語を含まない入力は翻訳しない。コードフェンスの中は入力でも出力でも翻訳しない。
+
+同じセッションで送ったプロンプトと和訳した段落は対訳として覚え、次の翻訳に履歴として渡す (用語と言い回しがそろう)。対訳はセッションの中だけで使い、`/clear` や mod の読み込み直しで消える。固定の用語は `config.toml` の `glossary_file` で決める。
+
+翻訳に失敗したときは、入力では「原文のまま送る」か「やめる」を選ぶ。出力ではその段落を英語のまま表示する。
+
+### 設定 (userConfig)
+
+`/plugin` の Configure か `/config` で変える。
+
+| キー | 既定 | 内容 |
+|---|---|---|
+| `enabledByDefault` | `false` | セッションを始めたときにオンにするか |
+| `confirm` | `true` | 送る前に英訳を確認するか |
+| `translator` | `plamo-translate` | 翻訳に使う CLI のパス |
+| `historyPairs` | `8` | 履歴に入れる対訳の組の上限 |
+| `historyChars` | `6000` | 履歴に入れる文字数の上限 |
+| `form` | `auto` | 和訳の丁寧さ (`auto` / `polite` / `plain`) |
+| `flushLines` | `20` | 空行のない段落を何行で区切って表示するか |
+
+### 制限
+
+- transcript とプロンプト履歴には、送った英文が残る。
+- ツールの呼び出しと結果、許可の確認、選択肢つきの質問、思考過程は英語のまま表示する。
+- 和訳は Claude の生成より遅れて表示され、応答が終わってから数秒かかることがある。和訳が終わる前に次のプロンプトを送ると、その応答は英語の原文で表示されることがある。
+- Claude が日本語で答えた段落は、そのまま表示する。
+
 ## 設定 (`config.toml`)
 
 最初に見つかった 1 ファイルだけを読む: `$PLAMO_TRANSLATE_CONFIG`、次に `${XDG_CONFIG_HOME:-~/.config}/plamo-translate/config.toml`。すべて省略可。デーモンの起動時に 1 回だけ読む。
