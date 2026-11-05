@@ -18,6 +18,7 @@ from huggingface_hub import snapshot_download  # noqa: E402
 from huggingface_hub.errors import LocalEntryNotFoundError  # noqa: E402
 from mlx_lm import load, stream_generate  # noqa: E402
 from mlx_lm.sample_utils import make_sampler  # noqa: E402
+from mlx_lm.utils import DEFAULT_ALLOW_PATTERNS  # noqa: E402
 from tqdm.std import tqdm  # noqa: E402
 
 from . import pfml3  # noqa: E402
@@ -29,6 +30,9 @@ log = logging.getLogger(__name__)
 PROGRESS_MIN_INTERVAL_SECS = 0.25
 # snapshot_download aggregates bytes written by every file into the bar with this description.
 _RECONSTRUCT_BAR_PREFIX = "Reconstructing"
+# The files mlx_lm.load needs. Caches filled by mlx-lm hold only these, and a cached-snapshot
+# check over every repository file would reject them (IncompleteSnapshotError) and force a download.
+MODEL_FILE_PATTERNS = DEFAULT_ALLOW_PATTERNS
 
 
 class DownloadProgress:
@@ -153,6 +157,7 @@ class MlxEngine(Engine):
                 revision=self.revision,
                 cache_dir=self.hub_cache,
                 local_files_only=True,
+                allow_patterns=MODEL_FILE_PATTERNS,
             )
         except LocalEntryNotFoundError:
             pass

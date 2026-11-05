@@ -3,7 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from plamo_translated.config import paths
+from plamo_translated import mlx_engine
+from plamo_translated.config import DEFAULT_MODEL, DEFAULT_REVISION, paths
 from plamo_translated.mlx_engine import MlxEngine
 from plamo_translated.protocol import DaemonError, HistoryEntry, TranslateRequest
 
@@ -69,3 +70,12 @@ def test_load_failure_maps_to_model_load_failed(tmp_path):
         e.ensure_loaded(lambda p: None)
     assert ex.value.code == "model_load_failed"
 
+
+def test_default_model_loads_from_cache_with_verified_template(monkeypatch):
+    def no_download(*args, **kwargs):
+        raise AssertionError("the cached default snapshot must load without the download path")
+
+    monkeypatch.setattr(mlx_engine, "DownloadProgress", no_download)
+    e = MlxEngine(DEFAULT_MODEL, DEFAULT_REVISION, paths(Path.home()).hub_cache)
+    e.ensure_loaded(lambda p: None)
+    assert (e.loaded, e.template_verified) == (True, True)
