@@ -85,6 +85,7 @@ fn build_request(config: &Config, args: TranslateArgs) -> Result<TranslateReques
         target_lang,
         source_lang: args.from,
         context,
+        history: Vec::new(),
         glossary: merge_glossaries(lists),
         form: args.form,
         stream: !args.no_stream,
@@ -214,6 +215,7 @@ async fn translate(client: &Client, req: &TranslateRequest, json: bool, no_strea
                 usage,
                 model,
                 revision,
+                ..
             } => {
                 progress.clear();
                 if json {

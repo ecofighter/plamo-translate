@@ -7,12 +7,24 @@ pub struct GlossaryEntry {
     pub target: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct HistoryEntry {
+    /// A text translated earlier in the same document.
+    pub source: String,
+    /// The translation returned for it, unchanged.
+    pub translation: String,
+}
+
+pub const FEATURE_HISTORY: &str = "history";
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TranslateRequest {
     pub text: String,
     pub target_lang: String,
     pub source_lang: Option<String>,
     pub context: Option<String>,
+    pub history: Vec<HistoryEntry>,
     pub glossary: Vec<GlossaryEntry>,
     pub form: Option<String>,
     pub stream: bool,
@@ -31,6 +43,8 @@ impl Serialize for TranslateRequest {
             source_lang: &'a Option<String>,
             #[serde(skip_serializing_if = "Option::is_none")]
             context: &'a Option<String>,
+            #[serde(skip_serializing_if = "<[HistoryEntry]>::is_empty")]
+            history: &'a [HistoryEntry],
             #[serde(skip_serializing_if = "<[GlossaryEntry]>::is_empty")]
             glossary: &'a [GlossaryEntry],
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -46,6 +60,7 @@ impl Serialize for TranslateRequest {
             target_lang: &self.target_lang,
             source_lang: &self.source_lang,
             context: &self.context,
+            history: &self.history,
             glossary: &self.glossary,
             form: &self.form,
             stream: self.stream,
@@ -71,6 +86,16 @@ pub struct Status {
     pub queue_len: u32,
     pub version: String,
     pub protocol: u32,
+    pub features: Option<Vec<String>>,
+    pub template_verified: Option<bool>,
+}
+
+impl Status {
+    pub fn supports(&self, feature: &str) -> bool {
+        self.features
+            .as_deref()
+            .is_some_and(|f| f.iter().any(|x| x == feature))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -100,6 +125,7 @@ pub enum Event {
     },
     Done {
         text: String,
+        finish_reason: Option<String>,
         usage: Option<Usage>,
         model: Option<String>,
         revision: Option<String>,
@@ -167,5 +193,96 @@ mod tests {
             }
             .is_terminal()
         );
+    }
+    #[test]
+    fn q1_history_request_serializes_exactly() {
+        let j = serde_json::to_value(TranslateRequest {
+            text: "オーナーでフィルタリングすることもできます。".into(),
+            target_lang: "en".into(),
+            source_lang: Some("ja".into()),
+            history: vec![
+                HistoryEntry {
+                    source: "プロジェクトの管理画面を開きます。".into(),
+                    translation: "Open the project dashboard.".into(),
+                },
+                HistoryEntry {
+                    source: "進行中のタスクがすべて表示されます。".into(),
+                    translation: "It lists all active tasks.".into(),
+                },
+            ],
+            stream: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            j,
+            serde_json::json!({
+                "v": 1,
+                "op": "translate",
+                "text": "オーナーでフィルタリングすることもできます。",
+                "target_lang": "en",
+                "source_lang": "ja",
+                "history": [
+                    {"source": "プロジェクトの管理画面を開きます。", "translation": "Open the project dashboard."},
+                    {"source": "進行中のタスクがすべて表示されます。", "translation": "It lists all active tasks."}
+                ],
+                "stream": true
+            })
+        );
+    }
+    #[test]
+    fn empty_history_is_omitted() {
+        let j = serde_json::to_value(TranslateRequest {
+            text: "x".into(),
+            target_lang: "en".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(j.get("history").is_none());
+    }
+    #[test]
+    fn done_finish_reason_parsed_and_optional() {
+        let e: Event =
+            serde_json::from_str(r#"{"type":"done","text":"t","finish_reason":"length"}"#).unwrap();
+        assert_eq!(
+            e,
+            Event::Done {
+                text: "t".into(),
+                finish_reason: Some("length".into()),
+                usage: None,
+                model: None,
+                revision: None
+            }
+        );
+        let e: Event = serde_json::from_str(r#"{"type":"done","text":"t"}"#).unwrap();
+        assert!(matches!(
+            e,
+            Event::Done {
+                finish_reason: None,
+                ..
+            }
+        ));
+    }
+    #[test]
+    fn status_features_and_template_verified() {
+        let base = r#""type":"status","model":"m","revision":"r","loaded":true,"uptime_secs":1,"idle_timeout_secs":2,"queue_len":0,"version":"0","protocol":1"#;
+        let e: Event = serde_json::from_str(&format!(
+            r#"{{{base},"features":["history"],"template_verified":true}}"#
+        ))
+        .unwrap();
+        let Event::Status(s) = e else {
+            panic!("not status")
+        };
+        assert_eq!(s.template_verified, Some(true));
+        assert!(s.supports(FEATURE_HISTORY));
+        assert!(!s.supports("other"));
+
+        let e: Event = serde_json::from_str(&format!("{{{base}}}")).unwrap();
+        let Event::Status(s) = e else {
+            panic!("not status")
+        };
+        assert_eq!(s.features, None);
+        assert_eq!(s.template_verified, None);
+        assert!(!s.supports(FEATURE_HISTORY));
     }
 }

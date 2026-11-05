@@ -101,6 +101,7 @@ impl PlamoServer {
             target_lang: args.target_lang,
             source_lang: args.source_lang,
             context: args.context,
+            history: Vec::new(),
             glossary,
             form: args.form.map(|f| f.as_str().to_string()),
             stream: true,
