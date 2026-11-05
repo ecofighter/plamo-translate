@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib
 import logging
 import os
 import signal
@@ -62,6 +63,22 @@ def _setup_logging(log_dir: Path) -> RotatingFileHandler:
     return handler
 
 
+def route_library_logging() -> None:
+    """transformers and huggingface_hub attach their own stderr handlers; send their records to the root logger."""
+    for name, module in (
+        ("transformers", "transformers.utils.logging"),
+        ("huggingface_hub", "huggingface_hub.utils.logging"),
+    ):
+        try:
+            importlib.import_module(module).enable_propagation()
+        except ImportError:
+            continue
+        library_logger = logging.getLogger(name)
+        for handler in list(library_logger.handlers):
+            if type(handler) is logging.StreamHandler:
+                library_logger.removeHandler(handler)
+
+
 def _teardown_logging(handler: RotatingFileHandler) -> None:
     logging.captureWarnings(False)
     logging.getLogger().removeHandler(handler)
@@ -101,7 +118,9 @@ def main(argv: list[str] | None = None) -> int:
         if not config.revision_pinned:
             log.warning("revision is not pinned; tracking %r", config.revision)
         sock = bind_socket(args.socket) if args.socket else launchd_socket()
-        server = Server(make_engine(config, p), config.idle_timeout_secs, __version__)
+        engine = make_engine(config, p)
+        route_library_logging()
+        server = Server(engine, config.idle_timeout_secs, __version__)
         asyncio.run(_serve(server, sock))
         log.info("exiting")
         return 0

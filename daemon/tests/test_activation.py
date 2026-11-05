@@ -12,6 +12,9 @@ from pathlib import Path
 
 import pytest
 
+import transformers.utils.logging as tl  # noqa: E402  (import notice goes to stderr once)
+from huggingface_hub.utils import logging as hl
+
 from conftest import FakeEngine
 from plamo_translated import __main__ as entry
 from plamo_translated.activation import bind_socket, launchd_socket
@@ -101,3 +104,24 @@ def test_exclude_from_time_machine_failure_only_warns(monkeypatch, caplog, tmp_p
     with caplog.at_level(logging.WARNING):
         entry.exclude_from_time_machine(tmp_path)
     assert "tmutil" in caplog.text
+
+
+def test_route_library_logging_sends_records_to_root_not_stderr(capfd):
+    records: list[logging.LogRecord] = []
+
+    class Collect(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    collector = Collect()
+    root = logging.getLogger()
+    root.addHandler(collector)
+    try:
+        entry.route_library_logging()
+        tl.get_logger("transformers.test").warning("from-transformers")
+        hl.get_logger("huggingface_hub.test").warning("from-hub")
+    finally:
+        root.removeHandler(collector)
+    messages = [r.getMessage() for r in records]
+    assert "from-transformers" in messages and "from-hub" in messages
+    assert capfd.readouterr().err == ""
