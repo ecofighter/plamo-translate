@@ -1,0 +1,138 @@
+import { expect, mock, test } from 'claude-code/testing'
+
+type Run = { argv: string[]; init: { stdin?: string; timeoutMs?: number } }
+
+const done = (text: string) =>
+  JSON.stringify({ type: 'done', text, finish_reason: 'stop', model: 'm', revision: 'r', usage: {} }) + '\n'
+
+interface Harness {
+  runs: Run[]
+  writes: Array<{ path: string; content: string }>
+  translate: (run: Run) => { exitCode: number; stdout: string; stderr: string }
+  failWrite: boolean
+}
+
+function setup(on: any): Harness {
+  const h: Harness = {
+    runs: [],
+    writes: [],
+    translate: (run) => ({ exitCode: 0, stdout: done(`JA:${run.init.stdin}`), stderr: '' }),
+    failWrite: false,
+  }
+  mock.env(on, { TMPDIR: '/tmp' })
+  on('session.start', () => ({ cwd: '/work' }))
+  on('command.register', () => ({ value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+  on('session.id', () => ({ value: 'sess1' }))
+  on('fs.write', ($: unknown, e: { path: string; content?: string; text?: string }) => {
+    if (h.failWrite) return { deny: 'disk full' }
+    h.writes.push({ path: e.path, content: e.content ?? e.text ?? '' })
+    return { value: undefined }
+  })
+  on('process.run', ($: unknown, e: Run) => {
+    h.runs.push(e)
+    return { value: h.translate(e) }
+  })
+  on('classic.MessageDisplay', () => ({}))
+  return h
+}
+
+async function turnOn($: any) {
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  await $.command.run({ command: 'ja', args: 'on' })
+}
+
+let index = 0
+const show = ($: any, message_id: string, delta: string, final = false) =>
+  $.classic.MessageDisplay({
+    hook_event_name: 'MessageDisplay',
+    session_id: 's',
+    transcript_path: '/t',
+    cwd: '/w',
+    turn_id: 't1',
+    message_id,
+    index: index++,
+    final,
+    delta,
+  })
+
+test('paragraph translated when complete', async ($, on) => {
+  setup(on)
+  await turnOn($)
+  expect(await show($, 'm1', 'Hello.\n')).toEqual({ displayContent: '' })
+  expect(await show($, 'm1', '\n')).toEqual({ displayContent: 'JA:Hello.\n\n' })
+})
+
+test('fence shown verbatim', async ($, on) => {
+  const h = setup(on)
+  await turnOn($)
+  expect(await show($, 'm1', '```\ncode\n```\n')).toEqual({ displayContent: '```\ncode\n```\n' })
+  expect(h.runs.length).toBe(0)
+})
+
+test('final flushes and clears', async ($, on) => {
+  setup(on)
+  await turnOn($)
+  await show($, 'm1', 'Held.\n')
+  expect(await show($, 'm1', 'Tail', true)).toEqual({ displayContent: 'JA:Held.\nTail' })
+  expect(await show($, 'm1', 'Next.', true)).toEqual({ displayContent: 'JA:Next.' })
+})
+
+test('failure shows original', async ($, on) => {
+  const h = setup(on)
+  h.translate = () => ({ exitCode: 1, stdout: '', stderr: 'error: model_load_failed: x\n' })
+  await turnOn($)
+  expect(await show($, 'm1', 'Hello.\n\n')).toEqual({ displayContent: 'Hello.\n\n' })
+})
+
+test('history write failure shows original', async ($, on) => {
+  const h = setup(on)
+  await turnOn($)
+  await show($, 'm1', 'First.\n\n')
+  h.failWrite = true
+  expect(await show($, 'm1', 'Second.\n\n')).toEqual({ displayContent: 'Second.\n\n' })
+})
+
+test('uses en-ja history and timeout', async ($, on) => {
+  const h = setup(on)
+  await turnOn($)
+  await show($, 'm1', 'First.\n\nSecond.\n\n')
+  expect(h.runs[0].argv).toEqual(['plamo-translate', '--json', '--no-stream', '-s', 'en', '-t', 'ja'])
+  expect(h.runs[0].init.timeoutMs).toBe(20000)
+  expect(h.runs[1].argv.slice(-2)).toEqual(['--history', '/tmp/plamo-ja-bridge-sess1.jsonl'])
+  expect(JSON.parse(h.writes[0].content.trim())).toEqual({ source: 'First.', translation: 'JA:First.' })
+})
+
+test('table with a changed shape shows the original', async ($, on) => {
+  const h = setup(on)
+  h.translate = () => ({ exitCode: 0, stdout: done('| あ い |\n|---|---|'), stderr: '' })
+  await turnOn($)
+  const table = '| a | b |\n|---|---|\n'
+  expect(await show($, 'm1', table + '\n')).toEqual({ displayContent: table + '\n' })
+})
+
+test('interleaved messages keep separate buffers', async ($, on) => {
+  setup(on)
+  await turnOn($)
+  await show($, 'm1', 'A.\n')
+  await show($, 'm2', 'B.\n')
+  expect(await show($, 'm1', '\n')).toEqual({ displayContent: 'JA:A.\n\n' })
+  expect(await show($, 'm2', '\n')).toEqual({ displayContent: 'JA:B.\n\n' })
+})
+
+test('off passes through', async ($, on) => {
+  const h = setup(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  expect(await show($, 'm1', 'Hello.\n\n')).toEqual({})
+  expect(h.runs.length).toBe(0)
+})
+
+test('disabling mid-message flushes held text as original', async ($, on) => {
+  const h = setup(on)
+  await turnOn($)
+  expect(await show($, 'm1', 'Hello.\n')).toEqual({ displayContent: '' })
+  await $.command.run({ command: 'ja', args: 'off' })
+  expect(await show($, 'm1', 'World.\n')).toEqual({ displayContent: 'Hello.\nWorld.\n' })
+  expect(await show($, 'm1', 'Again.\n')).toEqual({})
+  expect(h.runs.length).toBe(0)
+})

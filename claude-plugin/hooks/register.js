@@ -3,9 +3,13 @@ import { createMemory, dropOldestHalf, isEligiblePair, toJsonl } from './lib/mem
 import { buildArgs, parseResult } from './lib/cli.js'
 import { splitEdges, splitFences } from './lib/segments.js'
 import { containsJapanese, decideSubmission, isPassthroughCommand, LABELS } from './lib/input.js'
+import { createDisplayBuffer, tableShapeMatches } from './lib/display.js'
 
 const STATUS_TEXT = 'ja⇄en'
 const INPUT_TIMEOUT_MS = 60000
+const OUTPUT_TIMEOUT_MS = 20000
+// Verified in an interactive session: an empty displayContent hides the batch (spec 5.2).
+const HOLD_INCOMPLETE = true
 const DROP_REASON = '送信をやめました。'
 
 const confirmQuestion = (en) => `英訳を確認してください。\n\n${en}\n\nこの英訳で送りますか?`
@@ -90,8 +94,27 @@ async function submitJapanese($, ctx, e, next) {
   return next({ ...e, text: decision.custom })
 }
 
+// A block that cannot be translated is shown as written: the display is the only thing at stake.
+async function renderBlock($, ctx, block) {
+  if (block.kind !== 'paragraph' && block.kind !== 'table') return block.text
+  const { lead, core, trail } = splitEdges(block.text)
+  if (core === '') return block.text
+  let result
+  try {
+    result = await translate($, ctx, core, 'en-ja', OUTPUT_TIMEOUT_MS)
+  } catch {
+    return block.text
+  }
+  if (!result.ok) return block.text
+  const ja = result.text.trim()
+  if (block.kind === 'table' && !tableShapeMatches(core, ja)) return block.text
+  if (isEligiblePair(core, ja, result.finishReason)) ctx.memory.add({ ja, en: core })
+  return lead + ja + trail
+}
+
 export function register(on, options) {
   const ctx = { cfg: resolveConfig(options), memory: createMemory() }
+  const displayBuffers = new Map()
   let enabled = ctx.cfg.enabledByDefault
 
   const stateLabel = () => (enabled ? 'オン' : 'オフ')
@@ -124,5 +147,21 @@ export function register(on, options) {
   }).catch(async ($, e, next) => {
     if (next.called) return next(e)
     return { drop: crashReason(next.error.kind) }
+  })
+
+  on('classic.MessageDisplay', async ($, e, next) => {
+    const held = displayBuffers.get(e.message_id)
+    if (!enabled) {
+      if (!held) return next(e)
+      displayBuffers.delete(e.message_id)
+      return { displayContent: held.takeAll().map((b) => b.text).join('') + e.delta }
+    }
+    const buffer = held ?? createDisplayBuffer({ flushLines: ctx.cfg.flushLines, holdIncomplete: HOLD_INCOMPLETE })
+    displayBuffers.set(e.message_id, buffer)
+    const blocks = buffer.push(e.delta, e.final)
+    if (e.final) displayBuffers.delete(e.message_id)
+    let shown = ''
+    for (const block of blocks) shown += await renderBlock($, ctx, block)
+    return { displayContent: shown }
   })
 }
