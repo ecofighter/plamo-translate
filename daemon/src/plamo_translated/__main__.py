@@ -13,8 +13,8 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import NoReturn
 
-from . import __version__
-from .activation import bind_socket, launchd_socket
+from . import __version__, protocol
+from .activation import bind_socket, launchd_socket, reject_pending
 from .config import Config, Paths, load_config, paths
 from .engine import Engine
 from .server import Server
@@ -102,25 +102,34 @@ def main(argv: list[str] | None = None) -> int:
         print(f"plamo-translated {__version__}")
         return 0
 
-    config = load_config(os.environ, Path.home())
-    p = paths(Path.home())
-    os.environ["HF_HUB_CACHE"] = str(p.hub_cache)
-    os.environ["HF_MODULES_CACHE"] = str(p.modules_cache)
-    os.environ.setdefault("MLX_ENABLE_TF32", "0")
-    os.environ.setdefault("MLX_ENABLE_CACHE_THRASHING_CHECK", "0")
-
-    created_hf = _prepare_directories(p)
-    handler = _setup_logging(p.log_dir)
+    # The listening socket comes first so that a startup failure can still answer queued clients.
+    sock = bind_socket(args.socket) if args.socket else launchd_socket()
+    handler: RotatingFileHandler | None = None
     try:
-        if created_hf:
-            exclude_from_time_machine(p.hub_cache.parent)
-        log.info("starting plamo-translated %s (model %s @ %s)", __version__, config.model, config.revision)
-        if not config.revision_pinned:
-            log.warning("revision is not pinned; tracking %r", config.revision)
-        sock = bind_socket(args.socket) if args.socket else launchd_socket()
-        engine = make_engine(config, p)
-        route_library_logging()
-        server = Server(engine, config.idle_timeout_secs, __version__)
+        try:
+            config = load_config(os.environ, Path.home())
+            p = paths(Path.home())
+            os.environ["HF_HUB_CACHE"] = str(p.hub_cache)
+            os.environ["HF_MODULES_CACHE"] = str(p.modules_cache)
+            os.environ.setdefault("MLX_ENABLE_TF32", "0")
+            os.environ.setdefault("MLX_ENABLE_CACHE_THRASHING_CHECK", "0")
+
+            created_hf = _prepare_directories(p)
+            handler = _setup_logging(p.log_dir)
+            if created_hf:
+                exclude_from_time_machine(p.hub_cache.parent)
+            log.info("starting plamo-translated %s (model %s @ %s)", __version__, config.model, config.revision)
+            if not config.revision_pinned:
+                log.warning("revision is not pinned; tracking %r", config.revision)
+            engine = make_engine(config, p)
+            route_library_logging()
+            server = Server(engine, config.idle_timeout_secs, __version__)
+        except Exception as e:
+            # Without a file handler this reaches stderr (daemon.stderr.log) via logging.lastResort.
+            log.exception("startup failed")
+            reply = protocol.encode_event(protocol.error("internal", f"daemon failed to start: {e}"))
+            reject_pending(sock, reply)
+            return 1
         asyncio.run(_serve(server, sock))
         log.info("exiting")
         return 0
@@ -128,7 +137,8 @@ def main(argv: list[str] | None = None) -> int:
         log.exception("fatal error")
         raise
     finally:
-        _teardown_logging(handler)
+        if handler is not None:
+            _teardown_logging(handler)
 
 
 def run() -> NoReturn:

@@ -119,3 +119,56 @@ def test_route_library_logging_sends_records_to_root_not_stderr(capfd):
     for name in ("transformers", "huggingface_hub"):
         # Library handlers hold the stderr stream captured at import time, so check them directly.
         assert [h for h in logging.getLogger(name).handlers if type(h) is logging.StreamHandler] == []
+
+
+
+def _run_failing_main(tmp_path, short_dir, monkeypatch, config_text: str, make_engine) -> tuple[dict, list[int]]:
+    home = tmp_path / "home"
+    cfg = home / ".config/plamo-translate/config.toml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(config_text)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    for var in ("PLAMO_TRANSLATE_CONFIG", "PLAMO_TRANSLATE_SOCKET", "XDG_CONFIG_HOME"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HF_HUB_CACHE", "x")
+    monkeypatch.setenv("HF_MODULES_CACHE", "x")
+    monkeypatch.setattr(entry, "make_engine", make_engine)
+    monkeypatch.setattr(entry, "exclude_from_time_machine", lambda path: None)
+
+    sock = short_dir / "d.sock"
+    result: list[int] = []
+    t = threading.Thread(target=lambda: result.append(entry.main(["--socket", str(sock)])))
+    t.start()
+    try:
+        deadline = time.monotonic() + 5
+        while not sock.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        with socket.socket(socket.AF_UNIX) as c:
+            c.settimeout(5)
+            c.connect(str(sock))
+            c.sendall(b'{"v":1,"op":"status"}\n')
+            reply = json.loads(c.makefile().readline())
+    finally:
+        t.join(10)
+    return reply, result
+
+
+def test_main_invalid_config_replies_internal_error_and_exits_nonzero(tmp_path, short_dir, monkeypatch):
+    reply, result = _run_failing_main(
+        tmp_path, short_dir, monkeypatch, 'idle_timeout_secs = "600"\n', lambda config, paths: FakeEngine()
+    )
+    assert reply["type"] == "error"
+    assert reply["code"] == "internal"
+    assert "idle_timeout_secs" in reply["message"]
+    assert result == [1]
+
+
+def test_main_engine_import_failure_replies_internal_error_and_exits_nonzero(tmp_path, short_dir, monkeypatch):
+    def broken_engine(config, paths):
+        raise ImportError("No module named 'mlx'")
+
+    reply, result = _run_failing_main(tmp_path, short_dir, monkeypatch, "", broken_engine)
+    assert reply == {"type": "error", "code": "internal", "message": "daemon failed to start: No module named 'mlx'"}
+    assert result == [1]
+    assert not any(isinstance(h, RotatingFileHandler) for h in logging.getLogger().handlers)
