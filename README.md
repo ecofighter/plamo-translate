@@ -56,6 +56,7 @@ plamo-translate "会議は来週の月曜日に変更されました。"
 echo "Hello, world" | plamo-translate -t ja
 plamo-translate -t ja --form plain "Thank you for your help."
 plamo-translate --context "ソフトウェアの UI 文言" --glossary ~/glossary.tsv "Commit"
+plamo-translate -t en --history h.jsonl --history-append --history-last 8 < part3.txt   # 前の訳を履歴として渡し、訳を履歴に追記する
 plamo-translate status
 plamo-translate model pull   # モデルを事前にダウンロードしてロードする
 plamo-translate model path   # ウェイトの保存先を表示する
@@ -69,10 +70,15 @@ plamo-translate model path   # ウェイトの保存先を表示する
 | `--context TEXT` / `--context-file FILE` | 訳さない補足の文脈 (どちらか一方) |
 | `--glossary FILE` | TSV の用語集 (原語と訳語をタブで区切る、`#` 始まりはコメント)。複数指定でき、config の `glossary_file` に追加される。重複する原語は後の指定が優先 |
 | `--form polite\|plain` | 日本語の丁寧さ。`-t ja` のときだけ有効 |
+| `--history FILE` | 翻訳履歴の JSONL。1 行に `{"source": "原文", "translation": "訳文"}` を古い順に書く。同じ文書の前の部分とその訳を渡すと、用語や文体がそろう。stdin は TEXT 用なので `-` は指定できない |
+| `--history-append` | 訳し終えたら原文と訳文の組を `--history` のファイルに追記する (なければ作る)。原文は送ったとおり (stdin の末尾の改行も含む) に書く。打ち切られた訳 (`finish_reason` が `stop` 以外)、空の訳、`<\|plamo:` を含む訳は追記せず stderr に警告を出す。履歴が空でもデーモンの対応を先に確かめる |
+| `--history-last N` | `--history` のうち新しい N 組だけを送る (ファイルは変えない) |
 | `--no-stream` | ストリーミングせず、完了後にまとめて出力する |
-| `--json` | 最後の `done` イベントを 1 行の JSON で出力する |
+| `--json` | 最後の `done` イベント (`finish_reason` を含む) を 1 行の JSON で出力する |
 
 終了コード: 0 成功、1 翻訳エラー、2 使い方の誤り、3 デーモンに到達できない。130 は Ctrl-C。進捗表示は stderr が TTY のときだけ出る。
+
+履歴はデーモンが対応している必要がある。古いデーモンが動いていると `daemon does not support translation history; run "plamo-translate daemon restart"` を出して終了コード 1 で終わる。原文、文脈、履歴、用語集に `<|plamo:` を含めると `invalid_request` になる。履歴を含めた入力と出力が 32,768 トークンを超えると `context_too_long` になる (1 行 4 MiB を超えるリクエストは `invalid_request`)。CLI は履歴を自動では削らないので、`--history-last` で減らす。`--history-append` で訳の出力後に追記に失敗すると終了コード 1 になる (訳は出力済み、履歴には未記録)。同じ履歴ファイルを複数のプロセスから同時に使わないこと。
 
 デーモンの操作:
 
@@ -92,7 +98,7 @@ plamo-translate daemon uninstall [--purge [--yes]]   # --purge はモデル、�
 claude mcp add plamo-translate -- plamo-translate-mcp
 ```
 
-`translate` tool が 1 つ使える。引数は `text`、`target_lang` (必須。`ja`、`en`、`zh-hans`、`zh-hant`、`ko`、`fr`、`de`、`es`、`ja(easy)` など)、`source_lang`、`context`、`glossary` (`[{source, target}]`)、`form` (`polite` / `plain`、`target_lang=ja` のときだけ)。config の `glossary_file` も適用され、引数の glossary が優先される。
+`translate` tool が 1 つ使える。引数は `text`、`target_lang` (必須。`ja`、`en`、`zh-hans`、`zh-hant`、`ko`、`fr`、`de`、`es`、`ja(easy)` など)、`source_lang`、`context`、`glossary` (`[{source, target}]`)、`form` (`polite` / `plain`、`target_lang=ja` のときだけ)、`history` (`[{source, translation}]`、同じ文書の前の部分とその訳を古い順に)。config の `glossary_file` も適用され、引数の glossary が優先される。履歴を含めてモデルの上限を超える場合は、古い組から半分ずつ削って再試行し、削ったことを `note:` で始まる 2 つ目の content に書く。打ち切られた訳などの履歴に使えない結果にも同じ形で注記する。
 
 1 回の呼び出しのタイムアウトは 300 秒 (初回のダウンロードを含むため)。環境変数 `PLAMO_TRANSLATE_MCP_TIMEOUT_SECS` で秒数を変更できる。
 
@@ -142,3 +148,5 @@ just bump-mlx   # scripts/bump_mlx.py で版と sha256 を更新 -> nix flake ch
 - 起動自体に失敗している (Python のエラーなど) ときは `~/Library/Logs/plamo-translate/daemon.stderr.log` を見る
 - 終了コード 3 (デーモンに到達できない): LaunchAgent が読み込まれていない。home-manager で適用するか `plamo-translate daemon install` を実行する
 - 設定を変えたのに反映されない: Nix 管理なら再適用、それ以外は `plamo-translate daemon restart`
+- `daemon does not support translation history`: 更新前のデーモンが動いている。`plamo-translate daemon restart` を実行する
+- `plamo-translate status` の `template_verified: false`: モデルの chat template が検証済みのものと異なる。翻訳は動くが、プロンプトの形式がずれている可能性がある (モデルのロード前は `-` と表示される)

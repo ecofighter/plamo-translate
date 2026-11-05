@@ -185,11 +185,15 @@ socket_path = "~/Library/Application Support/plamo-translate/daemon.sock"
 - 接続に失敗したら `Error::DaemonUnreachable { socket_path }` を返す。
 - 設定の解決（`Config::load()`）と `resolve_target(text, default_target)` を持つ。後者は `auto` のとき、かな・漢字の文字数が英字を含む全言語文字の 30% 以上なら `en`、それ以外は `ja` を返す。
 - 用語集 TSV のパーサー（`原語<TAB>訳語`、`#` で始まる行と空行は無視、列数が不正な行は行番号付きでエラー）。
+- `HistoryEntry { source, translation }`、`TranslateRequest.history`（古い順。空なら送らない）、`Event::Done.finish_reason`、`Status.features` / `Status.template_verified` を持つ。
+- `Client::translate` は `history` が空でないたびに、先に `op: status` を送り `features` に `"history"` があるか確かめる（結果は覚えない）。なければ translate を送らず `Error::HistoryUnsupported`（`daemon does not support translation history; run "plamo-translate daemon restart"`）を返す。`Client::require_history()` で明示的にも呼べる。
+- 履歴に使える組の判定 `check_history_eligible`（`finish_reason == "stop"`、Python の `strip()` 相当で空でない、`<|plamo:` を含まない）、`drop_oldest_half`（古い `ceil(n/2)` 組を削る）、履歴 JSONL のパーサーと追記を持つ。意味の検証はデーモンが行い、クライアントは行わない。
 
 ### CLI `plamo-translate`
 ```
 plamo-translate [TEXT] [-t LANG] [-s LANG] [--context TEXT | --context-file FILE]
                 [--glossary FILE]... [--form polite|plain] [--no-stream] [--json]
+                [--history FILE [--history-append] [--history-last N]]
 plamo-translate status
 plamo-translate model pull          # op=load で事前ダウンロードとロード
 plamo-translate model path          # ウェイトの保存先を表示
@@ -199,7 +203,12 @@ plamo-translate daemon {start|stop|restart|status|logs [-f]}
 ```
 - TEXT を省略すると stdin を読む。訳文は stdout に出す。進捗表示（「モデルをダウンロード中 45%」「モデルをロード中…」）は、stderr が TTY のときだけ出す。
 - `--glossary` は複数指定でき、config の `glossary_file` に追記される形で結合する。同じ原語が重複したら後の指定を優先する。
-- `--json` を付けると、`done` イベントをそのまま1行の JSON で出す。
+- `--json` を付けると、`done` イベントをそのまま1行の JSON で出す。`finish_reason` を含む。
+- `--history FILE`: 翻訳履歴の JSONL。1 行に `{"source": "原文", "translation": "訳文"}` を古い順に書く。stdin は TEXT 用なので `-` は指定できない。
+- `--history-append`: 訳し終えたら原文と訳文の組を `--history` のファイルに追記する（なければ作る）。履歴が空でも `require_history()` でデーモンの対応を先に確かめる。追記する原文は送ったとおり（stdin の末尾の改行も含む）。打ち切られた訳（`finish_reason` が `stop` 以外）、空の訳、`<|plamo:` を含む訳は追記せず stderr に警告を出す。
+- `--history-last N`: `--history` のうち新しい N 組だけを送る（ファイルは変えない）。CLI は履歴を自動では削らない。
+- `status` は `features` と `template_verified` を表示する。
+- `context_too_long` は再試行しない。古いデーモンなら終了コード 1。出力後に追記に失敗したときも終了コード 1（訳は出力済み、履歴には未記録）。
 - 終了コード: 0 は成功、1 は翻訳エラー（デーモンが error を返した）、2 は使い方の誤り、3 はデーモンに到達できない場合。終了コード 3 のときは `plamo-translate daemon install` を案内する。
 
 #### launchd の操作
@@ -222,8 +231,11 @@ plamo-translate daemon {start|stop|restart|status|logs [-f]}
 
 ### MCP server `plamo-translate-mcp`
 - rmcp の stdio transport を使う。tool は `translate` の1つだけ。
-- 入力スキーマ: `text`（必須）、`target_lang`（必須。description に主要コードと `ja(easy)` を列挙する）、`source_lang`、`context`、`glossary: [{source, target}]`、`form: "polite" | "plain"`（`target_lang=ja` のときだけ有効）。
+- 入力スキーマ: `text`（必須）、`target_lang`（必須。description に主要コードと `ja(easy)` を列挙する）、`source_lang`、`context`、`glossary: [{source, target}]`、`form: "polite" | "plain"`（`target_lang=ja` のときだけ有効）、`history: [{source, translation}]`（同じ文書の前の部分とその訳を古い順に）。
 - 出力は訳文を text content として返す。`usage` は返さない。
+- 履歴があるときの `context_too_long` は、同じタイムアウトの中で古い方から半分ずつ削って成功するか履歴が空になるまで再送し、削ったことを 2 つ目の `note:` content で伝える（尽きたらエラーテキストで伝える）。
+- MCP では履歴を持つのは呼び出し側のモデルなので、履歴に使えない結果（打ち切られた訳など）には `note: do not pass this translation as history: <理由>.` を付け、`isError` は false のままにする。
+- 古いデーモンには、`daemon does not support translation history; run "plamo-translate daemon restart"` のメッセージで `isError` を返す。
 - クライアントが `progressToken` を渡してきた場合は、progress 通知でロード状況と、これまでに生成した部分訳の文字数を送る。
 - デーモンのエラーは `isError: true` の tool 結果として返す。到達できない場合は導入手順を含める。
 - 1回の呼び出しの全体タイムアウトは 300 秒（初回ダウンロードを考慮）。環境変数 `PLAMO_TRANSLATE_MCP_TIMEOUT_SECS` で変更できる。
