@@ -1,5 +1,7 @@
 # plamo-translate Implementation Plan
 
+> **履歴としての注記:** この計画は v1 の初期実装時のもの。その後、PFML3 プロンプトの構築と入力の検証は chat template からデーモンの `pfml3` モジュールへ移り、`Engine.stream` は `TextStream` を返すようになった。現在の仕様は `docs/superpowers/specs/2026-11-05-plamo-translate-design.md` §5 と `docs/superpowers/notes/2026-11-05-pfml3-tokenizer-findings.md` を正とする。以下の記述は当時のまま残す。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** PLaMo-3-translate (MLX) を launchd の socket activation でオンデマンドに常駐させる Python デーモンと、それを使う Rust 製の CLI と MCP server を作り、home-manager モジュール経由で nix-darwin から導入できるようにする。
