@@ -136,3 +136,10 @@ test('disabling mid-message flushes held text as original', async ($, on) => {
   expect(await show($, 'm1', 'Again.\n')).toEqual({})
   expect(h.runs.length).toBe(0)
 })
+
+test('Japanese blocks are shown without translation', async ($, on) => {
+  const h = setup(on)
+  await turnOn($)
+  expect(await show($, 'm1', 'すでに日本語です。\n\n')).toEqual({ displayContent: 'すでに日本語です。\n\n' })
+  expect(h.runs.length).toBe(0)
+})

@@ -1,8 +1,14 @@
 const FENCE_OPEN = /^\s*(`{3,}|~{3,})/
 const FENCE_CLOSE = /^\s*(`{3,}|~{3,})\s*$/
 const TABLE = /^\s*\|/
+const DELIMITER_ROW = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$/
+const LIST_ITEM = /^ {0,3}([-*+]|\d+[.)])\s/
 
 const isBlank = (line) => /^\s*$/.test(line)
+// GFM tables may omit the leading pipe; then the delimiter row under the header is what marks them.
+const startsTable = (lines, i) =>
+  TABLE.test(lines[i]) || (lines[i].includes('|') && i + 1 < lines.length && DELIMITER_ROW.test(lines[i + 1]))
+const inTable = (line) => line.includes('|') && !isBlank(line)
 const fenceMarker = (line) => line.match(FENCE_OPEN)?.[1]
 const closes = (line, marker) => {
   const m = line.match(FENCE_CLOSE)
@@ -69,9 +75,9 @@ export function createDisplayBuffer({ flushLines, holdIncomplete }) {
         continue
       }
 
-      if (TABLE.test(line)) {
-        let j = i
-        while (j < n && TABLE.test(lines[j])) j++
+      if (startsTable(lines, i)) {
+        let j = i + 1
+        while (j < n && inTable(lines[j])) j++
         if (j < n || final || !holdIncomplete) {
           emit('table', i, j)
           i = j
@@ -79,8 +85,9 @@ export function createDisplayBuffer({ flushLines, holdIncomplete }) {
         continue
       }
 
-      let j = i
-      while (j < n && !isBlank(lines[j]) && !fenceMarker(lines[j]) && !TABLE.test(lines[j])) j++
+      // A new list item also ends the block, so earlier items are shown before the list is complete.
+      let j = i + 1
+      while (j < n && !isBlank(lines[j]) && !fenceMarker(lines[j]) && !startsTable(lines, j) && !LIST_ITEM.test(lines[j])) j++
       if (j < n || final || !holdIncomplete) {
         emit('paragraph', i, j)
         i = j

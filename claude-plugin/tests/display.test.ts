@@ -89,3 +89,30 @@ test('tableShapeMatches compares rows and pipes', () => {
   expect(tableShapeMatches('| a | b |\n|---|---|', '| あ い |\n|---|---|')).toBe(false)
   expect(tableShapeMatches('| a | b |\n|---|---|', '| あ | い |')).toBe(false)
 })
+
+test('each list item is its own block', () => {
+  const b = held()
+  expect(b.push('Intro:\n- one\n- two\n', false)).toEqual([
+    { kind: 'paragraph', text: 'Intro:\n' },
+    { kind: 'paragraph', text: '- one\n' },
+  ])
+  expect(b.push('  continued\n3. three\n', false)).toEqual([{ kind: 'paragraph', text: '- two\n  continued\n' }])
+  expect(b.push('', true)).toEqual([{ kind: 'paragraph', text: '3. three\n' }])
+})
+
+test('a table without a leading pipe is a table', () => {
+  const b = held()
+  expect(b.push('Intro.\na | b\n--- | ---\n1 | 2\n\n', false)).toEqual([
+    { kind: 'paragraph', text: 'Intro.\n' },
+    { kind: 'table', text: 'a | b\n--- | ---\n1 | 2\n' },
+    { kind: 'blank', text: '\n' },
+  ])
+})
+
+test('a pipe in prose without a delimiter row stays a paragraph', () => {
+  const b = held()
+  expect(b.push('use a | b here\nnext line\n\n', false)).toEqual([
+    { kind: 'paragraph', text: 'use a | b here\nnext line\n' },
+    { kind: 'blank', text: '\n' },
+  ])
+})

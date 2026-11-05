@@ -98,7 +98,7 @@ async function submitJapanese($, ctx, e, next) {
 async function renderBlock($, ctx, block) {
   if (block.kind !== 'paragraph' && block.kind !== 'table') return block.text
   const { lead, core, trail } = splitEdges(block.text)
-  if (core === '') return block.text
+  if (core === '' || containsJapanese(core)) return block.text
   let result
   try {
     result = await translate($, ctx, core, 'en-ja', OUTPUT_TIMEOUT_MS)
