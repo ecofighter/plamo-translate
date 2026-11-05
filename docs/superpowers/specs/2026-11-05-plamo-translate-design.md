@@ -2,7 +2,7 @@
 
 - 日付: 2026-11-05
 - 状態: ドラフト（ユーザーレビュー待ち）
-- 改訂: Homebrew tap と home-manager モジュールを v1 から外し、nix-darwin を主たる導入経路にした
+- 改訂: Homebrew tap を v1 から外した。導入経路は home-manager モジュール（nix-darwin に組み込んで使う）を主とした
 
 ## 1. 目的と前提
 
@@ -12,7 +12,7 @@
 - Claude Code などのエージェントから MCP 経由で呼ぶ
 - シェルから CLI で呼ぶ
 
-導入と管理は Nix flake で行う。**nix-darwin モジュールで宣言的に導入できることを最優先とする**。加えて、launchctl 操作用の `nix run` app も提供する。
+導入と管理は Nix flake で行う。**nix-darwin の構成から宣言的に導入できることを最優先とする**。そのための手段として home-manager モジュールを提供し、nix-darwin には `home-manager.darwinModules.home-manager` 経由で組み込む。加えて、launchctl 操作用の `nix run` app も提供する。
 
 ### 利用者と品質水準
 主な利用者は作者本人（nix-darwin 環境）。公開は副次的な扱いとし、設定項目やドキュメントは作者が日常的に使う範囲に絞る。
@@ -21,7 +21,7 @@
 1. ログイン後、初回の翻訳要求でデーモンが自動起動し、モデルのロード中は進捗を表示したうえで翻訳を返す。
 2. 2回目以降は、ロード待ちなしでストリーミング翻訳が始まる。
 3. 一定時間使わなければデーモンが終了してメモリを解放し、次の要求で再び自動起動する。
-4. nix-darwin の設定に `services.plamo-translate.enable = true;` を書いて `darwin-rebuild switch` するだけで、CLI、MCP server、LaunchAgent がそろう。
+4. nix-darwin 構成内の `home-manager.users.<user>` に `services.plamo-translate.enable = true;` を書いて `darwin-rebuild switch` するだけで、CLI、MCP server、LaunchAgent、設定ファイルがそろう。
 
 ### 対象モデル
 - コレクション: https://huggingface.co/collections/pfnet/plamo-3-translate
@@ -36,7 +36,7 @@
 - 複数モデルの同時常駐、リクエストごとのモデル切り替え
 - 翻訳履歴（モデルの chat template が対応する、過去の原文と訳文のペア）の受け渡し
 - ファイルの一括翻訳、GUI、リモートからのアクセス
-- Homebrew tap と home-manager モジュール（§8 に将来の拡張として方針だけを残す）
+- Homebrew tap と nix-darwin 専用モジュール（§8 に将来の拡張として方針だけを残す）
 
 ## 2. 全体構成
 
@@ -54,7 +54,7 @@
 | `plamo-client` (crate) | Rust | プロトコル型、UDS 接続、イベントストリーム、パスと設定の解決 | tokio、serde |
 | `plamo-translate` | Rust | 翻訳 CLI、`daemon` / `model` サブコマンド（launchctl 操作） | plamo-client |
 | `plamo-translate-mcp` | Rust | stdio の MCP server（`translate` tool） | plamo-client、rmcp |
-| `flake.nix` | Nix | パッケージ、nix-darwin モジュール、操作 app、devShell、checks | nixpkgs |
+| `flake.nix` | Nix | パッケージ、home-manager モジュール、操作 app、devShell、checks | nixpkgs、home-manager |
 
 責務の境界は「デーモン = 推論とモデル管理、Rust = UX と launchd 操作」とする。PFML3 プロンプトの生成と入力の意味的な検証は、モデル同梱の chat template を使うデーモン側だけが行う。
 
@@ -65,7 +65,7 @@ crates/plamo-client/
 crates/plamo-translate/
 crates/plamo-translate-mcp/
 protocol/fixtures/*.ndjson       # Python と Rust の両方のテストが読むプロトコル例
-nix/{packages.nix,darwin-module.nix,launchd.nix}
+nix/{packages.nix,hm-module.nix,launchd.nix}
 flake.nix
 justfile
 docs/superpowers/specs/
@@ -75,14 +75,14 @@ docs/superpowers/specs/
 
 | 用途 | パス | 備考 |
 |---|---|---|
-| 設定 | `$PLAMO_TRANSLATE_CONFIG` → `${XDG_CONFIG_HOME:-~/.config}/plamo-translate/config.toml` → `/etc/plamo-translate/config.toml` | dotfiles で管理しやすいよう XDG に置く。最初に見つかった1ファイルだけを読む（マージしない） |
+| 設定 | `$PLAMO_TRANSLATE_CONFIG` → `${XDG_CONFIG_HOME:-~/.config}/plamo-translate/config.toml` | home-manager の `xdg.configFile` で置ける XDG の場所にする。最初に見つかった1ファイルだけを読む（マージしない） |
 | アプリデータの基点 | `~/Library/Application Support/plamo-translate/` | ディレクトリは 0700 で作る |
 | モデルのウェイト | `<基点>/huggingface/hub/` | デーモンが `HF_HUB_CACHE` に設定する。`~/.cache/huggingface` とは共有しない |
 | remote code のキャッシュ | `<基点>/huggingface/modules/` | `HF_MODULES_CACHE` に設定する |
 | ソケット | `<基点>/daemon.sock` | plist の `SockPathMode` は 0600（10進で 384）。sun_path の上限 104 バイトは install 時に検証する |
 | ログ | `~/Library/Logs/plamo-translate/daemon.log` | デーモンが `RotatingFileHandler`（5MB × 3世代）で書く。Console.app からも見える |
 | クラッシュ時の出力 | `~/Library/Logs/plamo-translate/daemon.stderr.log` | plist の `StandardErrorPath` / `StandardOutPath`。Python の起動失敗などを捕捉する |
-| LaunchAgent | nix-darwin: `/Library/LaunchAgents/local.plamo-translate.daemon.plist`、CLI の `install`: `~/Library/LaunchAgents/` の同名ファイル | Label は `local.plamo-translate.daemon`。どちらの場合も launchd のドメインは `gui/$UID` |
+| LaunchAgent | `~/Library/LaunchAgents/local.plamo-translate.daemon.plist` | home-manager と CLI の `install` のどちらが書いても同じパス。Label は `local.plamo-translate.daemon`、ドメインは `gui/$UID` |
 
 - **ウェイトは Application Support に置く**。Caches はシステムが容量不足時に消すことがあり、消されると数 GB の再ダウンロードになるため。
 - **Time Machine から除外する**。ウェイトは再取得できるので、デーモンが `<基点>/huggingface/` を初めて作るときに `tmutil addexclusion`（`-p` なし、root 不要の sticky 除外）を実行する。失敗しても警告ログを出すだけで続行する。
@@ -203,8 +203,8 @@ plamo-translate daemon {start|stop|restart|status|logs [-f]}
 | `logs` | `daemon.log` を表示する（`-f` で追従） |
 
 - plist の主な内容: `Label`、`ProgramArguments`（デーモンの実行ファイル）、`Sockets.Listeners.{SockPathName, SockPathMode=384}`、`StandardOutPath` / `StandardErrorPath`、`ProcessType=Interactive`。`KeepAlive` と `RunAtLoad` は指定しない（オンデマンド起動のため）。管理元の識別には `EnvironmentVariables.PLAMO_TRANSLATE_MANAGED_BY` に `cli` または `nix` を入れる（launchd が知らないトップレベルキーを避けるため、環境変数に入れる）。
-- `install` と `uninstall` は、`/Library/LaunchAgents/` に同じ Label の plist がある場合（nix-darwin が管理している場合）や、既存の plist の管理元が `nix` の場合は、変更を拒否して終了コード 2 を返す。それ以外のサブコマンドは管理元を問わず動く。
-- CLI の `install` は、nix-darwin モジュールを使わない場合（`nix run .#daemon-install` や開発時）のためにある。
+- `install` と `uninstall` は、既存の plist の管理元が `nix` の場合（home-manager が書いた plist は Nix store へのシンボリックリンクでもある）は、変更を拒否して終了コード 2 を返す。それ以外のサブコマンドは管理元を問わず動く。
+- CLI の `install` は、home-manager モジュールを使わない場合（`nix run .#daemon-install` や開発時）のためにある。
 - デーモンの実行ファイルは「`--daemon-bin` → `$PLAMO_TRANSLATED_BIN` → `<CLI の実体の場所>/../libexec/bin/plamo-translated` → `PATH`」の順に探す。`install` は、見つかったパスの symlink を解決せずにそのまま plist に書く。`nix profile` 経由なら、プロファイルのパスが更新後も有効なまま残るため。
 
 ### MCP server `plamo-translate-mcp`
@@ -222,25 +222,24 @@ plamo-translate daemon {start|stop|restart|status|logs [-f]}
   - `plamo-translated`: `python3Packages.buildPythonApplication`。依存は nixpkgs の `mlx`、`mlx-lm`、`transformers`、`numba`、`huggingface-hub`。nixpkgs の版がモデルの要求に足りなければ、flake 内の overlay で上げる。
   - `plamo-translate`: crane で CLI と MCP をビルドする。`postInstall` で `$out/libexec/bin/plamo-translated` へのシンボリックリンクを張り、CLI が Nix 環境でもデーモンを見つけられるようにする。
   - `default`: `plamo-translate`（デーモンを内包する）。
-- `darwinModules.default`（nix-darwin、**主たる導入経路**）
+- `homeManagerModules.default`（**主たる導入経路**。nix-darwin 構成の `home-manager.users.<user>.imports` に入れて使う）
   ```nix
   services.plamo-translate = {
     enable = true;
-    package = …;          # 既定は self.packages.${system}.default
-    user = …;             # 既定は config.system.primaryUser
+    package = …;          # 既定は self.packages.${pkgs.system}.default
     settings = { model = "…"; idle_timeout_secs = 600; … };  # config.toml に変換
   };
   ```
-  - `launchd.user.agents.plamo-translate` で `/Library/LaunchAgents/` に plist を置く。`serviceConfig` の主なキーは、`Label`、`ProgramArguments`、`Sockets`、ログのパス、`ProcessType`、`EnvironmentVariables`。
-  - plist では `~` が使えないため、ソケット・ログのパスは `users.users.${user}.home`（未定義なら `/Users/${user}`）から絶対パスで組み立てる。`settings.socket_path` も同じ値で上書きし、デーモンと CLI のパスを必ず一致させる。
-  - `/Library/LaunchAgents/` の agent は全ユーザーのログインで読み込まれる。そのため `ProgramArguments` を `/bin/sh -c '[ "$(id -un)" = <user> ] && exec <daemon>'` で包み、他のユーザーでは何もしないようにする。`Sockets` 自体はユーザーごとに launchd が作ろうとするので、他ユーザーのホーム配下のパスへの bind は権限エラーで失敗する。これは無害だが、段階0で挙動を確認する。
-  - ログディレクトリと Application Support 配下のディレクトリは、launchd がソケットを作る前に存在している必要がある。`system.activationScripts.postActivation` で、`user` の所有・0700 で作成する。
-  - settings は `pkgs.formats.toml` で store に生成し、`environment.etc."plamo-translate/config.toml"` に置く。agent には `PLAMO_TRANSLATE_CONFIG` で渡す。CLI と MCP は §3 の探索順で `/etc` のファイルを見つけるので、同じ設定を共有できる（ユーザーが `~/.config` に置いた場合はそちらが優先されるため、`daemon status` でデーモンと CLI の設定ファイルのパスが違えば警告する）。
-  - `package` を `environment.systemPackages` に追加する。
+  - `launchd.agents.plamo-translate = { enable = true; config = { … }; }` で plist を定義する。home-manager が `~/Library/LaunchAgents/` への配置と、activation 時の `launchctl bootout` / `bootstrap` を行う。`config` の主なキーは、`Label`、`ProgramArguments`、`Sockets`、ログのパス、`ProcessType`、`EnvironmentVariables`。
+  - plist では `~` が使えないため、ソケットとログのパスは `config.home.homeDirectory` から絶対パスで組み立てる。`settings.socket_path` も同じ値で上書きし、デーモンと CLI のパスを必ず一致させる。
+  - ログディレクトリと Application Support 配下のディレクトリは、launchd がソケットを作る前に存在している必要がある。`home.activation` の `lib.hm.dag.entryBefore [ "setupLaunchAgents" ]` で、0700 で作成する（ユーザー権限で動くので chown は不要）。
+  - settings は `pkgs.formats.toml` で生成し、`xdg.configFile."plamo-translate/config.toml"` に置く。デーモン、CLI、MCP はいずれも §3 の探索順でこのファイルを読むので、`PLAMO_TRANSLATE_CONFIG` は設定しない。
+  - `package` を `home.packages` に追加する。
   - `nix/launchd.nix` に plist 属性の生成関数を置き、モジュールの評価テストからも使う。キー構成は CLI の `install` と揃え、`PLAMO_TRANSLATE_MANAGED_BY=nix` を入れる。
+  - flake の inputs に `home-manager` を加える（モジュールの評価テストにだけ使い、`follows` で nixpkgs を揃える）。
 - `apps`: `daemon-install`、`daemon-uninstall`、`daemon-start`、`daemon-stop`、`daemon-restart`、`daemon-status`、`daemon-logs`。いずれも `plamo-translate daemon <cmd>` を呼ぶ `writeShellApplication`。
 - `devShells.default`: rust toolchain（rust-overlay は使わず、nixpkgs の stable）、uv、python3、just、cargo-insta。
-- `checks`: cargo test、pytest（slow を除く）、nix-darwin モジュールの評価テスト（最小の `darwinSystem` を評価し、生成された plist の属性を assert する）。
+- `checks`: cargo test、pytest（slow を除く）、home-manager モジュールの評価テスト（最小の `homeManagerConfiguration` を評価し、`launchd.agents` から生成された plist の属性と `xdg.configFile` の内容を assert する）。
 - `devShells.default` の uv は、デーモンの開発時のテスト実行にだけ使う。パッケージは nixpkgs の Python パッケージで組むので、`uv.lock` はビルドに使わない。
 
 ## 8. 将来の拡張（v1 では作らない）
@@ -249,8 +248,8 @@ plamo-translate daemon {start|stop|restart|status|logs [-f]}
 - brew の `mlx` formula は `python@3.15` 向けであり、tokenizer が依存する numba / llvmlite には formula が無く、3.15 対応も未確認。そのため、封入型の formula は保守コストが高い。
 - 作る場合は、`uv.lock` から resource を生成するスクリプト、numba / llvmlite の wheel 許可リスト、CLI のデーモン探索での `$(brew --prefix)/opt/...` への正規化を追加する。§6 の CLI `install` はそのまま使える。
 
-### home-manager モジュール
-- `nix/launchd.nix` の生成関数を再利用し、`launchd.agents` と `xdg.configFile` に出力する形で追加できる。
+### nix-darwin 専用モジュール
+- home-manager を使わない nix-darwin 環境向け。`launchd.user.agents` は `/Library/LaunchAgents` に置かれて全ユーザーで読み込まれるため、ユーザー判定のラッパー、root での activation によるディレクトリ作成と chown、`/etc` への設定配置が必要になる。需要が出たら `nix/launchd.nix` の生成関数を再利用して追加する。
 
 ## 9. エラー処理の方針
 - デーモンは、1リクエストの失敗でプロセスを落とさない。ただしモデルのロードに失敗した場合は、`model_load_failed` を返した後もプロセスを維持し、次の要求で再試行する（ネットワーク断からの回復を想定）。
@@ -267,17 +266,17 @@ plamo-translate daemon {start|stop|restart|status|logs [-f]}
 - **手動の受け入れ確認**（実装計画の最後に手順として書く）: install → 初回翻訳（ダウンロードとロードの進捗表示）→ 2回目の即応 → アイドル後の自動終了と再起動 → Claude Code からの MCP 呼び出し。
 
 ## 11. 実装の段階
-0. **事前検証（spike）**: nixpkgs の mlx-lm / numba / transformers でモデルの `model_file` 方式のロードと翻訳が通るか、`launch_activate_socket` を ctypes で呼べるか、`/Library/LaunchAgents` の `Sockets` が他ユーザーのログイン時にどう振る舞うか、を確認する。結果に応じて §5 と §7 を修正する。
+0. **事前検証（spike）**: nixpkgs の mlx-lm / numba / transformers でモデルの `model_file` 方式のロードと翻訳が通るか、`launch_activate_socket` を ctypes で呼べるか、home-manager の `launchd.agents` で `Sockets` を含む plist が期待どおりに生成・bootstrap されるか、を確認する。結果に応じて §5 と §7 を修正する。
 1. デーモンとプロトコル fixtures
 2. `plamo-client` と CLI（`daemon` / `model` サブコマンドを含む）
 3. MCP server
-4. Nix flake（パッケージ、nix-darwin モジュール、apps、checks）
-5. 作者の nix-darwin 設定への組み込みと、§10 の手動の受け入れ確認
+4. Nix flake（パッケージ、home-manager モジュール、apps、checks）
+5. 作者の nix-darwin 構成への home-manager の導入と本モジュールの組み込み、§10 の手動の受け入れ確認
 
 ## 12. 既知のリスク
 | リスク | 影響 | 対応 |
 |---|---|---|
 | nixpkgs の mlx-lm が古く、`model_file` によるロードに未対応 | Nix 版が動かない | overlay で版を上げる |
 | 上流の remote code の変更 | 予期しない挙動 | revision を固定する（§4） |
-| nix-darwin の `launchd.user.agents` が全ユーザー向けである | 他ユーザーのログイン時に不要な起動やエラーログが出る | §7 のユーザー判定で抑止する。単一ユーザーの Mac なので影響は小さい |
+| 作者の nix-darwin 構成に home-manager が未導入 | 導入の初回に構成変更が必要 | 段階5で `home-manager.darwinModules.home-manager` を追加する手順を書く。既存の `users.users.<user>.packages` などと競合しないか確認する |
 | launchd の socket activation と Python の相性 | 起動できない | 段階0で確認する。駄目なら `--socket` で自分で bind し、`KeepAlive` で常駐させる方式に退避する（アイドル時の終了はモデルのアンロードに読み替える） |
