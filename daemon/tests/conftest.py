@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from plamo_translated.engine import Engine, ProgressEvent
+from plamo_translated.engine import Engine, ProgressEvent, TextStream
 from plamo_translated.protocol import DaemonError, TranslateRequest
 
 FAKE_DOWNLOAD_BYTES = 1000
@@ -55,14 +55,19 @@ class FakeEngine(Engine):
         self.calls.append(req)
         return self.input_tokens
 
-    def stream(self, req: TranslateRequest, max_tokens: int, cancelled: threading.Event) -> Iterator[str]:
+    def stream(self, req: TranslateRequest, max_tokens: int, cancelled: threading.Event) -> TextStream:
+        return TextStream(self._steps(max_tokens, cancelled))
+
+    def _steps(self, max_tokens: int, cancelled: threading.Event) -> Iterator[tuple[str, str | None]]:
         for i, token in enumerate(self.tokens[:max_tokens]):
             if i > 0:
                 time.sleep(self.token_delay)
             if cancelled.is_set():
                 self.saw_cancel = True
                 return
-            yield token
+            yield token, None
+        # Like mlx-lm: the eos after the last token only counts if it fits within max_tokens.
+        yield "", "stop" if len(self.tokens) < max_tokens else "length"
 
 
 class StubTokenizer:

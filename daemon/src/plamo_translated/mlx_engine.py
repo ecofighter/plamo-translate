@@ -21,7 +21,7 @@ from mlx_lm import load, stream_generate  # noqa: E402
 from mlx_lm.sample_utils import make_sampler  # noqa: E402
 from tqdm.std import tqdm  # noqa: E402
 
-from .engine import Engine, ProgressEvent  # noqa: E402
+from .engine import Engine, ProgressEvent, TextStream  # noqa: E402
 from .protocol import DaemonError, TranslateRequest  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -167,11 +167,13 @@ class MlxEngine(Engine):
     def count_tokens(self, req: TranslateRequest) -> int:
         return len(self._prompt_tokens(req))
 
-    def stream(self, req: TranslateRequest, max_tokens: int, cancelled: threading.Event) -> Iterator[str]:
+    def stream(self, req: TranslateRequest, max_tokens: int, cancelled: threading.Event) -> TextStream:
         # Not a generator itself, so template errors surface at the call rather than on first next().
-        return self._generate(self._prompt_tokens(req), max_tokens, cancelled)
+        return TextStream(self._generate(self._prompt_tokens(req), max_tokens, cancelled))
 
-    def _generate(self, prompt: list[int], max_tokens: int, cancelled: threading.Event) -> Iterator[str]:
+    def _generate(
+        self, prompt: list[int], max_tokens: int, cancelled: threading.Event
+    ) -> Iterator[tuple[str, str | None]]:
         responses = stream_generate(
             self._model, self._tokenizer, prompt, max_tokens=max_tokens, sampler=make_sampler(temp=0.0)
         )
@@ -179,5 +181,4 @@ class MlxEngine(Engine):
             for response in responses:
                 if cancelled.is_set():
                     return
-                if response.text:
-                    yield response.text
+                yield response.text, response.finish_reason

@@ -15,7 +15,7 @@ Line layout:
 - `load_error: str`: model load fails with this message.
 - `download: bool`: loading goes through a `downloading` progress phase.
 
-The FakeEngine has no validation role: semantic `invalid_request` errors come from the daemon's validator, which runs before the request is queued or the model is loaded.
+The FakeEngine ends every uninterrupted generation with `finish_reason` `"stop"` when `len(tokens) < max_tokens`, `"length"` otherwise (the same rule as mlx-lm, whose eos token is not part of `tokens`). It has no validation role: semantic `invalid_request` errors come from the daemon's validator, which runs before the request is queued or the model is loaded.
 
 The daemon test starts the FakeEngine with the model already loaded unless `download` or `load_error` is set, so only those scenarios include load `progress` events.
 

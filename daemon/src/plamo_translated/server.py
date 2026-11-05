@@ -181,7 +181,8 @@ class Server:
             input_tokens = engine.count_tokens(req)
             max_tokens = _max_tokens(input_tokens, req.max_tokens)
             pieces: list[str] = []
-            for piece in engine.stream(req, max_tokens, job.cancelled):
+            text_stream = engine.stream(req, max_tokens, job.cancelled)
+            for piece in text_stream:
                 if job.cancelled.is_set():
                     return
                 pieces.append(piece)
@@ -189,7 +190,18 @@ class Server:
                     job.emit(protocol.delta(piece))
             if job.cancelled.is_set():
                 return
-            job.emit(protocol.done("".join(pieces), input_tokens, len(pieces), engine.model, engine.revision))
+            if text_stream.finish_reason is None:
+                raise DaemonError("internal", "generation ended without a finish reason")
+            job.emit(
+                protocol.done(
+                    pfml3.strip_stop_token("".join(pieces)),
+                    input_tokens,
+                    len(pieces),
+                    engine.model,
+                    engine.revision,
+                    finish_reason=text_stream.finish_reason,
+                )
+            )
         except DaemonError as e:
             job.emit(protocol.error(e.code, e.message))
         except Exception as e:

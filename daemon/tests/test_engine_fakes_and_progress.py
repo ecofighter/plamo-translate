@@ -3,7 +3,7 @@ import threading
 import pytest
 
 from conftest import FakeEngine
-from plamo_translated.engine import ProgressEvent
+from plamo_translated.engine import ProgressEvent, TextStream
 from plamo_translated.mlx_engine import DownloadProgress
 from plamo_translated.protocol import DaemonError, TranslateRequest
 
@@ -123,3 +123,24 @@ def test_fake_engine_from_fixture():
     assert (e.tokens, e.input_tokens, e.load_error, e.download) == (["x"], 3, "l", True)
     d = FakeEngine.from_fixture({})
     assert (d.tokens, d.input_tokens, d.load_error, d.download) == (["ok"], 5, None, False)
+
+
+@pytest.mark.parametrize(("max_tokens", "streamed", "reason"), [(3, ["a", "b"], "stop"), (2, ["a", "b"], "length"), (1, ["a"], "length")])
+def test_fake_engine_finish_reason_follows_mlx_lm(max_tokens, streamed, reason):
+    s = FakeEngine(tokens=["a", "b"]).stream(REQ, max_tokens, threading.Event())
+    assert s.finish_reason is None
+    assert list(s) == streamed
+    assert s.finish_reason == reason
+
+
+def test_fake_engine_cancelled_stream_has_no_finish_reason():
+    ev = threading.Event()
+    s = FakeEngine(tokens=["a", "b"]).stream(REQ, 10, ev)
+    next(s)
+    ev.set()
+    assert list(s) == [] and s.finish_reason is None
+
+
+def test_text_stream_skips_empty_pieces_and_keeps_finish_reason():
+    s = TextStream([("a", None), ("", None), ("b", None), ("", "stop")])
+    assert list(s) == ["a", "b"] and s.finish_reason == "stop"

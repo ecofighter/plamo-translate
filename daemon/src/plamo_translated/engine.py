@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
@@ -13,6 +13,26 @@ class ProgressEvent:
     stage: Literal["downloading", "loading"]
     done_bytes: int | None = None
     total_bytes: int | None = None
+
+
+class TextStream(Iterator[str]):
+    """Non-empty decoded text pieces of one generation.
+
+    `finish_reason` is mlx-lm's label ("stop" | "length") once the generation
+    ended on its own, and stays None when iteration stopped early (cancellation).
+    """
+
+    def __init__(self, steps: Iterable[tuple[str, str | None]]):
+        self._steps = iter(steps)
+        self.finish_reason: str | None = None
+
+    def __next__(self) -> str:
+        while True:
+            text, finish_reason = next(self._steps)
+            if finish_reason is not None:
+                self.finish_reason = finish_reason
+            if text:
+                return text
 
 
 class Engine(Protocol):
@@ -37,4 +57,4 @@ class Engine(Protocol):
 
     def count_tokens(self, req: TranslateRequest) -> int: ...
 
-    def stream(self, req: TranslateRequest, max_tokens: int, cancelled: threading.Event) -> Iterator[str]: ...
+    def stream(self, req: TranslateRequest, max_tokens: int, cancelled: threading.Event) -> TextStream: ...

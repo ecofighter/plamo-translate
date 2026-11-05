@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from conftest import FakeEngine
+from plamo_translated.engine import TextStream
 from plamo_translated.protocol import MAX_LINE_BYTES
 from plamo_translated.server import MAX_QUEUE, Server
 
@@ -450,3 +451,43 @@ async def test_validation_precedes_busy_and_shutting_down():
     assert ev["code"] == "invalid_request"
     for _, writer in clients:
         writer.close()
+
+
+async def test_done_strips_one_trailing_stop_token():
+    ev = await roundtrip_with(loaded(tokens=["Hi", "<|plamo:tag|>"]), translate())
+    assert ev[-1]["text"] == "Hi"
+    assert [e["text"] for e in ev if e["type"] == "delta"] == ["Hi", "<|plamo:tag|>"]
+    assert ev[-1]["usage"]["output_tokens"] == 2
+
+
+@pytest.mark.parametrize(("tokens", "text"), [
+    (["a<|plamo:bos|>"], "a"),
+    (["a", "<|plamo:tag|>", "<|plamo:tag|>"], "a<|plamo:tag|>"),
+    (["<|plamo:tag|>", "a"], "<|plamo:tag|>a"),
+    (["a ", "\n"], "a \n"),
+    (["a<|plamo:msg|>"], "a<|plamo:msg|>"),
+])
+async def test_done_text_is_unmodified_except_one_stop_suffix(tokens, text):
+    ev = await roundtrip_with(loaded(tokens=tokens), translate(stream=False))
+    assert ev[-1]["text"] == text
+
+
+async def test_done_reports_finish_reason():
+    stop = await roundtrip_with(loaded(tokens=["a", "b"]), translate(max_tokens=3))
+    length = await roundtrip_with(loaded(tokens=["a", "b", "c"]), translate(max_tokens=2))
+    assert (stop[-1]["finish_reason"], length[-1]["finish_reason"]) == ("stop", "length")
+    assert length[-1]["text"] == "ab"
+
+
+async def test_load_done_has_no_finish_reason():
+    ev = await roundtrip_with(FakeEngine(), LOAD)
+    assert "finish_reason" not in ev[-1]
+
+
+async def test_engine_without_finish_reason_is_internal_error():
+    class NoReason(FakeEngine):
+        def stream(self, req, max_tokens, cancelled):
+            return TextStream([("a", None)])
+
+    ev = await roundtrip_with(NoReason(), translate(stream=False))
+    assert (ev[-1]["type"], ev[-1]["code"]) == ("error", "internal")
