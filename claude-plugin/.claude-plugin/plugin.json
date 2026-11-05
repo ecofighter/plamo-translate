@@ -1,0 +1,56 @@
+{
+  "name": "plamo-ja-bridge",
+  "version": "0.1.0",
+  "description": "Translate Japanese prompts to English and English replies to Japanese with plamo-translate",
+  "author": { "name": "Shota Arakaki" },
+  "repository": "https://github.com/ecofighter/plamo-translate",
+  "license": "MIT OR Apache-2.0",
+  "userConfig": {
+    "enabledByDefault": {
+      "type": "boolean",
+      "title": "Enable on session start",
+      "description": "Turn the Japanese-English layer on when a session starts (toggle with /ja)",
+      "default": false
+    },
+    "confirm": {
+      "type": "boolean",
+      "title": "Confirm translations",
+      "description": "Show the English translation and ask before sending a prompt",
+      "default": true
+    },
+    "translator": {
+      "type": "string",
+      "title": "Translator command",
+      "description": "Path to the plamo-translate CLI",
+      "default": "plamo-translate"
+    },
+    "historyPairs": {
+      "type": "number",
+      "title": "History pairs",
+      "description": "Maximum number of past translation pairs passed as history",
+      "default": 8,
+      "min": 0
+    },
+    "historyChars": {
+      "type": "number",
+      "title": "History characters",
+      "description": "Maximum total characters of past translation pairs passed as history",
+      "default": 6000,
+      "min": 0
+    },
+    "form": {
+      "type": "string",
+      "title": "Japanese politeness",
+      "description": "Politeness of Japanese translations of replies (auto leaves it to the model)",
+      "options": ["auto", "polite", "plain"],
+      "default": "auto"
+    },
+    "flushLines": {
+      "type": "number",
+      "title": "Flush lines",
+      "description": "Show a paragraph without blank lines after this many lines",
+      "default": 20,
+      "min": 1
+    }
+  }
+}

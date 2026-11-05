@@ -1,0 +1,14 @@
+{
+  "name": "ecofighter-plamo-translate",
+  "description": "Claude Code plugins for the plamo-translate local translator",
+  "owner": {
+    "name": "Shota Arakaki"
+  },
+  "plugins": [
+    {
+      "name": "plamo-ja-bridge",
+      "source": "./claude-plugin",
+      "description": "Japanese-English translation layer for Claude Code using plamo-translate"
+    }
+  ]
+}
