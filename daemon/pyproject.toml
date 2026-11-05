@@ -9,7 +9,7 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.scripts]
-plamo-translated = "plamo_translated.__main__:main"
+plamo-translated = "plamo_translated.__main__:run"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/plamo_translated"]
