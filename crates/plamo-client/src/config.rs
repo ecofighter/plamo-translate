@@ -13,6 +13,8 @@ pub enum ConfigError {
         path: PathBuf,
         source: toml::de::Error,
     },
+    #[error("invalid config {path}: {key} must be a non-empty string")]
+    Invalid { path: PathBuf, key: &'static str },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -34,6 +36,24 @@ struct RawConfig {
     default_target: Option<String>,
     glossary_file: Option<String>,
     socket_path: Option<String>,
+}
+
+impl RawConfig {
+    fn reject_empty_strings(&self, path: &Path) -> Result<(), ConfigError> {
+        let fields = [
+            ("model", &self.model),
+            ("revision", &self.revision),
+            ("glossary_file", &self.glossary_file),
+            ("socket_path", &self.socket_path),
+        ];
+        match fields.into_iter().find(|(_, v)| v.as_deref() == Some("")) {
+            Some((key, _)) => Err(ConfigError::Invalid {
+                path: path.to_path_buf(),
+                key,
+            }),
+            None => Ok(()),
+        }
+    }
 }
 
 pub fn default_socket_path(home: &Path) -> PathBuf {
@@ -66,31 +86,30 @@ impl Config {
         env: &impl Fn(&str) -> Option<String>,
         home: &Path,
     ) -> Result<Config, ConfigError> {
-        let candidate = match non_empty(env("PLAMO_TRANSLATE_CONFIG")) {
-            Some(p) => expand_tilde(&p, home),
-            None => {
-                let base = non_empty(env("XDG_CONFIG_HOME"))
-                    .map(|p| expand_tilde(&p, home))
-                    .unwrap_or_else(|| home.join(".config"));
-                base.join("plamo-translate/config.toml")
-            }
-        };
+        let mut candidates = Vec::new();
+        if let Some(p) = non_empty(env("PLAMO_TRANSLATE_CONFIG")) {
+            candidates.push(expand_tilde(&p, home));
+        }
+        let xdg_base = non_empty(env("XDG_CONFIG_HOME"))
+            .map(|p| expand_tilde(&p, home))
+            .unwrap_or_else(|| home.join(".config"));
+        candidates.push(xdg_base.join("plamo-translate/config.toml"));
 
-        let (raw, config_file) = match std::fs::read_to_string(&candidate) {
-            Ok(text) => {
-                let raw = toml::from_str(&text).map_err(|source| ConfigError::Parse {
-                    path: candidate.clone(),
+        let (raw, config_file) = match candidates.into_iter().find(|c| c.is_file()) {
+            Some(path) => {
+                let text = std::fs::read_to_string(&path).map_err(|source| ConfigError::Io {
+                    path: path.clone(),
                     source,
                 })?;
-                (raw, Some(candidate))
+                let raw: RawConfig =
+                    toml::from_str(&text).map_err(|source| ConfigError::Parse {
+                        path: path.clone(),
+                        source,
+                    })?;
+                raw.reject_empty_strings(&path)?;
+                (raw, Some(path))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (RawConfig::default(), None),
-            Err(source) => {
-                return Err(ConfigError::Io {
-                    path: candidate,
-                    source,
-                });
-            }
+            None => (RawConfig::default(), None),
         };
 
         let socket_path = non_empty(env("PLAMO_TRANSLATE_SOCKET"))
@@ -115,7 +134,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
         let m: HashMap<String, String> = pairs
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -214,6 +233,63 @@ mod tests {
         let c = Config::load_from(&env_of(&[]), home.path()).unwrap();
         assert_eq!(c.glossary_file, Some(home.path().join("g.tsv")));
         assert_eq!(c.socket_path, home.path().join("s.sock"));
+    }
+
+    #[test]
+    fn missing_explicit_path_falls_back_to_xdg() {
+        let home = tempfile::tempdir().unwrap();
+        write(
+            home.path(),
+            ".config/plamo-translate/config.toml",
+            "socket_path = \"/from/xdg.sock\"\n",
+        );
+        let missing = home.path().join("nope.toml");
+        let c = Config::load_from(
+            &env_of(&[("PLAMO_TRANSLATE_CONFIG", missing.to_str().unwrap())]),
+            home.path(),
+        )
+        .unwrap();
+        assert_eq!(c.socket_path, PathBuf::from("/from/xdg.sock"));
+        assert_eq!(
+            c.config_file,
+            Some(home.path().join(".config/plamo-translate/config.toml"))
+        );
+    }
+
+    #[test]
+    fn directory_explicit_path_is_skipped() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("adir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let env = env_of(&[("PLAMO_TRANSLATE_CONFIG", dir.to_str().unwrap())]);
+        let c = Config::load_from(&env, home.path()).unwrap();
+        assert_eq!(c.config_file, None);
+        write(
+            home.path(),
+            ".config/plamo-translate/config.toml",
+            "model = \"xdg\"\n",
+        );
+        let c = Config::load_from(&env, home.path()).unwrap();
+        assert_eq!(c.model.as_deref(), Some("xdg"));
+    }
+
+    #[test]
+    fn empty_string_values_are_rejected() {
+        for key in ["socket_path", "model", "revision", "glossary_file"] {
+            let home = tempfile::tempdir().unwrap();
+            write(
+                home.path(),
+                ".config/plamo-translate/config.toml",
+                &format!("{key} = \"\"\n"),
+            );
+            assert!(
+                matches!(
+                    Config::load_from(&env_of(&[]), home.path()),
+                    Err(ConfigError::Invalid { .. })
+                ),
+                "{key}"
+            );
+        }
     }
 
     #[test]
