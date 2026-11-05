@@ -29,9 +29,9 @@ async def server_cleanup(tmp_path):
     _started.clear()
 
 
-async def run_server(engine, idle=600) -> tuple[Server, Path, asyncio.Task]:
+async def run_server(engine, idle=600, sock_cls=socket.socket) -> tuple[Server, Path, asyncio.Task]:
     path = _sock_dir / f"d{len(_started)}.sock"
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock = sock_cls(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.bind(str(path))
     sock.listen(64)
     server = Server(engine, idle_timeout_secs=idle, version=VERSION)
@@ -335,6 +335,31 @@ async def test_idle_does_not_drop_connection_accepted_at_close():
     writer.close()
     assert events[-1]["type"] == "done"
     assert events[-1]["text"] == "ab"
+
+
+async def test_idle_does_not_drop_connection_accepted_but_not_yet_handled():
+    accepted = asyncio.Event()
+
+    class ObservedListener(socket.socket):
+        def accept(self):
+            conn = super().accept()
+            accepted.set()
+            return conn
+
+    server, path, task = await run_server(loaded(tokens=["a", "b"]), idle=1, sock_cls=ObservedListener)
+    late = {}
+
+    async def before_close():
+        late["conn"] = await send(path, translate("late"))
+        # Close as soon as the kernel-level accept() has happened, before the server can react further.
+        await accepted.wait()
+
+    server._before_close = before_close
+    await asyncio.wait_for(task, 5)
+    reader, writer = late["conn"]
+    events = await asyncio.wait_for(read_all(reader), 0.2)
+    writer.close()
+    assert [e["type"] for e in events] == ["delta", "delta", "done"]
 
 
 async def test_shutdown_sends_shutting_down():

@@ -82,7 +82,7 @@ class Server:
         loop = asyncio.get_running_loop()
         # One fixed thread: mlx-lm generation streams are thread-local.
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="plamo-worker")
-        server = await asyncio.start_unix_server(self._handle, sock=sock, limit=MAX_LINE_BYTES)
+        listener = _Listener(loop, sock, self._accepted)
         worker = asyncio.create_task(self._work(loop, executor))
         try:
             stop = asyncio.create_task(self._stop.wait())
@@ -97,7 +97,7 @@ class Server:
                 log.info("idle for %s s; closing the listener", self._idle_timeout)
                 if self._before_close is not None:
                     await self._before_close()
-                server.close()
+                listener.close()
                 # Connections accepted before close() are served to completion.
                 drained = asyncio.create_task(self._wait_handlers())
                 await asyncio.wait({drained, stop}, return_when=asyncio.FIRST_COMPLETED)
@@ -105,7 +105,7 @@ class Server:
 
             if self._stop.is_set():
                 log.info("shutdown requested")
-                server.close()
+                listener.close()
                 self._fail_all_jobs()
                 await self._wait_handlers(timeout=SHUTDOWN_GRACE_SECS)
                 for task in list(self._handlers):
@@ -113,7 +113,7 @@ class Server:
                 await self._wait_handlers()
             stop.cancel()
         finally:
-            server.close()
+            listener.close()
             worker.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await worker
@@ -142,9 +142,12 @@ class Server:
                 await asyncio.wait_for(self._activity.wait(), remaining)
 
     async def _wait_handlers(self, timeout: float | None = None) -> None:
-        await asyncio.sleep(0)  # let accepted-but-not-yet-started handlers register
-        if self._handlers:
-            await asyncio.wait(set(self._handlers), timeout=timeout)
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self._handlers:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return
+            await asyncio.wait(set(self._handlers), timeout=remaining)
 
     # ---- worker ----------------------------------------------------------
 
@@ -205,11 +208,23 @@ class Server:
 
     # ---- connections -----------------------------------------------------
 
-    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        task = asyncio.current_task()
-        self._handlers.add(task)
+    def _accepted(self, conn: socket.socket) -> None:
+        # Registered in the same callback as accept(), so the idle check and the
+        # drain after close() can never miss a connection the kernel handed us.
         self._connections += 1
         self._touch()
+        task = asyncio.get_running_loop().create_task(self._handle(conn))
+        self._handlers.add(task)
+        task.add_done_callback(lambda t: self._handler_finished(t, conn))
+
+    def _handler_finished(self, task: asyncio.Task, conn: socket.socket) -> None:
+        self._handlers.discard(task)
+        self._connections -= 1
+        self._touch()
+        conn.close()  # covers a handler cancelled before it ever ran
+
+    async def _handle(self, conn: socket.socket) -> None:
+        reader, writer = await asyncio.open_unix_connection(sock=conn, limit=MAX_LINE_BYTES)
         try:
             await self._serve_connection(reader, writer)
         except (ConnectionError, BrokenPipeError):
@@ -219,9 +234,6 @@ class Server:
             with contextlib.suppress(Exception):
                 await _send(writer, protocol.error("internal", f"{type(e).__name__}: {e}"))
         finally:
-            self._handlers.discard(task)
-            self._connections -= 1
-            self._touch()
             writer.close()
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
@@ -290,6 +302,43 @@ class Server:
             version=self._version,
             protocol=PROTOCOL_VERSION,
         )
+
+
+class _Listener:
+    """Accepts with a plain reader callback instead of asyncio.start_unix_server.
+
+    asyncio's accept path spans several loop iterations between accept() and the
+    client callback; a connection accepted in that window would be lost if the
+    idle exit closed the listener then, and it would no longer be in launchd's
+    backlog to trigger a relaunch.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, sock: socket.socket, on_accept: Callable[[socket.socket], None]):
+        self._loop = loop
+        self._sock = sock
+        self._on_accept = on_accept
+        self._open = True
+        sock.setblocking(False)
+        loop.add_reader(sock.fileno(), self._ready)
+
+    def _ready(self) -> None:
+        while self._open:
+            try:
+                conn, _ = self._sock.accept()
+            except (BlockingIOError, InterruptedError):
+                return
+            except OSError:
+                log.exception("accept failed")
+                return
+            conn.setblocking(False)
+            self._on_accept(conn)
+
+    def close(self) -> None:
+        if not self._open:
+            return
+        self._open = False
+        self._loop.remove_reader(self._sock.fileno())
+        self._sock.close()
 
 
 def _progress_event(p: ProgressEvent) -> dict:
