@@ -2,8 +2,8 @@ use crate::{EXIT_INTERRUPTED, ExitCode};
 use clap::Args;
 use futures::StreamExt;
 use plamo_client::{
-    Client, Config, Error, ErrorCode, Event, GlossaryEntry, Status, TranslateRequest,
-    merge_glossaries, parse_glossary, resolve_target,
+    Client, Config, Error, ErrorCode, Event, GlossaryEntry, HistoryEntry, Status, TranslateRequest,
+    append_history, history_entry, merge_glossaries, parse_glossary, parse_history, resolve_target,
 };
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -33,6 +33,21 @@ pub struct TranslateArgs {
     /// Print the final done event as one JSON line
     #[arg(long)]
     json: bool,
+    /// JSONL translation history: {"source": ..., "translation": ...} per line, oldest first
+    #[arg(long, value_name = "FILE")]
+    history: Option<PathBuf>,
+    /// Append this translation to the --history file (skipped if truncated or empty)
+    #[arg(long, requires = "history")]
+    history_append: bool,
+    /// Send only the last N history entries
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..), requires = "history")]
+    history_last: Option<u32>,
+}
+
+struct Prepared {
+    req: TranslateRequest,
+    /// The history file to append the result to (`--history-append`).
+    record: Option<PathBuf>,
 }
 
 fn usage_error(msg: impl std::fmt::Display) -> i32 {
@@ -46,7 +61,28 @@ fn read_glossary(path: &Path) -> Result<Vec<GlossaryEntry>, String> {
     parse_glossary(&s).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-fn build_request(config: &Config, args: TranslateArgs) -> Result<TranslateRequest, String> {
+fn read_history(path: &Path, append: bool, last: Option<u32>) -> Result<Vec<HistoryEntry>, String> {
+    if path.as_os_str() == "-" {
+        return Err(
+            "--history does not read stdin (stdin is reserved for TEXT); pass a file path".into(),
+        );
+    }
+    let s = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        // the first --history-append of a document creates the file
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && append => String::new(),
+        Err(e) => return Err(format!("cannot read history {}: {e}", path.display())),
+    };
+    let mut history = parse_history(&s).map_err(|e| format!("{}: {e}", path.display()))?;
+    if let Some(n) = last {
+        let keep = usize::try_from(n).unwrap_or(usize::MAX);
+        let drop = history.len().saturating_sub(keep);
+        history.drain(..drop);
+    }
+    Ok(history)
+}
+
+fn build_request(config: &Config, args: TranslateArgs) -> Result<Prepared, String> {
     let text = match args.text {
         Some(t) => t,
         None => {
@@ -76,20 +112,28 @@ fn build_request(config: &Config, args: TranslateArgs) -> Result<TranslateReques
     for p in &args.glossary {
         lists.push(read_glossary(p)?);
     }
+    let history = match &args.history {
+        Some(p) => read_history(p, args.history_append, args.history_last)?,
+        None => Vec::new(),
+    };
+    let record = args.history.filter(|_| args.history_append);
     let target_lang = match args.to {
         Some(t) => t,
         None => resolve_target(&text, &config.default_target),
     };
-    Ok(TranslateRequest {
-        text,
-        target_lang,
-        source_lang: args.from,
-        context,
-        history: Vec::new(),
-        glossary: merge_glossaries(lists),
-        form: args.form,
-        stream: !args.no_stream,
-        max_tokens: None,
+    Ok(Prepared {
+        req: TranslateRequest {
+            text,
+            target_lang,
+            source_lang: args.from,
+            context,
+            history,
+            glossary: merge_glossaries(lists),
+            form: args.form,
+            stream: !args.no_stream,
+            max_tokens: None,
+        },
+        record,
     })
 }
 
@@ -163,17 +207,26 @@ fn done_json(
 pub async fn run(client: &Client, config: &Config, args: TranslateArgs) -> i32 {
     let json = args.json;
     let no_stream = args.no_stream;
-    let req = match build_request(config, args) {
-        Ok(r) => r,
+    let prepared = match build_request(config, args) {
+        Ok(p) => p,
         Err(m) => return usage_error(m),
     };
     tokio::select! {
-        code = translate(client, &req, json, no_stream) => code,
+        code = translate(client, &prepared, json, no_stream) => code,
         _ = tokio::signal::ctrl_c() => EXIT_INTERRUPTED,
     }
 }
 
-async fn translate(client: &Client, req: &TranslateRequest, json: bool, no_stream: bool) -> i32 {
+async fn translate(client: &Client, prepared: &Prepared, json: bool, no_stream: bool) -> i32 {
+    let req = &prepared.req;
+    // Client::translate only checks the daemon when history is sent; an append-only run
+    // must still fail on a daemon that cannot take the history it is building.
+    if prepared.record.is_some()
+        && req.history.is_empty()
+        && let Err(e) = client.require_history().await
+    {
+        return report_error(&e);
+    }
     let mut events = match client.translate(req).await {
         Ok(s) => s,
         Err(e) => return report_error(&e),
@@ -236,7 +289,10 @@ async fn translate(client: &Client, req: &TranslateRequest, json: bool, no_strea
                         write("\n", &mut last_byte);
                     }
                 }
-                return ExitCode::Ok as i32;
+                return match &prepared.record {
+                    Some(path) => record_history(path, &req.text, finish_reason.as_deref(), &text),
+                    None => ExitCode::Ok as i32,
+                };
             }
             Event::Error { code, message } => {
                 progress.clear();
@@ -246,6 +302,22 @@ async fn translate(client: &Client, req: &TranslateRequest, json: bool, no_strea
         }
     }
     ExitCode::Translation as i32
+}
+
+fn record_history(path: &Path, source: &str, finish_reason: Option<&str>, text: &str) -> i32 {
+    match history_entry(source, finish_reason, text) {
+        Ok(entry) => match append_history(path, &entry) {
+            Ok(()) => ExitCode::Ok as i32,
+            Err(e) => {
+                eprintln!("error: cannot append to history {}: {e}", path.display());
+                ExitCode::Translation as i32
+            }
+        },
+        Err(reason) => {
+            eprintln!("warning: translation not added to history: {reason}");
+            ExitCode::Ok as i32
+        }
+    }
 }
 
 fn report_daemon_error(code: &ErrorCode, message: &str) -> i32 {
