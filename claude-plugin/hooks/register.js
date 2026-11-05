@@ -15,7 +15,8 @@ import { createDisplayBuffer, tableShapeMatches } from './lib/display.js'
 const STATUS_TEXT = 'ja⇄en'
 const INPUT_TIMEOUT_MS = 60000
 const OUTPUT_TIMEOUT_MS = 20000
-// Verified in an interactive session: an empty displayContent hides the batch (spec 5.2).
+// An empty displayContent hides a batch (checked in an interactive session on Claude Code v2.1.317),
+// so a paragraph can be held until it is complete.
 const HOLD_INCOMPLETE = true
 const DROP_REASON = '送信をやめました。'
 
