@@ -30,6 +30,7 @@ class FakeEngine(Engine):
         self.token_delay = token_delay
         self.load_delay = load_delay
         self.calls: list[TranslateRequest] = []
+        self.saw_cancel = False
 
     @classmethod
     def from_fixture(cls, d: dict) -> "FakeEngine":
@@ -54,10 +55,10 @@ class FakeEngine(Engine):
         return self.input_tokens
 
     def stream(self, req: TranslateRequest, max_tokens: int, cancelled: threading.Event) -> Iterator[str]:
-        self.calls.append(req)
         for i, token in enumerate(self.tokens[:max_tokens]):
             if i > 0:
                 time.sleep(self.token_delay)
             if cancelled.is_set():
+                self.saw_cancel = True
                 return
             yield token

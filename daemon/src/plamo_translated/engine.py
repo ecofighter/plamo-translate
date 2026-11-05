@@ -26,7 +26,14 @@ class Engine(Protocol):
     revision: str
     loaded: bool
 
-    def ensure_loaded(self, progress: Callable[[ProgressEvent], None]) -> None: ...
+    def ensure_loaded(self, progress: Callable[[ProgressEvent], None]) -> None:
+        """Download (if needed) and load the model; a no-op once loaded.
+
+        `progress` may be invoked from huggingface_hub download threads rather
+        than the calling thread, so callers must hand events over to their event
+        loop thread-safely (`loop.call_soon_threadsafe`).
+        """
+        ...
 
     def count_tokens(self, req: TranslateRequest) -> int: ...
 

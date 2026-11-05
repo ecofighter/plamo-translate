@@ -16,4 +16,6 @@ Line layout:
 - `load_error: str`: model load fails with this message.
 - `download: bool`: loading goes through a `downloading` progress phase.
 
+The daemon test starts the FakeEngine with the model already loaded unless `download` or `load_error` is set, so only those scenarios include load `progress` events.
+
 Matching: the string `"<any>"` matches any value. Expected events are matched as a subset of the actual event's keys, except keys prefixed with `x_`, which only exist to exercise forward compatibility. Daemon tests ignore `x_` keys in expected events; client tests feed the lines verbatim and must ignore unknown keys.

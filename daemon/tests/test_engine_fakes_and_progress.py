@@ -82,7 +82,7 @@ def test_fake_engine_streams_tokens_and_records_calls():
     e = FakeEngine(tokens=["a", "b"], input_tokens=7)
     assert e.count_tokens(REQ) == 7
     assert list(e.stream(REQ, 10, threading.Event())) == ["a", "b"]
-    assert e.calls == [REQ, REQ]
+    assert e.calls == [REQ]
 
 
 def test_fake_engine_stops_when_cancelled():
@@ -92,6 +92,7 @@ def test_fake_engine_stops_when_cancelled():
     assert next(it) == "a"
     ev.set()
     assert list(it) == []
+    assert e.saw_cancel
 
 
 def test_fake_engine_load_progress():
