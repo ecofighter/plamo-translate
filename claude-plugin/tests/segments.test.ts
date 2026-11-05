@@ -55,3 +55,11 @@ test('a fence closed by the other character stays open', () => {
 test('empty input gives no segments', () => {
   expect(splitFences('')).toEqual([])
 })
+
+import { splitEdges } from '../hooks/lib/segments.js'
+
+test('splitEdges separates surrounding whitespace', () => {
+  expect(splitEdges('\n  直して\n\n')).toEqual({ lead: '\n  ', core: '直して', trail: '\n\n' })
+  expect(splitEdges('abc')).toEqual({ lead: '', core: 'abc', trail: '' })
+  expect(splitEdges('  \n')).toEqual({ lead: '  \n', core: '', trail: '' })
+})

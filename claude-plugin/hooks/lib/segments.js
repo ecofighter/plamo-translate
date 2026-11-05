@@ -38,3 +38,10 @@ export function splitFences(text) {
   }
   return segments
 }
+
+export function splitEdges(text) {
+  const lead = text.match(/^\s*/)[0]
+  const rest = text.slice(lead.length)
+  const trail = rest.match(/\s*$/)[0]
+  return { lead, core: rest.slice(0, rest.length - trail.length), trail }
+}
