@@ -69,6 +69,31 @@ class FakeEngine(Engine):
             yield token
 
 
+class StubTokenizer:
+    """Maps each control string to one id and every other character to its code point."""
+
+    def __init__(self, ids=None, eos_token_ids=frozenset({1, 16}), unk_token_id=0):
+        self.ids = {"<|plamo:bos|>": 1, "<|plamo:tag|>": 16, "<|plamo:key|>": 17, "<|plamo:val|>": 18,
+                    "<|plamo:msg|>": 19, "<|plamo:index|>": 20, "<|plamo:item|>": 21} if ids is None else ids
+        self.eos_token_ids = eos_token_ids
+        self.unk_token_id = unk_token_id
+        self.calls = []
+
+    def encode(self, text, add_special_tokens=True):
+        self.calls.append(add_special_tokens)
+        out, i = [], 0
+        while i < len(text):
+            for token, token_id in self.ids.items():
+                if text.startswith(token, i):
+                    out.append(token_id)
+                    i += len(token)
+                    break
+            else:
+                out.append(ord(text[i]))
+                i += 1
+        return out
+
+
 # AF_UNIX paths must stay under 104 bytes; pytest's tmp_path (and the Nix build TMPDIR) can exceed that.
 @pytest.fixture
 def short_dir():
