@@ -114,15 +114,12 @@ def test_fake_engine_errors():
     with pytest.raises(DaemonError) as ex:
         FakeEngine(load_error="boom").ensure_loaded(lambda p: None)
     assert (ex.value.code, ex.value.message) == ("model_load_failed", "boom")
-    with pytest.raises(DaemonError) as ex:
-        FakeEngine(template_error="bad").count_tokens(REQ)
-    assert (ex.value.code, ex.value.message) == ("invalid_request", "bad")
 
 
 def test_fake_engine_from_fixture():
     e = FakeEngine.from_fixture(
-        {"tokens": ["x"], "input_tokens": 3, "template_error": "t", "load_error": "l", "download": True}
+        {"tokens": ["x"], "input_tokens": 3, "load_error": "l", "download": True}
     )
-    assert (e.tokens, e.input_tokens, e.template_error, e.load_error, e.download) == (["x"], 3, "t", "l", True)
+    assert (e.tokens, e.input_tokens, e.load_error, e.download) == (["x"], 3, "l", True)
     d = FakeEngine.from_fixture({})
-    assert (d.tokens, d.input_tokens, d.template_error, d.load_error, d.download) == (["ok"], 5, None, None, False)
+    assert (d.tokens, d.input_tokens, d.load_error, d.download) == (["ok"], 5, None, False)

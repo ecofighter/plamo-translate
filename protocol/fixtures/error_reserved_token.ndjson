@@ -1,0 +1,3 @@
+{"fake":{}}
+{"v":1,"op":"translate","text":"<|plamo:tag|>x","target_lang":"en"}
+{"type":"error","code":"invalid_request","message":"text must not contain reserved PFML tokens (<|plamo:...)."}

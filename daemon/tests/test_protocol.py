@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from plamo_translated.pfml3 import validate
 from plamo_translated.protocol import (
     DaemonError,
     GlossaryEntry,
@@ -139,11 +140,21 @@ def test_fixture_request_matches_expected_outcome(path):
     else:
         line = json.dumps(request, ensure_ascii=False).encode()
     terminal = events[-1]
-    if path.stem in {"error_template", "error_context_too_long", "error_model_load_failed"}:
-        assert parse_request(line) is not None
-    elif terminal["type"] == "error":
+    if terminal["type"] == "error" and terminal["code"] not in ENGINE_ERROR_CODES:
         with pytest.raises(DaemonError) as e:
-            parse_request(line)
+            _parse_and_validate(line)
         assert e.value.code == terminal["code"]
+        if terminal["message"] != "<any>":
+            assert e.value.message == terminal["message"]
     else:
-        parse_request(line)
+        _parse_and_validate(line)
+
+
+# Errors that only the engine stage can produce; the request itself is valid.
+ENGINE_ERROR_CODES = {"context_too_long", "model_load_failed"}
+
+
+def _parse_and_validate(line: bytes) -> None:
+    req = parse_request(line)
+    if isinstance(req, TranslateRequest):
+        validate(req)

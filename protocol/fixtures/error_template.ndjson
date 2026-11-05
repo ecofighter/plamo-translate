@@ -1,3 +1,0 @@
-{"fake":{"template_error":"message content must not contain reserved PFML tokens (<|plamo:...)."}}
-{"v":1,"op":"translate","text":"<|plamo:op|>","target_lang":"en"}
-{"type":"error","code":"invalid_request","message":"message content must not contain reserved PFML tokens (<|plamo:...)."}

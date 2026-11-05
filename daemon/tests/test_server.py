@@ -427,3 +427,26 @@ async def test_status_reports_fields():
     assert isinstance(ev["uptime_secs"], int) and ev["uptime_secs"] >= 0
     await roundtrip(path, LOAD)
     assert (await status_of(path))["loaded"] is True
+
+
+async def test_validation_precedes_load():
+    engine = FakeEngine()
+    ev = await roundtrip_with(engine, b'{"v":1,"op":"translate","text":"<|plamo:tag|>x","target_lang":"en"}')
+    assert ev == [{"type": "error", "code": "invalid_request", "message": "text must not contain reserved PFML tokens (<|plamo:...)."}]
+    assert engine.loaded is False and engine.calls == []
+
+
+async def test_validation_precedes_busy_and_shutting_down():
+    server, path, _ = await run_server(loaded(tokens=["a", "b"], token_delay=1))
+    clients = [await send(path, translate("running"))]
+    await read_event(clients[0][0])
+    for i in range(MAX_QUEUE):
+        clients.append(await send(path, translate(f"queued{i}")))
+    await wait_queue_len(path, MAX_QUEUE)
+    (ev,) = await asyncio.wait_for(roundtrip(path, translate("", target_lang="en")), 0.5)
+    assert (ev["code"], ev["message"]) == ("invalid_request", "text must not be empty.")
+    server._shutting_down = True
+    (ev,) = await asyncio.wait_for(roundtrip(path, translate("x", form="formal")), 0.5)
+    assert ev["code"] == "invalid_request"
+    for _, writer in clients:
+        writer.close()

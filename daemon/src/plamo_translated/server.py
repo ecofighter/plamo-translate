@@ -11,7 +11,7 @@ from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
-from . import protocol
+from . import pfml3, protocol
 from .engine import Engine, ProgressEvent
 from .protocol import (
     MAX_CONTEXT_TOKENS,
@@ -244,6 +244,8 @@ class Server:
             if line is None:
                 return
             req = parse_request(line)
+            if isinstance(req, TranslateRequest):
+                pfml3.validate(req)
         except DaemonError as e:
             await _send(writer, protocol.error(e.code, e.message))
             return

@@ -1,0 +1,3 @@
+{"fake":{}}
+{"v":1,"op":"translate","text":"hi","target_lang":"en","history":"x"}
+{"type":"error","code":"invalid_request","message":"field history must be an array"}

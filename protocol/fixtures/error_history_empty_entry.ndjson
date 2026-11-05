@@ -1,0 +1,3 @@
+{"fake":{}}
+{"v":1,"op":"translate","text":"b","target_lang":"en","history":[{"source":"a","translation":" "}],"stream":false}
+{"type":"error","code":"invalid_request","message":"history[0].translation must not be empty."}

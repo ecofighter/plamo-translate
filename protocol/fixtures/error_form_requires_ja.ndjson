@@ -1,0 +1,3 @@
+{"fake":{}}
+{"v":1,"op":"translate","text":"hi","target_lang":"en","form":"polite"}
+{"type":"error","code":"invalid_request","message":"form must be polite or plain and requires target_lang=\"ja\"."}

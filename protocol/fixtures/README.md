@@ -12,9 +12,10 @@ Line layout:
 
 - `tokens: [str]`: tokens the engine emits.
 - `input_tokens: int`: reported input token count.
-- `template_error: str`: the chat template rejects the input with this message.
 - `load_error: str`: model load fails with this message.
 - `download: bool`: loading goes through a `downloading` progress phase.
+
+The FakeEngine has no validation role: semantic `invalid_request` errors come from the daemon's validator, which runs before the request is queued or the model is loaded.
 
 The daemon test starts the FakeEngine with the model already loaded unless `download` or `load_error` is set, so only those scenarios include load `progress` events.
 

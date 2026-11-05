@@ -193,9 +193,9 @@ git commit -m "docs: record spike results"
   - イベント生成ヘルパー: `progress(stage, done_bytes=None, total_bytes=None)`、`delta(text)`、`done(text, input_tokens, output_tokens, model, revision)`、`error(code, message)`、`status(**fields)`。いずれも `dict` を返し、値が None のキーは出力しない。
   - `def default_max_tokens(input_tokens: int) -> int`
 
-**fixtures の形式**（`protocol/fixtures/README.md` に書く）: 1行目は `{"fake": {...}}` で FakeEngine の振る舞いを指定する（Rust 側は読み飛ばす）。2行目はリクエストで、生のバイト列を試す fixture では `{"raw": "<文字列>"}` とする。3行目以降は期待するイベント。値 `"<any>"` は任意の値に一致する。`fake` のキーは `tokens: [str]`、`input_tokens: int`、`template_error: str`、`load_error: str`、`download: bool`。
+**fixtures の形式**（`protocol/fixtures/README.md` に書く）: 1行目は `{"fake": {...}}` で FakeEngine の振る舞いを指定する（Rust 側は読み飛ばす）。2行目はリクエストで、生のバイト列を試す fixture では `{"raw": "<文字列>"}` とする。3行目以降は期待するイベント。値 `"<any>"` は任意の値に一致する。`fake` のキーは `tokens: [str]`、`input_tokens: int`、`load_error: str`（当初あった chat template のエラー指定は、PFML3 をデーモンで組み立てる変更で削除した）、`download: bool`。
 
-用意する fixture: `translate_stream`、`translate_nostream`、`status`、`load_with_download`（progress downloading → loading → done）、`error_invalid_json`（raw `"{not json"`）、`error_missing_target_lang`、`error_unsupported_version`（`"v":2`）、`error_template`（template_error `"message content must not contain reserved PFML tokens (<|plamo:...)."`）、`error_context_too_long`（input_tokens 32000、max_tokens 1000）、`error_model_load_failed`、`unknown_fields`（リクエストとイベントに未知のキーを含む）。`done` の `model` と `revision` は `"<any>"` にする。
+用意する fixture: `translate_stream`、`translate_nostream`、`status`、`load_with_download`（progress downloading → loading → done）、`error_invalid_json`（raw `"{not json"`）、`error_missing_target_lang`、`error_unsupported_version`（`"v":2`）、`error_reserved_token`（当初は `error_template`。PFML3 をデーモンで組み立てる変更で改名した）、`error_context_too_long`（input_tokens 32000、max_tokens 1000）、`error_model_load_failed`、`unknown_fields`（リクエストとイベントに未知のキーを含む）。`done` の `model` と `revision` は `"<any>"` にする。
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -308,7 +308,7 @@ def test_paths_layout(tmp_path):
 - Produces（`plamo_translated.engine`）:
   - `@dataclass(frozen=True) class ProgressEvent: stage: Literal["downloading", "loading"]; done_bytes: int | None = None; total_bytes: int | None = None`
   - `class Engine(Protocol)`: `model: str`、`revision: str`、`loaded: bool`、`def ensure_loaded(self, progress: Callable[[ProgressEvent], None]) -> None`、`def count_tokens(self, req: TranslateRequest) -> int`、`def stream(self, req: TranslateRequest, max_tokens: int, cancelled: threading.Event) -> Iterator[str]`。失敗はすべて `DaemonError` で表す（ロード失敗は `model_load_failed`、template の検証エラーは `invalid_request`）。
-- Produces（`daemon/tests/conftest.py`）: `class FakeEngine(Engine)`。コンストラクタは `tokens: list[str] = ["ok"]`、`input_tokens: int = 5`、`template_error: str | None`、`load_error: str | None`、`download: bool = False`、`token_delay: float = 0.0`、`load_delay: float = 0.0`。`calls: list[TranslateRequest]` を記録する。`stream` は `cancelled` を各トークンの前に確認する。fixture の `fake` 行から作る `FakeEngine.from_fixture(d: dict)` も持つ。
+- Produces（`daemon/tests/conftest.py`）: `class FakeEngine(Engine)`。コンストラクタは `tokens: list[str] = ["ok"]`、`input_tokens: int = 5`、`load_error: str | None`、`download: bool = False`、`token_delay: float = 0.0`、`load_delay: float = 0.0`。`calls: list[TranslateRequest]` を記録する。`stream` は `cancelled` を各トークンの前に確認する。fixture の `fake` 行から作る `FakeEngine.from_fixture(d: dict)` も持つ。
 - Produces（`plamo_translated.mlx_engine`）: `class MlxEngine(Engine)`、`__init__(self, model: str, revision: str, hub_cache: Path)`。
 
 MlxEngine の要件（spec §5 と spike の結果に従う）:

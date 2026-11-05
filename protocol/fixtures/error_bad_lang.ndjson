@@ -1,0 +1,3 @@
+{"fake":{}}
+{"v":1,"op":"translate","text":"hi","target_lang":"en\n"}
+{"type":"error","code":"invalid_request","message":"target_lang must be a lowercase language code, e.g. en, ja, zh-hans, or ja(easy)."}
