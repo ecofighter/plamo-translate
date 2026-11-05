@@ -7,14 +7,18 @@ Apple silicon 上で PLaMo-3-translate (MLX) を使い、日英を中心とし�
 - `plamo-translate-mcp`: Rust 製の stdio MCP server (`translate` tool)
 - Nix flake: パッケージ、home-manager モジュール (nix-darwin から使う)、操作用 app
 
-## ライセンス上の注意
+## ライセンス
 
-既定のモデル [`pfnet/plamo-3-translate-2b-MLX-4bit`](https://huggingface.co/pfnet/plamo-3-translate-2b-MLX-4bit) は PLaMo Community License で提供されている。個人利用や非営利利用は無償だが、商用利用は収益規模によって PFN への登録が必要になる。条件はモデルのページで確認すること。このリポジトリはモデルのウェイトを含まない。
+このリポジトリのコードは [MIT License](LICENSE-MIT) または [Apache License 2.0](LICENSE-APACHE) のどちらかを選んで使える。
+
+このリポジトリはモデルのウェイト、モデルのコード、tokenizer を含まない。モデルは初回のロード時に Hugging Face から利用者の環境へダウンロードされ、その利用にはモデルのライセンスが別に適用される。既定のモデル [`pfnet/plamo-3-translate-2b-MLX-4bit`](https://huggingface.co/pfnet/plamo-3-translate-2b-MLX-4bit) は [PLaMo Community License](https://plamo.preferredai.jp/info/plamo-community-license-ja) で提供されている。個人利用や非営利利用は無償だが、商用利用には PFN への事前登録が必要で、年間売上が 10 億円を超える場合は別の契約が必要になる。翻訳結果を公開するときはモデルの出力であることを明示する必要がある。条件はモデルのページとライセンス本文で確認すること。
+
+Built with PLaMo
 
 ## 導入 (nix-darwin + home-manager)
 
 ```nix
-# flake inputs: plamo-translate.url = "github:<you>/plamo-translate"; home-manager.url = "github:nix-community/home-manager";
+# flake inputs: plamo-translate.url = "github:ecofighter/plamo-translate"; home-manager.url = "github:nix-community/home-manager";
 darwinConfigurations.<host> = nix-darwin.lib.darwinSystem {
   modules = [
     home-manager.darwinModules.home-manager
@@ -23,7 +27,7 @@ darwinConfigurations.<host> = nix-darwin.lib.darwinSystem {
 };
 ```
 
-`darwin-rebuild switch` すると、`plamo-translate` と `plamo-translate-mcp` が PATH に入り、LaunchAgent (`local.plamo-translate.daemon`) と `~/.config/plamo-translate/config.toml` が配置される。
+`darwin-rebuild switch` すると、`plamo-translate` と `plamo-translate-mcp` が PATH に入り、LaunchAgent (`net.ecofighter.plamo-translate.daemon`) と `~/.config/plamo-translate/config.toml` が配置される。
 
 オプション (`services.plamo-translate`):
 
@@ -47,7 +51,7 @@ services.plamo-translate = {
 
 ### home-manager を使わない場合
 
-`nix profile install github:<you>/plamo-translate` でプロファイルに入れてから `plamo-translate daemon install` を実行すると、plist を書いて読み込む。plist にはプロファイル内のデーモンのパスが記録されるので、GC で消えない。`nix run .#daemon-install` はストアのパスを GC ルートなしで plist に記録するため、`nix-collect-garbage` の後にデーモンが消える (このとき `daemon install` は警告を出す)。試用以外では使わないこと。`daemon-uninstall`、`daemon-start`、`daemon-stop`、`daemon-restart`、`daemon-status`、`daemon-logs` も app として用意してある。`daemon stop` はデーモンが起動していなければ何もせず終了コード 0 を返す。plist が Nix 管理 (home-manager) のときは、`daemon install` / `daemon uninstall` は変更を拒否して終了コード 2 を返す。
+`nix profile install github:ecofighter/plamo-translate` でプロファイルに入れてから `plamo-translate daemon install` を実行すると、plist を書いて読み込む。plist にはプロファイル内のデーモンのパスが記録されるので、GC で消えない。`nix run .#daemon-install` はストアのパスを GC ルートなしで plist に記録するため、`nix-collect-garbage` の後にデーモンが消える (このとき `daemon install` は警告を出す)。試用以外では使わないこと。`daemon-uninstall`、`daemon-start`、`daemon-stop`、`daemon-restart`、`daemon-status`、`daemon-logs` も app として用意してある。`daemon stop` はデーモンが起動していなければ何もせず終了コード 0 を返す。plist が Nix 管理 (home-manager) のときは、`daemon install` / `daemon uninstall` は変更を拒否して終了コード 2 を返す。
 
 ## 使い方 (CLI)
 
@@ -128,7 +132,7 @@ socket_path = "~/Library/Application Support/plamo-translate/daemon.sock"
 | ソケット | `~/Library/Application Support/plamo-translate/daemon.sock` (0600) |
 | ログ | `~/Library/Logs/plamo-translate/daemon.log` (5MB x 3 世代) |
 | クラッシュ時の出力 | `~/Library/Logs/plamo-translate/daemon.stderr.log` |
-| LaunchAgent | `~/Library/LaunchAgents/local.plamo-translate.daemon.plist` (Label は `local.plamo-translate.daemon`、ドメインは `gui/$UID`) |
+| LaunchAgent | `~/Library/LaunchAgents/net.ecofighter.plamo-translate.daemon.plist` (Label は `net.ecofighter.plamo-translate.daemon`、ドメインは `gui/$UID`) |
 
 ## MLX の更新
 

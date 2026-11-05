@@ -61,7 +61,7 @@ mod tests {
 
     fn spec(managed_by: &'static str) -> AgentSpec {
         AgentSpec {
-            label: "local.plamo-translate.daemon".into(),
+            label: "net.ecofighter.plamo-translate.daemon".into(),
             program: "/nix/profile/libexec/bin/plamo-translated".into(),
             socket_path: "/Users/u/Library/Application Support/plamo-translate/daemon.sock".into(),
             log_dir: "/Users/u/Library/Logs/plamo-translate".into(),

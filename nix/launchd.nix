@@ -15,7 +15,7 @@ in
 # ProgramArguments differs once home-manager wraps it with wait4path, and only the
 # Nix plist sets XDG_CONFIG_HOME (home-manager knows xdg.configHome; the CLI does not need to).
 {
-  Label = "local.plamo-translate.daemon";
+  Label = "net.ecofighter.plamo-translate.daemon";
   ProgramArguments = [ "${package}/libexec/bin/plamo-translated" ];
   Sockets.Listeners = {
     SockPathName = settings.socket_path or defaultSocket;

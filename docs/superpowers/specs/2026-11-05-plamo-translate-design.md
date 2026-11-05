@@ -81,7 +81,7 @@ docs/superpowers/specs/
 | ソケット | `<基点>/daemon.sock` | 解決順は `$PLAMO_TRANSLATE_SOCKET` → config の `socket_path` → この既定値。plist の `SockPathMode` は 0600（10進で 384）。sun_path の上限 104 バイトは install 時に検証する |
 | ログ | `~/Library/Logs/plamo-translate/daemon.log` | デーモンが `RotatingFileHandler`（5MB × 3世代）で書く。Console.app からも見える |
 | クラッシュ時の出力 | `~/Library/Logs/plamo-translate/daemon.stderr.log` | plist の `StandardErrorPath` / `StandardOutPath`。Python の起動失敗などを捕捉する |
-| LaunchAgent | `~/Library/LaunchAgents/local.plamo-translate.daemon.plist` | home-manager と CLI の `install` のどちらが書いても同じパス。Label は `local.plamo-translate.daemon`、ドメインは `gui/$UID` |
+| LaunchAgent | `~/Library/LaunchAgents/net.ecofighter.plamo-translate.daemon.plist` | home-manager と CLI の `install` のどちらが書いても同じパス。Label は `net.ecofighter.plamo-translate.daemon`、ドメインは `gui/$UID` |
 
 - **ウェイトは Application Support に置く**。Caches はシステムが容量不足時に消すことがあり、消されると数 GB の再ダウンロードになるため。
 - **Time Machine から除外する**。ウェイトは再取得できるので、デーモンが `<基点>/huggingface/` を初めて作るときに `tmutil addexclusion`（`-p` なし、root 不要の sticky 除外）を実行する。失敗しても警告ログを出すだけで続行する。

@@ -11,7 +11,7 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-pub const LABEL: &str = "local.plamo-translate.daemon";
+pub const LABEL: &str = "net.ecofighter.plamo-translate.daemon";
 
 #[derive(Subcommand)]
 pub enum DaemonCmd {

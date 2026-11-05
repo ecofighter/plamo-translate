@@ -27,7 +27,13 @@ let
     disabledTestMarks = [ "slow" ];
     pythonImportsCheck = [ "plamo_translated" ];
 
-    meta.mainProgram = "plamo-translated";
+    meta = {
+      mainProgram = "plamo-translated";
+      license = with lib.licenses; [
+        mit
+        asl20
+      ];
+    };
   };
 
   # Everything under crates/ is Rust sources, tests, fixtures, or insta snapshots; taking the whole
@@ -64,7 +70,13 @@ let
         mkdir -p $out/libexec/bin
         ln -s ${plamo-translated}/bin/plamo-translated $out/libexec/bin/plamo-translated
       '';
-      meta.mainProgram = "plamo-translate";
+      meta = {
+        mainProgram = "plamo-translate";
+        license = with lib.licenses; [
+          mit
+          asl20
+        ];
+      };
     }
   );
 in

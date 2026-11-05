@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
-const LABEL: &str = "local.plamo-translate.daemon";
+const LABEL: &str = "net.ecofighter.plamo-translate.daemon";
 
 struct Home {
     dir: TempDir,
@@ -126,7 +126,7 @@ fn uninstall_refuses_nix_managed_plist() {
         h.plist(),
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict>
-<key>Label</key><string>local.plamo-translate.daemon</string>
+<key>Label</key><string>net.ecofighter.plamo-translate.daemon</string>
 <key>EnvironmentVariables</key><dict><key>PLAMO_TRANSLATE_MANAGED_BY</key><string>nix</string></dict>
 </dict></plist>"#,
     )

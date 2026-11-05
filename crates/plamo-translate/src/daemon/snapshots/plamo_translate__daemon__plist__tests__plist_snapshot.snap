@@ -7,7 +7,7 @@ expression: "render_plist(&spec(\"cli\"))"
 <plist version="1.0">
 <dict>
 	<key>Label</key>
-	<string>local.plamo-translate.daemon</string>
+	<string>net.ecofighter.plamo-translate.daemon</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>/nix/profile/libexec/bin/plamo-translated</string>

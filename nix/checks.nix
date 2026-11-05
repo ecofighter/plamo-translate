@@ -87,7 +87,7 @@ let
         jq -e '.agent.config.Sockets.Listeners.SockPathMode == 384' "$summaryPath"
         jq -e '.agent.config.ProgramArguments | last | contains("libexec/bin/plamo-translated")' "$summaryPath"
         jq -e '.agent.config.EnvironmentVariables.PLAMO_TRANSLATE_MANAGED_BY == "nix"' "$summaryPath"
-        jq -e '.agent.config.Label == "local.plamo-translate.daemon"' "$summaryPath"
+        jq -e '.agent.config.Label == "net.ecofighter.plamo-translate.daemon"' "$summaryPath"
         jq -e '.agent.restartTriggers | length == 1' "$summaryPath"
         jq -e '.hasDirsActivation' "$summaryPath"
         jq -e '.agent.config.EnvironmentVariables.XDG_CONFIG_HOME == "/Users/t/custom-xdg"' "$summaryPath"
