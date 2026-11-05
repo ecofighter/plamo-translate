@@ -1,4 +1,4 @@
-use crate::protocol::{Event, Status, TranslateRequest};
+use crate::protocol::{Event, FEATURE_HISTORY, Status, TranslateRequest};
 use futures::{Stream, StreamExt, stream};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -24,6 +24,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("protocol error: {0}")]
     Protocol(String),
+    #[error("daemon does not support translation history; run \"plamo-translate daemon restart\"")]
+    HistoryUnsupported,
 }
 
 #[derive(Debug, Clone)]
@@ -62,8 +64,20 @@ impl Client {
     }
 
     pub async fn translate(&self, req: &TranslateRequest) -> Result<EventStream, Error> {
+        if !req.history.is_empty() {
+            self.require_history().await?;
+        }
         let line = serde_json::to_string(req).map_err(|e| Error::Protocol(e.to_string()))?;
         self.request(line).await
+    }
+
+    /// Asks the daemon on every call: a cached answer would go stale if the daemon is rolled back.
+    pub async fn require_history(&self) -> Result<(), Error> {
+        if self.status().await?.supports(FEATURE_HISTORY) {
+            Ok(())
+        } else {
+            Err(Error::HistoryUnsupported)
+        }
     }
 
     pub async fn load(&self) -> Result<EventStream, Error> {
