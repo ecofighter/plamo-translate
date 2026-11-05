@@ -81,7 +81,7 @@ pub async fn run(
         DaemonCmd::Install(args) => install(args, cfg, lc, home),
         DaemonCmd::Uninstall(args) => uninstall(args, lc, home),
         DaemonCmd::Start => simple(lc, &["kickstart", &target]),
-        DaemonCmd::Stop => simple(lc, &["kill", "SIGTERM", &target]),
+        DaemonCmd::Stop => stop(lc, &target),
         DaemonCmd::Restart => simple(lc, &["kickstart", "-k", &target]),
         DaemonCmd::Status => status(cfg, lc, home).await,
         DaemonCmd::Logs { follow } => logs(home, follow),
@@ -115,6 +115,21 @@ fn simple(lc: &dyn Launchctl, args: &[&str]) -> io::Result<ExitCode> {
     } else {
         Ok(report_failure(args, &out))
     }
+}
+
+/// `launchctl kill` fails with ESRCH on a loaded but idle service, which is not an error for `stop`.
+fn stop(lc: &dyn Launchctl, target: &str) -> io::Result<ExitCode> {
+    let print = ["print", target];
+    let out = launchctl(lc, &print)?;
+    if !out.status.success() {
+        return Ok(report_failure(&print, &out));
+    }
+    let info = launchctl::parse_print(&String::from_utf8_lossy(&out.stdout));
+    if info.state.as_deref() != Some("running") {
+        println!("daemon is not running");
+        return Ok(ExitCode::Ok);
+    }
+    simple(lc, &["kill", "SIGTERM", target])
 }
 
 fn is_loaded(lc: &dyn Launchctl) -> io::Result<bool> {
@@ -158,6 +173,19 @@ fn create_private_dir(dir: &Path) -> io::Result<()> {
         _ => {}
     }
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
+/// A bare store path (e.g. from `nix run .#daemon-install`) has no GC root, so the plist
+/// would point at a deleted file after the next `nix-collect-garbage`.
+fn gc_root_warning(program: &Path) -> Option<String> {
+    program.starts_with("/nix/store").then(|| {
+        format!(
+            "warning: {} is a bare /nix/store path that the garbage collector may delete; \
+             run `nix profile install` and then `plamo-translate daemon install` from the profile, \
+             or use the home-manager module",
+            program.display()
+        )
+    })
 }
 
 fn install(
@@ -220,6 +248,9 @@ fn install(
     let out = launchctl(lc, &bootstrap)?;
     if !out.status.success() {
         return Ok(report_failure(&bootstrap, &out));
+    }
+    if let Some(warning) = gc_root_warning(&program) {
+        eprintln!("{warning}");
     }
     println!(
         "installed {}\ndaemon: {}\nsocket: {}",
@@ -443,6 +474,23 @@ mod tests {
         assert!(log_dir(e.home()).is_dir());
     }
 
+    #[test]
+    fn bare_store_daemon_path_gets_gc_warning() {
+        let store =
+            Path::new("/nix/store/abc123-plamo-translate-0.1.0/libexec/bin/plamo-translated");
+        let warning = gc_root_warning(store).unwrap();
+        assert!(warning.contains("nix profile install"), "{warning}");
+        assert!(warning.contains("home-manager"), "{warning}");
+        for rooted in [
+            "/Users/t/.nix-profile/libexec/bin/plamo-translated",
+            "/etc/profiles/per-user/t/libexec/bin/plamo-translated",
+            "/usr/local/bin/plamo-translated",
+            "/nix/storefront/bin/plamo-translated",
+        ] {
+            assert_eq!(gc_root_warning(Path::new(rooted)), None, "{rooted}");
+        }
+    }
+
     #[tokio::test]
     async fn install_skips_bootout_when_not_loaded() {
         let e = env();
@@ -552,12 +600,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_sends_sigterm_kill() {
+    async fn stop_sends_sigterm_kill_when_running() {
         let e = env();
-        let lc = RecordingLaunchctl::default();
+        let printed = include_str!("../../tests/fixtures/launchctl_print_running.txt");
+        let lc = RecordingLaunchctl::default().respond("print", 0, printed);
         let code = run(DaemonCmd::Stop, &e.cfg, &lc, e.home()).await.unwrap();
         assert_eq!(code, ExitCode::Ok);
-        assert_eq!(lc.calls(), vec![s(&["kill", "SIGTERM", &target()])]);
+        assert_eq!(
+            lc.calls(),
+            vec![s(&["print", &target()]), s(&["kill", "SIGTERM", &target()])]
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_when_loaded_but_idle_is_ok_without_kill() {
+        let e = env();
+        let printed = include_str!("../../tests/fixtures/launchctl_print_exited.txt");
+        let lc = RecordingLaunchctl::default().respond("print", 0, printed);
+        let code = run(DaemonCmd::Stop, &e.cfg, &lc, e.home()).await.unwrap();
+        assert_eq!(code, ExitCode::Ok);
+        assert_eq!(lc.calls(), vec![s(&["print", &target()])]);
+    }
+
+    #[tokio::test]
+    async fn stop_when_not_loaded_fails_without_kill() {
+        let e = env();
+        let lc = RecordingLaunchctl::default().respond("print", 113, "");
+        let code = run(DaemonCmd::Stop, &e.cfg, &lc, e.home()).await.unwrap();
+        assert_eq!(code, ExitCode::Translation);
+        assert_eq!(lc.calls(), vec![s(&["print", &target()])]);
     }
 
     #[tokio::test]

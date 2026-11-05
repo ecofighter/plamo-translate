@@ -13,6 +13,11 @@ struct Home {
 
 // HOME and launchctl are always fake so these tests never touch the real ~/Library or launchd.
 fn home() -> Home {
+    home_with_print("exit 113")
+}
+
+/// `print_action` is the shell run for `launchctl print`; other subcommands succeed silently.
+fn home_with_print(print_action: &str) -> Home {
     let dir = tempfile::Builder::new()
         .prefix("pth")
         .tempdir_in("/tmp")
@@ -20,7 +25,9 @@ fn home() -> Home {
     let launchctl = dir.path().join("fake-launchctl");
     std::fs::write(
         &launchctl,
-        "#!/bin/sh\necho \"$@\" >> \"$0.calls\"\ncase \"$1\" in print) exit 113;; esac\nexit 0\n",
+        format!(
+            "#!/bin/sh\necho \"$@\" >> \"$0.calls\"\ncase \"$1\" in print) {print_action};; esac\nexit 0\n"
+        ),
     )
     .unwrap();
     std::fs::set_permissions(&launchctl, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -204,4 +211,30 @@ fn model_pull_without_daemon_exits_unreachable() {
         .assert()
         .code(3)
         .stderr(contains("daemon install"));
+}
+
+#[test]
+fn stop_when_loaded_but_idle_exits_ok_without_kill() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/launchctl_print_exited.txt");
+    let h = home_with_print(&format!("cat '{}'; exit 0", fixture.display()));
+    h.cmd()
+        .args(["daemon", "stop"])
+        .assert()
+        .success()
+        .stdout(contains("not running"));
+    let calls = h.calls();
+    assert!(calls.starts_with("print gui/"), "{calls}");
+    assert!(!calls.contains("kill"), "{calls}");
+}
+
+#[test]
+fn stop_when_not_loaded_fails() {
+    let h = home();
+    h.cmd()
+        .args(["daemon", "stop"])
+        .assert()
+        .code(1)
+        .stderr(contains("is the daemon installed"));
+    assert!(!h.calls().contains("kill"));
 }

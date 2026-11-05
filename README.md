@@ -45,9 +45,9 @@ services.plamo-translate = {
 
 設定を変えて再適用すると、デーモンは自動で再起動される。
 
-### Nix を使わない場合
+### home-manager を使わない場合
 
-`nix run .#daemon-install` (または `plamo-translate daemon install`) で plist を書いて読み込む。`daemon-uninstall`、`daemon-start`、`daemon-stop`、`daemon-restart`、`daemon-status`、`daemon-logs` も app として用意してある。plist が Nix 管理 (home-manager) のときは、`daemon install` / `daemon uninstall` は変更を拒否して終了コード 2 を返す。
+`nix profile install github:<you>/plamo-translate` でプロファイルに入れてから `plamo-translate daemon install` を実行すると、plist を書いて読み込む。plist にはプロファイル内のデーモンのパスが記録されるので、GC で消えない。`nix run .#daemon-install` はストアのパスを GC ルートなしで plist に記録するため、`nix-collect-garbage` の後にデーモンが消える (このとき `daemon install` は警告を出す)。試用以外では使わないこと。`daemon-uninstall`、`daemon-start`、`daemon-stop`、`daemon-restart`、`daemon-status`、`daemon-logs` も app として用意してある。`daemon stop` はデーモンが起動していなければ何もせず終了コード 0 を返す。plist が Nix 管理 (home-manager) のときは、`daemon install` / `daemon uninstall` は変更を拒否して終了コード 2 を返す。
 
 ## 使い方 (CLI)
 
