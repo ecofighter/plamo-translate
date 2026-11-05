@@ -3,7 +3,6 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    crane.url = "github:ipetkov/crane";
     home-manager = {
       url = "github:nix-community/home-manager";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -14,7 +13,6 @@
     {
       self,
       nixpkgs,
-      crane,
       home-manager,
       ...
     }:
@@ -25,8 +23,7 @@
         inherit system;
         overlays = [ overlay ];
       };
-      craneLib = crane.mkLib pkgs;
-      build = import ./nix/packages.nix { inherit pkgs craneLib; };
+      build = import ./nix/packages.nix { inherit pkgs; };
       inherit (build) packages;
 
       daemonApp =
@@ -61,10 +58,9 @@
       ] (cmd: nixpkgs.lib.nameValuePair "daemon-${cmd}" (daemonApp cmd));
 
       checks.${system} = import ./nix/checks.nix {
-        inherit pkgs craneLib packages;
-        inherit home-manager;
+        inherit pkgs packages home-manager;
         hmModule = self.homeManagerModules.default;
-        inherit (build) cargoArgs cargoArtifacts;
+        inherit (build) rustArgs;
       };
 
       devShells.${system}.default = pkgs.mkShell {

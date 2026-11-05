@@ -1,11 +1,9 @@
 {
   pkgs,
-  craneLib,
   home-manager,
   hmModule,
   packages,
-  cargoArgs,
-  cargoArtifacts,
+  rustArgs,
 }:
 
 let
@@ -103,13 +101,34 @@ let
       '';
 in
 {
-  cargo-test = craneLib.cargoTest (cargoArgs // { inherit cargoArtifacts; });
-
-  clippy = craneLib.cargoClippy (
-    cargoArgs
+  # Debug profile, like `cargo test --workspace` in the justfile: a third of the release compile
+  # time, and overflow checks stay on. No build phase: `cargo test` builds the binaries the tests run.
+  # The checks ship no binaries, so cargo-auditable has nothing to embed.
+  cargo-test = pkgs.rustPlatform.buildRustPackage (
+    rustArgs
     // {
-      inherit cargoArtifacts;
-      cargoClippyExtraArgs = "--workspace --all-targets -- -D warnings";
+      pname = "plamo-translate-cargo-test";
+      buildType = "debug";
+      auditable = false;
+      dontCargoBuild = true;
+      cargoTestFlags = [ "--workspace" ];
+      installPhase = "touch $out";
+    }
+  );
+
+  clippy = pkgs.rustPlatform.buildRustPackage (
+    rustArgs
+    // {
+      pname = "plamo-translate-clippy";
+      auditable = false;
+      nativeBuildInputs = [ pkgs.clippy ];
+      buildPhase = ''
+        runHook preBuild
+        cargo clippy -j "$NIX_BUILD_CORES" --offline --locked --workspace --all-targets -- -D warnings
+        runHook postBuild
+      '';
+      doCheck = false;
+      installPhase = "touch $out";
     }
   );
 

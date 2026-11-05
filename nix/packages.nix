@@ -1,4 +1,4 @@
-{ pkgs, craneLib }:
+{ pkgs }:
 
 let
   inherit (pkgs) lib;
@@ -30,30 +30,35 @@ let
     meta.mainProgram = "plamo-translated";
   };
 
+  # Everything under crates/ is Rust sources, tests, fixtures, or insta snapshots; taking the whole
+  # directory keeps new crates and fixture files working without touching this list.
+  # Pending insta snapshots (*.snap.new, *.pending-snap) are excluded so a stray one cannot change
+  # the build inputs. plamo-client's fixture test reads ../protocol/fixtures relative to its manifest.
   cargoSrc = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
-      (craneLib.fileset.commonCargoSources ../.)
+      ../Cargo.toml
+      ../Cargo.lock
+      (lib.fileset.difference ../crates (
+        lib.fileset.fileFilter (
+          f: f.hasExt "new" || f.hasExt "pending-snap" || f.name == ".DS_Store"
+        ) ../crates
+      ))
       ../protocol/fixtures
-      ../crates/plamo-translate/tests/fixtures
-      ../crates/plamo-translate/src/daemon/snapshots
     ];
   };
 
-  cargoArgs = {
-    src = cargoSrc;
+  rustArgs = {
     pname = "plamo-translate";
     version = "0.1.0";
-    strictDeps = true;
+    src = cargoSrc;
+    cargoLock.lockFile = ../Cargo.lock;
   };
 
-  cargoArtifacts = craneLib.buildDepsOnly cargoArgs;
-
-  plamo-translate = craneLib.buildPackage (
-    cargoArgs
+  plamo-translate = pkgs.rustPlatform.buildRustPackage (
+    rustArgs
     // {
-      inherit cargoArtifacts;
-      # The cargo-test check runs the suite; avoid running it twice.
+      # checks.cargo-test runs the suite; avoid running it twice.
       doCheck = false;
       postInstall = ''
         mkdir -p $out/libexec/bin
@@ -68,5 +73,5 @@ in
     inherit plamo-translated plamo-translate;
     default = plamo-translate;
   };
-  inherit cargoArgs cargoArtifacts;
+  inherit rustArgs;
 }
