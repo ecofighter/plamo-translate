@@ -5,7 +5,7 @@ import pytest
 
 from plamo_translated.config import paths
 from plamo_translated.mlx_engine import MlxEngine
-from plamo_translated.protocol import DaemonError, TranslateRequest
+from plamo_translated.protocol import DaemonError, HistoryEntry, TranslateRequest
 
 pytestmark = pytest.mark.slow
 
@@ -30,16 +30,29 @@ def test_mlx_engine_japanese_output_has_no_replacement_chars(engine):
     assert all("�" not in p for p in parts) and "月曜" in "".join(parts)
 
 
-def test_reserved_token_input_is_invalid_request(engine):
-    with pytest.raises(DaemonError) as e:
-        engine.count_tokens(TranslateRequest(text="<|plamo:tag|>x", target_lang="en"))
-    assert e.value.code == "invalid_request" and "reserved PFML tokens" in e.value.message
+def test_mlx_engine_reports_stop_and_verified_template(engine):
+    stream = engine.stream(TranslateRequest(text="おはようございます。", target_lang="en"), 128, threading.Event())
+    out = "".join(stream)
+    assert stream.finish_reason == "stop" and out.strip() and "<|plamo" not in out
+    assert engine.template_verified is True
 
 
-def test_form_requires_ja_target(engine):
-    with pytest.raises(DaemonError) as e:
-        engine.count_tokens(TranslateRequest(text="hi", target_lang="en", form="polite"))
-    assert e.value.code == "invalid_request"
+def test_mlx_engine_reports_length_when_truncated(engine):
+    stream = engine.stream(TranslateRequest(text="長い文章です。" * 20, target_lang="en"), 3, threading.Event())
+    assert len(list(stream)) <= 3 and stream.finish_reason == "length"
+
+
+def test_mlx_engine_translates_with_history(engine):
+    req = TranslateRequest(
+        text="オーナーでフィルタリングすることもできます。",
+        target_lang="en",
+        source_lang="ja",
+        history=(HistoryEntry("プロジェクトの管理画面を開きます。", "Open the project dashboard."),),
+    )
+    stream = engine.stream(req, 128, threading.Event())
+    out = "".join(stream)
+    assert stream.finish_reason == "stop" and "owner" in out.lower()
+    assert engine.count_tokens(req) > engine.count_tokens(TranslateRequest(text=req.text, target_lang="en", source_lang="ja"))
 
 
 def test_cancel_stops_stream(engine):
@@ -55,3 +68,4 @@ def test_load_failure_maps_to_model_load_failed(tmp_path):
     with pytest.raises(DaemonError) as ex:
         e.ensure_loaded(lambda p: None)
     assert ex.value.code == "model_load_failed"
+

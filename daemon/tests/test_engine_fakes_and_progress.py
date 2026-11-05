@@ -144,3 +144,10 @@ def test_fake_engine_cancelled_stream_has_no_finish_reason():
 def test_text_stream_skips_empty_pieces_and_keeps_finish_reason():
     s = TextStream([("a", None), ("", None), ("b", None), ("", "stop")])
     assert list(s) == ["a", "b"] and s.finish_reason == "stop"
+
+
+def test_fake_engine_template_verified_once_loaded():
+    e = FakeEngine()
+    assert e.template_verified is None
+    e.ensure_loaded(lambda p: None)
+    assert e.template_verified is True

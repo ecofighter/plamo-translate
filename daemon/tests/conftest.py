@@ -35,6 +35,10 @@ class FakeEngine(Engine):
         self.calls: list[TranslateRequest] = []
         self.saw_cancel = False
 
+    @property
+    def template_verified(self) -> bool | None:
+        return True if self.loaded else None
+
     @classmethod
     def from_fixture(cls, d: dict) -> "FakeEngine":
         keys = ("tokens", "input_tokens", "load_error", "download")

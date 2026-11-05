@@ -38,13 +38,16 @@ class TextStream(Iterator[str]):
 class Engine(Protocol):
     """Model backend driven by the server's single worker thread.
 
-    Every failure is raised as DaemonError: `model_load_failed` for download or
-    load problems, `invalid_request` for chat template validation errors.
+    Requests reach the engine already validated (pfml3.validate). Every failure
+    is raised as DaemonError, `model_load_failed` for download, load or
+    tokenizer-compatibility problems.
     """
 
     model: str
     revision: str
     loaded: bool
+    # Whether the loaded snapshot's chat template is the one the PFML3 builder was verified against; None until loaded.
+    template_verified: bool | None
 
     def ensure_loaded(self, progress: Callable[[ProgressEvent], None]) -> None:
         """Download (if needed) and load the model; a no-op once loaded.

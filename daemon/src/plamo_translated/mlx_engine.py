@@ -13,7 +13,6 @@ from collections.abc import Callable, Iterator  # noqa: E402
 from contextlib import closing  # noqa: E402
 from pathlib import Path  # noqa: E402
 
-import jinja2.exceptions  # noqa: E402
 import mlx.core as mx  # noqa: E402
 from huggingface_hub import snapshot_download  # noqa: E402
 from huggingface_hub.errors import LocalEntryNotFoundError  # noqa: E402
@@ -21,6 +20,7 @@ from mlx_lm import load, stream_generate  # noqa: E402
 from mlx_lm.sample_utils import make_sampler  # noqa: E402
 from tqdm.std import tqdm  # noqa: E402
 
+from . import pfml3  # noqa: E402
 from .engine import Engine, ProgressEvent, TextStream  # noqa: E402
 from .protocol import DaemonError, TranslateRequest  # noqa: E402
 
@@ -97,35 +97,62 @@ class _NullWriter:
         pass
 
 
+TEMPLATE_DRIFT_WARNING = (
+    "bundled chat template differs from the one the PFML3 builder was verified against "
+    "(re-run the slow oracle tests)"
+)
+
+
 class MlxEngine(Engine):
     def __init__(self, model: str, revision: str, hub_cache: Path):
         self.model = model
         self.revision = revision
         self.hub_cache = hub_cache
         self.loaded = False
+        self.template_verified: bool | None = None
+        # Set when the tokenizer fails the PFML3 checks; the snapshot cannot change within the process.
+        self._incompatible: str | None = None
         self._model = None
         self._tokenizer = None
 
     def ensure_loaded(self, progress: Callable[[ProgressEvent], None]) -> None:
         if self.loaded:
             return
+        if self._incompatible is not None:
+            raise DaemonError("model_load_failed", self._incompatible)
         try:
             path = self._resolve_snapshot(progress)
             progress(ProgressEvent("loading"))
-            self._model, self._tokenizer = load(
+            model, tokenizer = load(
                 path, trust_remote_code=True, tokenizer_config={"trust_remote_code": True}
             )
         except Exception as e:
             raise DaemonError("model_load_failed", f"{type(e).__name__}: {e}") from e
+        try:
+            pfml3.check_tokenizer(tokenizer)
+        except DaemonError as e:
+            self._incompatible = e.message
+            raise
+        template_verified = pfml3.template_verified(Path(path))
+        if not template_verified:
+            log.warning(TEMPLATE_DRIFT_WARNING)
+        self._warn_unless_gpu()
+        self._model, self._tokenizer = model, tokenizer
+        self.template_verified = template_verified
+        self.loaded = True
+
+    def _warn_unless_gpu(self) -> None:
         device = mx.default_device()
         if device.type != mx.gpu:
             log.error("MLX default device is %s, not GPU; generation will be very slow", device)
-        self.loaded = True
 
     def _resolve_snapshot(self, progress: Callable[[ProgressEvent], None]) -> str:
         try:
             return snapshot_download(
-                self.model, revision=self.revision, cache_dir=self.hub_cache, local_files_only=True
+                self.model,
+                revision=self.revision,
+                cache_dir=self.hub_cache,
+                local_files_only=True,
             )
         except LocalEntryNotFoundError:
             pass
@@ -140,36 +167,17 @@ class MlxEngine(Engine):
         download_progress.finish()
         return path
 
-    def _prompt_tokens(self, req: TranslateRequest) -> list[int]:
+    def _prompt_ids(self, req: TranslateRequest) -> list[int]:
         if not self.loaded:
             raise DaemonError("internal", "model is not loaded")
-        kwargs: dict = {"target_lang": req.target_lang}
-        for key in ("source_lang", "context", "form"):
-            value = getattr(req, key)
-            if value is not None:
-                kwargs[key] = value
-        if req.glossary:
-            kwargs["glossary"] = [{"source": g.source, "target": g.target} for g in req.glossary]
-        try:
-            prompt = self._tokenizer.apply_chat_template(
-                [{"role": "user", "content": req.text}],
-                add_generation_prompt=True,
-                tokenize=False,
-                **kwargs,
-            )
-        except jinja2.exceptions.TemplateError as e:
-            raise DaemonError("invalid_request", str(e)) from e
-        # Same rule as stream_generate for string prompts, so the count matches what is generated from.
-        bos = self._tokenizer.bos_token
-        add_special_tokens = bos is None or not prompt.startswith(bos)
-        return self._tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
+        return pfml3.prompt_ids(self._tokenizer, req)
 
     def count_tokens(self, req: TranslateRequest) -> int:
-        return len(self._prompt_tokens(req))
+        return len(self._prompt_ids(req))
 
     def stream(self, req: TranslateRequest, max_tokens: int, cancelled: threading.Event) -> TextStream:
-        # Not a generator itself, so template errors surface at the call rather than on first next().
-        return TextStream(self._generate(self._prompt_tokens(req), max_tokens, cancelled))
+        # Not a generator itself, so encoding errors surface at the call rather than on first next().
+        return TextStream(self._generate(self._prompt_ids(req), max_tokens, cancelled))
 
     def _generate(
         self, prompt: list[int], max_tokens: int, cancelled: threading.Event
