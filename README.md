@@ -98,9 +98,25 @@ plamo-translate daemon uninstall [--purge [--yes]]   # --purge はモデル、�
 
 ## 使い方 (MCP)
 
+Claude Code (CLI) では次のコマンドで登録する。
+
 ```sh
 claude mcp add plamo-translate -- plamo-translate-mcp
 ```
+
+Claude Desktop のチャットでは `~/Library/Application Support/Claude/claude_desktop_config.json` に書く。Finder から起動したアプリはシェルの `PATH` を引き継がないことがあるので、`command -v plamo-translate-mcp` で調べた絶対パスを書く (home-manager なら `/etc/profiles/per-user/<ユーザー名>/bin/plamo-translate-mcp`)。書いたら Claude Desktop を終了して開き直す。
+
+```json
+{
+  "mcpServers": {
+    "plamo-translate": {
+      "command": "/etc/profiles/per-user/<ユーザー名>/bin/plamo-translate-mcp"
+    }
+  }
+}
+```
+
+Claude Desktop の Code タブのローカルセッションは、このファイルのサーバーも `~/.claude.json` のサーバーも読む。どちらかに登録すれば Code タブでも使える。
 
 `translate` tool が 1 つ使える。引数は `text`、`target_lang` (必須。`ja`、`en`、`zh-hans`、`zh-hant`、`ko`、`fr`、`de`、`es`、`ja(easy)` など)、`source_lang`、`context`、`glossary` (`[{source, target}]`)、`form` (`polite` / `plain`、`target_lang=ja` のときだけ)、`history` (`[{source, translation}]`、同じ文書の前の部分とその訳を古い順に)。config の `glossary_file` も適用され、引数の glossary が優先される。履歴を含めてモデルの上限を超える場合は、古い組から半分ずつ削って再試行し、削ったことを `note:` で始まる 2 つ目の content に書く。打ち切られた訳などの履歴に使えない結果にも同じ形で注記する。
 
@@ -108,13 +124,37 @@ claude mcp add plamo-translate -- plamo-translate-mcp
 
 ## Claude Code の日英レイヤ (`plamo-ja-bridge`)
 
-Claude Code の mod。日本語で入力すると英訳して Claude に送り、Claude の英語の応答を段落ごとに和訳して表示する。Claude には英文だけが届き、transcript にも英文が残る。翻訳には `plamo-translate` CLI を使うので、CLI とデーモンを先に導入しておく。Claude Code v2.1.317 で動作を確かめた。
+Claude Code の mod。日本語で入力すると英訳して Claude に送り、Claude の英語の応答を段落ごとに和訳して表示する。Claude には英文だけが届き、transcript にも英文が残る。翻訳には `plamo-translate` CLI を使うので、CLI とデーモンを先に導入しておく。動作はターミナルの Claude Code v2.1.317 で確かめた。Claude Desktop の Code タブでは確かめていない。
+
+### 導入
+
+このリポジトリが plugin の marketplace (`ecofighter-plamo-translate`) を兼ねている。Claude Code (CLI) と Claude Desktop の Code タブのローカルセッションは同じ設定ファイル (`~/.claude/settings.json` など) を読むので、どちらかで入れれば両方で使える。
+
+**Claude Code (CLI)**: セッションの中で次を実行し、詳細画面で範囲を選ぶ (自分だけなら user scope)。v2.1.275 以降が必要。
 
 ```
 /plugin install plamo-ja-bridge --marketplace ecofighter/plamo-translate
 ```
 
-開発中のチェックアウトから読み込むときは `claude --plugin-dir ./claude-plugin` を使う。
+シェルから入れる場合は次のとおり (v2.1.292 以降)。既定は user scope。開いているセッションには `/reload-plugins` で読み込む。
+
+```sh
+claude plugin install plamo-ja-bridge --marketplace ecofighter/plamo-translate
+```
+
+**Claude Desktop (Code タブ)**: plugin ブラウザには登録済みの marketplace の plugin だけが並ぶ。先にシェルで marketplace を登録する (上の `claude plugin install` で入れた場合は不要)。
+
+```sh
+claude plugin marketplace add ecofighter/plamo-translate
+```
+
+ローカルセッションでプロンプト欄の横の **+** から **Add plugins** (メニューが **Plugins** なら **Browse plugins**) を開き、`plamo-ja-bridge` を選んで範囲を決める。Code タブは Desktop が持つ Claude Code で動くので、ターミナルの `claude` とバージョンが違うことがある。`/status` の **Claude Code** 行で確かめる。
+
+Desktop は起動時にログインシェルの環境変数を読む。`plamo-translate` が見つからずに翻訳が失敗するときは、`translator` に絶対パス (例: `/etc/profiles/per-user/<ユーザー名>/bin/plamo-translate`) を設定するか、Desktop を終了して開き直す。
+
+この mod は Claude Code 用で、Claude Desktop のチャット (Code タブ以外) では動かない。チャットで翻訳を使うときは上の MCP を登録する。
+
+開発中のチェックアウトから 1 セッションだけ読み込むときは `claude --plugin-dir ./claude-plugin` を使う。
 
 ### 使い方
 
@@ -132,7 +172,7 @@ Claude Code の mod。日本語で入力すると英訳して Claude に送り�
 
 ### 設定 (userConfig)
 
-`/plugin` の Configure か `/config` で変える。
+`/plugin` の **Installed** タブで `plamo-ja-bridge` を開き、**Configure options** で変える。
 
 | キー | 既定 | 内容 |
 |---|---|---|
