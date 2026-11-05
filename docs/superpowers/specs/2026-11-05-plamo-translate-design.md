@@ -2,7 +2,7 @@
 
 - 日付: 2026-11-05
 - 状態: ドラフト（ユーザーレビュー待ち）
-- 改訂: Homebrew tap を v1 から外した。導入経路は home-manager モジュール（nix-darwin に組み込んで使う）を主とした
+- 改訂: Homebrew tap を v1 から外した。導入経路は home-manager モジュール（nix-darwin に組み込んで使う）を主とした。Fable によるレビューの指摘を反映した
 
 ## 1. 目的と前提
 
@@ -79,7 +79,7 @@ docs/superpowers/specs/
 | アプリデータの基点 | `~/Library/Application Support/plamo-translate/` | ディレクトリは 0700 で作る |
 | モデルのウェイト | `<基点>/huggingface/hub/` | デーモンが `HF_HUB_CACHE` に設定する。`~/.cache/huggingface` とは共有しない |
 | remote code のキャッシュ | `<基点>/huggingface/modules/` | `HF_MODULES_CACHE` に設定する |
-| ソケット | `<基点>/daemon.sock` | plist の `SockPathMode` は 0600（10進で 384）。sun_path の上限 104 バイトは install 時に検証する |
+| ソケット | `<基点>/daemon.sock` | 解決順は `$PLAMO_TRANSLATE_SOCKET` → config の `socket_path` → この既定値。plist の `SockPathMode` は 0600（10進で 384）。sun_path の上限 104 バイトは install 時に検証する |
 | ログ | `~/Library/Logs/plamo-translate/daemon.log` | デーモンが `RotatingFileHandler`（5MB × 3世代）で書く。Console.app からも見える |
 | クラッシュ時の出力 | `~/Library/Logs/plamo-translate/daemon.stderr.log` | plist の `StandardErrorPath` / `StandardOutPath`。Python の起動失敗などを捕捉する |
 | LaunchAgent | `~/Library/LaunchAgents/local.plamo-translate.daemon.plist` | home-manager と CLI の `install` のどちらが書いても同じパス。Label は `local.plamo-translate.daemon`、ドメインは `gui/$UID` |
@@ -95,38 +95,39 @@ docs/superpowers/specs/
 model = "pfnet/plamo-3-translate-2b-MLX-4bit"
 revision = "63777ddc6dc80aacacd92a1bf6966105f2f6270c"  # 省略時は下記の規則
 idle_timeout_secs = 600      # 0 で無期限
-max_queue = 8                # 処理待ちの上限。超えたら busy エラー
 default_target = "auto"      # "auto" または言語コード
 glossary_file = "~/.config/plamo-translate/glossary.tsv"  # 常用の用語集（任意）
 socket_path = "~/Library/Application Support/plamo-translate/daemon.sock"
 ```
 
 - **revision の固定**: `trust_remote_code` はモデルリポジトリの Python コードを実行するため、上流の更新が黙って反映されないようにする。既定モデルには、リリース時に検証したリビジョンをコードに埋め込む。既定以外のモデルで `revision` を省略した場合は `main` を使い、そのリビジョン ID を起動ログに警告として出す。
-- 設定はデーモンの起動時に1回だけ読む。変更の反映には `plamo-translate daemon restart` が必要（`status` で現在のモデルとリビジョンを確認できる）。
+- 設定はデーモンの起動時に1回だけ読む。home-manager 経由なら、設定の変更時に `darwin-rebuild switch` がデーモンを再起動する（§7 の `restartTriggers`）。CLI の `install` 経由なら、`plamo-translate daemon restart` が必要。`status` で現在のモデルとリビジョンを確認できる。
+- 処理待ちの上限は定数 8 とし、設定項目にはしない（単一ユーザーのため）。
 - `~` の展開は Rust と Python の双方で行う。
 
 ## 5. デーモン `plamo-translated`
 
 ### モジュール構成
-- `activation`: launchd の `launch_activate_socket("Listeners")` を ctypes（libSystem）で呼び、listen 済みの fd を受け取る。`--socket PATH` が与えられたら自分で bind する（開発用・テスト用）。
+- `activation`: launchd の `launch_activate_socket("Listeners", int**, size_t*)`（`launch.h`、libSystem）を ctypes で呼び、listen 済みの fd を受け取る。返された fd 配列は `free()` で解放する。呼び出しは名前ごとに1回だけ。`--socket PATH` が与えられたら自分で bind する（開発用・テスト用）。
 - `config`: 上記の探索順で TOML（`tomllib`）を読み、dataclass に変換する。
 - `engine`: `Engine` プロトコルの定義と、その実装 `MlxEngine`。
-  - `ensure_loaded(progress_cb)`: まず `snapshot_download(local_files_only=True)` を試し、ローカルに無ければダウンロードする（ネットワーク確認を毎回しないため）。進捗は `progress_cb` で通知する。その後 `mlx_lm.load(path, model_config={"trust_remote_code": True}, tokenizer_config={"trust_remote_code": True})` でロードする。
-  - `count_tokens(req)` と `stream(req) -> Iterator[str]`: `tokenizer.apply_chat_template(messages=[{"role":"user","content":text}], add_generation_prompt=True, tokenize=False, target_lang=..., source_lang=..., context=..., glossary=..., form=...)` でプロンプトを作り、`mlx_lm.stream_generate` を temp 0（`make_sampler(temp=0)`）で回す。stop トークンは `<|plamo:tag|>` と `<|plamo:bos|>`。
-  - chat template が出す例外（`TemplateError`）は `invalid_request` に変換し、template のメッセージをそのまま返す。
+  - `ensure_loaded(progress_cb)`: まず `snapshot_download(local_files_only=True)` を試し、ローカルに無ければダウンロードする（ネットワーク確認を毎回しないため）。ダウンロードの進捗は、`snapshot_download` に独自の `tqdm_class` を渡してバイト数を集計し、`progress_cb` で通知する。その後、モデルの README と同じ `mlx_lm.load(path, trust_remote_code=True, tokenizer_config={"trust_remote_code": True})` でロードする（`trust_remote_code` は `load()` の引数であり、`model_config` に入れても効かない）。ロード後に `mx.default_device()` が GPU であることを確認し、CPU なら起動ログにエラーを出す。
+  - `count_tokens(req)` と `stream(req) -> Iterator[str]`: `tokenizer.apply_chat_template(messages=[{"role":"user","content":text}], add_generation_prompt=True, tokenize=False, target_lang=..., source_lang=..., context=..., glossary=..., form=...)` でプロンプトを作り、`mlx_lm.stream_generate` を temp 0（`make_sampler(temp=0)`）で回す。`TokenizerWrapper.apply_chat_template` は追加の kwargs を HF tokenizer にそのまま渡す。停止条件は独自に実装しない。モデルの `generation_config.json` の `eos_token_id: [1, 16]`（`<|plamo:bos|>`、`<|plamo:tag|>`）を mlx-lm が読み込み、`stream_generate` がそこで止まるため。
+  - chat template の `raise_exception` が出す例外（`jinja2.TemplateError`。transformers 5 系でこの型になることを段階0で確認する）は `invalid_request` に変換し、template のメッセージをそのまま返す。
   - モデル同梱の `serve.py` と同じ MLX 環境変数（`MLX_ENABLE_TF32=0` など）を、import 前に `setdefault` で設定する。`serving_memory.py` のパッチはプロンプトキャッシュ用なので使わない。
 - `server`: asyncio の UDS サーバー。
-  - 接続の受け付けは並行に行う。生成は GPU を1本しか使わないため、単一ワーカーが FIFO キューから1件ずつ処理する。推論は `asyncio.to_thread` で実行し、トークンは `asyncio.Queue` で接続ハンドラに渡す。
-  - キューが `max_queue` 件に達していたら、新しい要求には即座に `busy` を返す。
-  - クライアントの切断を検知したら、生成ループのキャンセルフラグを立ててトークン単位で中断する。
-  - アイドル監視: 「処理中の要求なし、キュー空、接続なし」の状態が `idle_timeout_secs` 続いたら、ログを出して `exit(0)` する。launchd がソケットを持ち続けるので、次の接続で再起動される。
+  - 接続の受け付けは並行に行う。生成は GPU を1本しか使わないため、単一ワーカーが FIFO キューから1件ずつ処理する。
+  - ロードと推論は、専用のスレッド1本の `ThreadPoolExecutor(max_workers=1)` で実行する。mlx-lm の生成ストリームはスレッドローカルなので、`asyncio.to_thread` のようにスレッドが入れ替わる実行方式は避ける。ワーカーから接続ハンドラへのトークンの受け渡しは `loop.call_soon_threadsafe(queue.put_nowait, …)` で行う（`asyncio.Queue` はスレッドセーフではないため）。
+  - キューが 8 件に達していたら、新しい要求には即座に `busy` を返す。
+  - 切断の検知: 接続ハンドラはリクエスト行を読んだ後も読み取りを続け、EOF または読み取りエラーを切断とみなす。待ち行列にいれば取り除き、生成中ならキャンセルフラグを立ててトークン単位で中断する。
+  - アイドル監視: 「処理中の要求なし、キュー空、接続なし」の状態が `idle_timeout_secs` 続いたら、まず `server.close()` で新規の受け付けを止める。その直前に受け付けた接続があれば、それを処理し終えてから `exit(0)` する。受け付けを止めた後に来た接続は launchd 側の backlog に残り、プロセスの再起動を引き起こす。
   - SIGTERM を受けたら、処理中の要求に `error: shutting_down` を送ってから終了する。
 - `__main__`: 引数の解析、ログの設定、`HF_HUB_CACHE` などの環境変数の設定、起動。
 
 ### プロトコル v1
 1接続1リクエストで、UTF-8 の NDJSON（1行1 JSON、`\n` 区切り）を使う。
 
-**リクエスト**（クライアントから1行送り、書き込み側を shutdown する）
+**リクエスト**（クライアントから1行送る。クライアントは書き込み側を shutdown せず、接続を開いたまま応答を待つ。デーモンは EOF を切断として扱うため）
 ```json
 {"v":1,"op":"translate","text":"…","target_lang":"en","source_lang":null,
  "context":null,"glossary":[{"source":"推論","target":"inference"}],
@@ -134,7 +135,7 @@ socket_path = "~/Library/Application Support/plamo-translate/daemon.sock"
 {"v":1,"op":"status"}
 {"v":1,"op":"load"}
 ```
-- `op` が `load` の場合は、モデルのダウンロードとロードだけを行い、`progress` と `done` を返す（事前ウォームアップ用）。
+- `op` が `load` の場合は、モデルのダウンロードとロードだけを行い、`progress` と `done` を返す（`model pull` 用）。
 - `max_tokens` が null の場合は、`min(4 * 入力トークン数 + 256, 32768 - 入力トークン数)` を使う。
 - `target_lang` に `"auto"` は渡さない（auto の解決はクライアント側で行う）。
 
@@ -196,14 +197,14 @@ plamo-translate daemon {start|stop|restart|status|logs [-f]}
 |---|---|
 | `install` | plist を生成して `~/Library/LaunchAgents/` に書き、`launchctl bootstrap gui/$UID <plist>` を実行する。既に読み込まれていれば先に `bootout` する。ログとデータのディレクトリも作る |
 | `uninstall` | `bootout` して plist を削除する。`--purge` を付けると Application Support とログも削除する（確認プロンプトあり、`--yes` で省略） |
-| `start` | `launchctl kickstart gui/$UID/<label>`（ソケットは常に待ち受けているので、プロセスを先に立ち上げるだけ）に続けて op=load を送る |
+| `start` | `launchctl kickstart gui/$UID/<label>` だけを行う（ソケットは常に待ち受けているので、プロセスを先に立ち上げるだけ）。モデルの事前ロードは `model pull` で行う |
 | `stop` | `launchctl kill SIGTERM gui/$UID/<label>`。モデルは解放されるが、ソケットは残り次の接続で再起動する |
 | `restart` | `kickstart -k` |
 | `status` | `launchctl print` から読み込み状態と PID を取り、デーモンが動いていれば op=status の結果も合わせて表示する |
 | `logs` | `daemon.log` を表示する（`-f` で追従） |
 
-- plist の主な内容: `Label`、`ProgramArguments`（デーモンの実行ファイル）、`Sockets.Listeners.{SockPathName, SockPathMode=384}`、`StandardOutPath` / `StandardErrorPath`、`ProcessType=Interactive`。`KeepAlive` と `RunAtLoad` は指定しない（オンデマンド起動のため）。管理元の識別には `EnvironmentVariables.PLAMO_TRANSLATE_MANAGED_BY` に `cli` または `nix` を入れる（launchd が知らないトップレベルキーを避けるため、環境変数に入れる）。
-- `install` と `uninstall` は、既存の plist の管理元が `nix` の場合（home-manager が書いた plist は Nix store へのシンボリックリンクでもある）は、変更を拒否して終了コード 2 を返す。それ以外のサブコマンドは管理元を問わず動く。
+- plist の主な内容: `Label`、`ProgramArguments`（デーモンの実行ファイル）、`Sockets.Listeners.{SockPathName, SockPathMode=384}`、`StandardOutPath` / `StandardErrorPath`、`ProcessType=Interactive`（翻訳はユーザーが待っている前景の処理なので、`Adaptive` ではなくスケジューリングで優遇される `Interactive` にする）。`KeepAlive` と `RunAtLoad` は指定しない（オンデマンド起動のため）。管理元の識別には `EnvironmentVariables.PLAMO_TRANSLATE_MANAGED_BY` に `cli` または `nix` を入れる（launchd が知らないトップレベルキーを避けるため、環境変数に入れる）。
+- `install` と `uninstall` は、既存の plist の `EnvironmentVariables.PLAMO_TRANSLATE_MANAGED_BY` が `nix` の場合は、変更を拒否して終了コード 2 を返す（home-manager は plist をコピーで置くため、判定はこのキーだけで行う）。それ以外のサブコマンドは管理元を問わず動く。
 - CLI の `install` は、home-manager モジュールを使わない場合（`nix run .#daemon-install` や開発時）のためにある。
 - デーモンの実行ファイルは「`--daemon-bin` → `$PLAMO_TRANSLATED_BIN` → `<CLI の実体の場所>/../libexec/bin/plamo-translated` → `PATH`」の順に探す。`install` は、見つかったパスの symlink を解決せずにそのまま plist に書く。`nix profile` 経由なら、プロファイルのパスが更新後も有効なまま残るため。
 
@@ -219,7 +220,10 @@ plamo-translate daemon {start|stop|restart|status|logs [-f]}
 ## 7. Nix flake
 
 - `packages.aarch64-darwin`
-  - `plamo-translated`: `python3Packages.buildPythonApplication`。依存は nixpkgs の `mlx`、`mlx-lm`、`transformers`、`numba`、`huggingface-hub`。nixpkgs の版がモデルの要求に足りなければ、flake 内の overlay で上げる。
+  - `plamo-translated`: `python3Packages.buildPythonApplication`。依存は `mlx-bin`、`mlx-lm`、`transformers`、`numba`、`huggingface-hub`。
+    - **nixpkgs の `python3Packages.mlx` は使わない**。`MLX_BUILD_METAL=false` でビルドされた CPU 専用版であり、実用的な速度が出ないため。代わりに PyPI の wheel を使う `mlx-bin` と、Metal カーネルを含む `mlx-metal`（`macosVariant` は "26"。M5 / macOS 26 向けのカーネルを含むため）を使う。
+    - `mlx-lm` は `mlx-lm.override { mlx = mlx-bin; }` で差し替え、クロージャに `mlx` が2つ入らないようにする。
+    - nixpkgs の `mlx-bin` は 0.32.0 で、`mlx-lm` 0.32.2 の要求（`mlx>=0.32.2`）を満たさない。flake 内の overlay で `wheel-sources.nix` 相当の版とハッシュを上げる。これは「必要なら」ではなく段階4の作業として行う。
   - `plamo-translate`: crane で CLI と MCP をビルドする。`postInstall` で `$out/libexec/bin/plamo-translated` へのシンボリックリンクを張り、CLI が Nix 環境でもデーモンを見つけられるようにする。
   - `default`: `plamo-translate`（デーモンを内包する）。
 - `homeManagerModules.default`（**主たる導入経路**。nix-darwin 構成の `home-manager.users.<user>.imports` に入れて使う）
@@ -230,9 +234,11 @@ plamo-translate daemon {start|stop|restart|status|logs [-f]}
     settings = { model = "…"; idle_timeout_secs = 600; … };  # config.toml に変換
   };
   ```
-  - `launchd.agents.plamo-translate = { enable = true; config = { … }; }` で plist を定義する。home-manager が `~/Library/LaunchAgents/` への配置と、activation 時の `launchctl bootout` / `bootstrap` を行う。`config` の主なキーは、`Label`、`ProgramArguments`、`Sockets`、ログのパス、`ProcessType`、`EnvironmentVariables`。
+  - `launchd.agents.plamo-translate = { enable = true; config = { … }; }` で plist を定義する。home-manager が `~/Library/LaunchAgents/` への配置（コピー）と、activation 時の `launchctl bootout` / `bootstrap` を行う。ドメインは `gui` で、CLI と同じ `gui/$UID/<label>` を操作対象にできる。`config` の主なキーは、`Label`、`ProgramArguments`、`Sockets`（`SockPathName`、`SockPathMode`）、ログのパス、`ProcessType`、`EnvironmentVariables`。
+  - home-manager の既定（`waitForNixStore = true`）では、`ProgramArguments` が `/bin/sh -c "/bin/wait4path /nix/store && exec …"` に書き換えられる。`exec` するので launchd のジョブとしての同一性は保たれ、`launch_activate_socket` も使える。ログイン直後に Nix store がまだマウントされていない場合に備えて、この既定のままにする。そのため、CLI の `install` が生成する plist とは `ProgramArguments` だけが異なる。評価テストではこの差を前提にする。
+  - `restartTriggers` に `config.xdg.configFile."plamo-translate/config.toml".source` を指定し、設定の変更時に `darwin-rebuild switch` でデーモンが再起動されるようにする。
   - plist では `~` が使えないため、ソケットとログのパスは `config.home.homeDirectory` から絶対パスで組み立てる。`settings.socket_path` も同じ値で上書きし、デーモンと CLI のパスを必ず一致させる。
-  - ログディレクトリと Application Support 配下のディレクトリは、launchd がソケットを作る前に存在している必要がある。`home.activation` の `lib.hm.dag.entryBefore [ "setupLaunchAgents" ]` で、0700 で作成する（ユーザー権限で動くので chown は不要）。
+  - ログディレクトリと Application Support 配下のディレクトリは、launchd がソケットを作る前に存在している必要がある。`home.activation` の `lib.hm.dag.entryBetween [ "setupLaunchAgents" ] [ "writeBoundary" ]` で、0700 で作成する（`writeBoundary` より後に置くのは dry-run 時に書き込まないため。ユーザー権限で動くので chown は不要）。
   - settings は `pkgs.formats.toml` で生成し、`xdg.configFile."plamo-translate/config.toml"` に置く。デーモン、CLI、MCP はいずれも §3 の探索順でこのファイルを読むので、`PLAMO_TRANSLATE_CONFIG` は設定しない。
   - `package` を `home.packages` に追加する。
   - `nix/launchd.nix` に plist 属性の生成関数を置き、モジュールの評価テストからも使う。キー構成は CLI の `install` と揃え、`PLAMO_TRANSLATE_MANAGED_BY=nix` を入れる。
@@ -253,20 +259,20 @@ plamo-translate daemon {start|stop|restart|status|logs [-f]}
 
 ## 9. エラー処理の方針
 - デーモンは、1リクエストの失敗でプロセスを落とさない。ただしモデルのロードに失敗した場合は、`model_load_failed` を返した後もプロセスを維持し、次の要求で再試行する（ネットワーク断からの回復を想定）。
-- launchd の throttle（既定 10 秒）を考慮し、起動直後のクラッシュは `daemon.stderr.log` に残す。`daemon status` は、直近の終了ステータスが非 0 なら stderr ログの末尾を案内する。
+- launchd の throttle（`ThrottleInterval`、既定 10 秒）は、直前の実行が 10 秒未満で終わった場合にだけ再起動を遅らせる。アイドル終了（600 秒後）には影響せず、`daemon stop` の直後に要求した場合に最大 10 秒待つ程度なので、特別な対処はしない。起動直後のクラッシュは `daemon.stderr.log` に残し、`daemon status` は直近の終了ステータスが非 0 なら stderr ログの末尾を案内する。
 - CLI と MCP は、デーモンが返した `message` を加工せずに表示する。そこに CLI 側の文脈（ソケットパスなど）を付け加える。
 
 ## 10. テスト方針
 - **プロトコル fixtures**: `protocol/fixtures/` に、リクエストとレスポンス列の組を NDJSON で置く（正常系、stream:false、各エラーコード、未知フィールド）。pytest（デーモンが fixture どおりに応答するか）と Rust（クライアントが fixture を正しく解釈するか）の両方から読む。
-- **デーモン**（pytest + pytest-asyncio）: `FakeEngine` を差し込んで、FIFO の直列化、`busy`、切断時の中断、アイドル時の exit、SIGTERM、`context_too_long`、template 例外の変換を確認する。`activation` は `--socket` 経路だけをテストする（launchd 経路は手動確認）。実モデル（`0.8b-MLX-4bit`）を使う結合テストは `@pytest.mark.slow` を付ける。
+- **デーモン**（pytest + pytest-asyncio）: `FakeEngine` を差し込んで、FIFO の直列化、`busy`、切断時の中断（待ち行列中・生成中・`stream:false` の各場合）、アイドル時の exit（終了直前に受け付けた接続を取りこぼさないこと）、SIGTERM、`context_too_long`、template 例外の変換を確認する。`activation` は `--socket` 経路だけをテストする（launchd 経路は手動確認）。実モデル（`0.8b-MLX-4bit`）を使う結合テストは `@pytest.mark.slow` を付ける。
 - **plamo-client**: tokio のフェイク UDS サーバーで fixture を再生する。`resolve_target` と TSV パーサーは単体テストで確認する。
 - **CLI**: `assert_cmd` に `PLAMO_TRANSLATE_SOCKET` でフェイクサーバーを渡す。plist の生成は `insta` のスナップショットで、launchctl の呼び出しはフェイクの `Launchctl` で、デーモン実行ファイルの探索順は単体テストで確認する。
 - **MCP**: rmcp のインプロセスクライアントで `tools/list` と `tools/call` を確認する。
-- **Nix**: `checks` でモジュールを評価し、plist の属性を確認する。
+- **Nix**: `checks` でモジュールを評価し、plist の属性（`wait4path` で包まれた `ProgramArguments` を含む）を確認する。
 - **手動の受け入れ確認**（実装計画の最後に手順として書く）: install → 初回翻訳（ダウンロードとロードの進捗表示）→ 2回目の即応 → アイドル後の自動終了と再起動 → Claude Code からの MCP 呼び出し。
 
 ## 11. 実装の段階
-0. **事前検証（spike）**: nixpkgs の mlx-lm / numba / transformers でモデルの `model_file` 方式のロードと翻訳が通るか、`launch_activate_socket` を ctypes で呼べるか、home-manager の `launchd.agents` で `Sockets` を含む plist が期待どおりに生成・bootstrap されるか、を確認する。結果に応じて §5 と §7 を修正する。
+0. **事前検証（spike）**: `mlx-bin`（版を上げたもの）+ `mlx-metal` + `mlx-lm` で `mx.default_device()` が GPU を返すか。transformers 5 系（nixpkgs は 5.22.1、モデルのコードは 4.57.1 向け）で `tokenization_plamo.py`（numba を使う）が import でき、翻訳が通り、template の例外が `jinja2.TemplateError` として上がるか。`launch_activate_socket` を ctypes で呼べるか、home-manager の `launchd.agents` で `Sockets` を含む plist が期待どおりに生成・bootstrap されるか、を確認する。結果に応じて §5 と §7 を修正する。
 1. デーモンとプロトコル fixtures
 2. `plamo-client` と CLI（`daemon` / `model` サブコマンドを含む）
 3. MCP server
@@ -276,7 +282,9 @@ plamo-translate daemon {start|stop|restart|status|logs [-f]}
 ## 12. 既知のリスク
 | リスク | 影響 | 対応 |
 |---|---|---|
-| nixpkgs の mlx-lm が古く、`model_file` によるロードに未対応 | Nix 版が動かない | overlay で版を上げる |
+| nixpkgs の `mlx` が CPU 専用ビルド | 推論が実用にならない | `mlx-bin` + `mlx-metal` を使う（§7）。段階0で GPU の使用を確認する |
+| `mlx-bin` の版が `mlx-lm` の要求より古い | ビルド時の依存チェックで失敗する | overlay で版を上げる（段階4の作業） |
+| モデルのコードが transformers 4.57.1 向けで、nixpkgs は 5 系 | tokenizer の import やテンプレート処理が失敗する | 段階0で確認する。失敗したら overlay で transformers を 4.57 系に固定できるかを検討する（mlx-lm 0.32.2 は transformers 5.7 以上を要求するので、mlx-lm の版も合わせて見直す） |
 | 上流の remote code の変更 | 予期しない挙動 | revision を固定する（§4） |
 | 作者の nix-darwin 構成に home-manager が未導入 | 導入の初回に構成変更が必要 | 段階5で `home-manager.darwinModules.home-manager` を追加する手順を書く。既存の `users.users.<user>.packages` などと競合しないか確認する |
 | launchd の socket activation と Python の相性 | 起動できない | 段階0で確認する。駄目なら `--socket` で自分で bind し、`KeepAlive` で常駐させる方式に退避する（アイドル時の終了はモデルのアンロードに読み替える） |
