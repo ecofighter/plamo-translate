@@ -1,5 +1,6 @@
 test:
     cd daemon && pytest -m "not slow"
+    cargo test --workspace
 
 test-slow:
     cd daemon && pytest -m slow

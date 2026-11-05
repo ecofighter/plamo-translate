@@ -1,0 +1,11 @@
+pub mod client;
+pub mod config;
+pub mod glossary;
+pub mod protocol;
+pub mod target;
+
+pub use client::{Client, Error, EventStream};
+pub use config::{Config, ConfigError, default_socket_path};
+pub use glossary::{GlossaryError, merge_glossaries, parse_glossary};
+pub use protocol::{ErrorCode, Event, GlossaryEntry, Status, TranslateRequest, Usage};
+pub use target::resolve_target;
