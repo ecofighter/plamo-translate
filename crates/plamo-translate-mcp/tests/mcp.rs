@@ -315,3 +315,247 @@ async fn config_glossary_merged_with_args() {
         ])
     );
 }
+
+struct SeqFake {
+    _dir: TempDir,
+    socket: PathBuf,
+    requests: mpsc::Receiver<Value>,
+}
+
+/// Accepts connections in order and answers the n-th one with `conversations[n]`.
+/// Every request line from every connection goes to the one `requests` channel.
+fn fake_daemon_seq(conversations: &[&[&str]]) -> SeqFake {
+    let dir = tempfile::Builder::new()
+        .prefix("pm")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let socket = dir.path().join("d.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (tx, requests) = mpsc::channel();
+    let conversations: Vec<Vec<String>> = conversations
+        .iter()
+        .map(|c| c.iter().map(|s| format!("{s}\n")).collect())
+        .collect();
+    thread::spawn(move || {
+        for responses in conversations {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            tx.send(serde_json::from_str::<Value>(&line).unwrap())
+                .unwrap();
+            for r in responses {
+                conn.write_all(r.as_bytes()).unwrap();
+            }
+            conn.flush().unwrap();
+            // keep this connection open until the client drops it while serving the next one
+            thread::spawn(move || {
+                let _ = reader.read_to_end(&mut Vec::new());
+                drop(conn);
+            });
+        }
+    });
+    SeqFake {
+        _dir: dir,
+        socket,
+        requests,
+    }
+}
+
+const STATUS_HISTORY: &str = r#"{"type":"status","model":"pfnet/m","revision":"abc","loaded":true,"uptime_secs":1,"idle_timeout_secs":600,"queue_len":0,"version":"0.1.0","protocol":1,"features":["history"],"template_verified":true}"#;
+const STATUS_OLD: &str = r#"{"type":"status","model":"pfnet/m","revision":"abc","loaded":true,"uptime_secs":1,"idle_timeout_secs":600,"queue_len":0,"version":"0.1.0","protocol":1}"#;
+const DONE_STOP: &str = r#"{"type":"done","text":"The meeting","finish_reason":"stop","usage":{"input_tokens":3,"output_tokens":2},"model":"m","revision":"r"}"#;
+const DONE_LENGTH: &str = r#"{"type":"done","text":"The meeting","finish_reason":"length","usage":{"input_tokens":3,"output_tokens":2},"model":"m","revision":"r"}"#;
+const TOO_LONG: &str = r#"{"type":"error","code":"context_too_long","message":"too long"}"#;
+
+fn pairs(n: usize) -> Value {
+    Value::Array(
+        (0..n)
+            .map(|i| json!({"source": format!("s{i}"), "translation": format!("t{i}")}))
+            .collect(),
+    )
+}
+
+fn content_len(result: &Value) -> usize {
+    result["content"].as_array().unwrap().len()
+}
+
+fn next_request(fake: &SeqFake) -> Value {
+    fake.requests.recv_timeout(WAIT).unwrap()
+}
+
+#[tokio::test]
+async fn schema_has_history_array_of_pairs() {
+    let session = connect(server_for(PathBuf::from("/tmp/pm-unused.sock"))).await;
+    let tools = session.client.list_all_tools().await.unwrap();
+    let tool = serde_json::to_value(&tools[0]).unwrap();
+    let description = tool["description"].as_str().unwrap();
+    assert!(description.contains("history"), "{description}");
+    assert!(description.contains("note:"), "{description}");
+
+    let schema = &tool["inputSchema"];
+    let history = &schema["properties"]["history"];
+    let ty = &history["type"];
+    let is_array = ty == "array"
+        || ty
+            .as_array()
+            .is_some_and(|types| types.iter().any(|t| t == "array"));
+    assert!(is_array, "{history}");
+    let item = resolve(schema, &history["items"]);
+    assert_eq!(item["type"], "object", "{item}");
+    assert_eq!(item["required"], json!(["source", "translation"]), "{item}");
+}
+
+#[tokio::test]
+async fn history_is_sent_after_preflight() {
+    let fake = fake_daemon_seq(&[&[STATUS_HISTORY], &[DONE_STOP]]);
+    let session = connect(server_for(fake.socket.clone())).await;
+    let result = call(
+        &session,
+        json!({"text": "会議", "target_lang": "en", "history": pairs(2)}),
+    )
+    .await;
+    assert!(!is_error(&result), "{result}");
+    assert_eq!(text_of(&result), "The meeting");
+    assert_eq!(content_len(&result), 1, "{result}");
+
+    assert_eq!(next_request(&fake)["op"], "status");
+    let req = next_request(&fake);
+    assert_eq!(req["op"], "translate");
+    assert_eq!(req["history"], pairs(2));
+}
+
+#[tokio::test]
+async fn empty_history_skips_preflight() {
+    let fake = fake_daemon_seq(&[&[DONE_STOP]]);
+    let session = connect(server_for(fake.socket.clone())).await;
+    let result = call(
+        &session,
+        json!({"text": "会議", "target_lang": "en", "history": []}),
+    )
+    .await;
+    assert!(!is_error(&result), "{result}");
+    let req = next_request(&fake);
+    assert_eq!(req["op"], "translate");
+    assert!(req.get("history").is_none(), "{req}");
+}
+
+#[tokio::test]
+async fn stale_daemon_is_tool_error() {
+    let fake = fake_daemon_seq(&[&[STATUS_OLD], &[DONE_STOP]]);
+    let session = connect(server_for(fake.socket.clone())).await;
+    let result = call(
+        &session,
+        json!({"text": "会議", "target_lang": "en", "history": pairs(1)}),
+    )
+    .await;
+    assert!(is_error(&result), "{result}");
+    assert_eq!(
+        text_of(&result),
+        r#"daemon does not support translation history; run "plamo-translate daemon restart""#
+    );
+    assert_eq!(next_request(&fake)["op"], "status");
+    assert!(
+        fake.requests
+            .recv_timeout(Duration::from_millis(300))
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn context_too_long_drops_oldest_half_and_retries() {
+    let fake = fake_daemon_seq(&[
+        &[STATUS_HISTORY],
+        &[TOO_LONG],
+        &[STATUS_HISTORY],
+        &[TOO_LONG],
+        &[DONE_STOP],
+    ]);
+    let session = connect(server_for(fake.socket.clone())).await;
+    let result = call(
+        &session,
+        json!({"text": "会議", "target_lang": "en", "history": pairs(3)}),
+    )
+    .await;
+    assert!(!is_error(&result), "{result}");
+    assert_eq!(text_of(&result), "The meeting");
+    assert_eq!(
+        result["content"][1]["text"],
+        "note: the oldest 3 of 3 history pairs were dropped to fit the model's context window; only the last 0 were used."
+    );
+
+    assert_eq!(next_request(&fake)["op"], "status");
+    let first = next_request(&fake);
+    assert_eq!(first["op"], "translate");
+    assert_eq!(first["history"], pairs(3));
+    assert_eq!(next_request(&fake)["op"], "status");
+    let second = next_request(&fake);
+    assert_eq!(second["op"], "translate");
+    assert_eq!(
+        second["history"],
+        json!([{"source": "s2", "translation": "t2"}])
+    );
+    let third = next_request(&fake);
+    assert_eq!(third["op"], "translate");
+    assert!(third.get("history").is_none(), "{third}");
+}
+
+#[tokio::test]
+async fn context_too_long_with_history_exhausted_is_error() {
+    let fake = fake_daemon_seq(&[&[STATUS_HISTORY], &[TOO_LONG], &[TOO_LONG]]);
+    let session = connect(server_for(fake.socket.clone())).await;
+    let result = call(
+        &session,
+        json!({"text": "会議", "target_lang": "en", "history": pairs(1)}),
+    )
+    .await;
+    assert!(is_error(&result), "{result}");
+    assert_eq!(
+        text_of(&result),
+        "context_too_long: too long (all 1 history pairs were dropped and the request still does not fit; shorten text, context or glossary)"
+    );
+}
+
+#[tokio::test]
+async fn truncated_result_has_history_note() {
+    let fake = fake_daemon_seq(&[&[DONE_LENGTH]]);
+    let session = connect(server_for(fake.socket.clone())).await;
+    let result = call(&session, json!({"text": "会議", "target_lang": "en"})).await;
+    assert!(!is_error(&result), "{result}");
+    assert_eq!(text_of(&result), "The meeting");
+    assert_eq!(
+        result["content"][1]["text"],
+        "note: do not pass this translation as history: the translation did not finish normally (finish_reason: length)."
+    );
+}
+
+#[tokio::test]
+async fn stop_result_has_no_note() {
+    let fake = fake_daemon_seq(&[&[DONE_STOP]]);
+    let session = connect(server_for(fake.socket.clone())).await;
+    let result = call(&session, json!({"text": "会議", "target_lang": "en"})).await;
+    assert!(!is_error(&result), "{result}");
+    assert_eq!(text_of(&result), "The meeting");
+    assert_eq!(content_len(&result), 1, "{result}");
+}
+
+#[tokio::test]
+async fn every_history_call_preflights() {
+    let fake = fake_daemon_seq(&[
+        &[STATUS_HISTORY],
+        &[DONE_STOP],
+        &[STATUS_HISTORY],
+        &[DONE_STOP],
+    ]);
+    let session = connect(server_for(fake.socket.clone())).await;
+    for _ in 0..2 {
+        let result = call(
+            &session,
+            json!({"text": "会議", "target_lang": "en", "history": pairs(1)}),
+        )
+        .await;
+        assert!(!is_error(&result), "{result}");
+    }
+    let ops: Value = (0..4).map(|_| next_request(&fake)["op"].clone()).collect();
+    assert_eq!(ops, json!(["status", "translate", "status", "translate"]));
+}
