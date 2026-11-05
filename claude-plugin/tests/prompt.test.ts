@@ -15,6 +15,7 @@ interface Harness {
   answers: Array<string | null>
   translate: (run: Run) => { exitCode: number; stdout: string; stderr: string }
   failWrite: boolean
+  runDeny?: string
 }
 
 function setup(on: any): Harness {
@@ -37,6 +38,7 @@ function setup(on: any): Harness {
     return { value: undefined }
   })
   on('process.run', ($: unknown, e: Run) => {
+    if (h.runDeny) return { deny: h.runDeny }
     h.runs.push(e)
     return { value: h.translate(e) }
   })
@@ -218,4 +220,20 @@ test('catch drops when the hook throws', async ($, on) => {
   expect(result).toEqual({
     drop: '日英レイヤでエラーが起きたため送信を止めました (throw)。/ja off で無効にできます。',
   })
+})
+
+test('a translator that cannot start reports why', async ($, on) => {
+  const h = setup(on)
+  h.runDeny = 'spawn plamo-translate ENOENT'
+  h.answers.push(LABELS.cancel)
+  await turnOn($)
+  await submit($, '直して')
+  expect(h.questions[0]).toContain('ENOENT')
+})
+
+test('custom English keeps the prompt fences', async ($, on) => {
+  const h = setup(on)
+  h.answers.push('Fix this')
+  await turnOn($)
+  expect(await submit($, '直して\n```\nlog\n```\n')).toEqual({ text: 'Fix this\n\n```\nlog\n```\n' })
 })

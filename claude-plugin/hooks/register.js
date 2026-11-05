@@ -2,7 +2,14 @@ import { resolveConfig } from './lib/config.js'
 import { createMemory, dropOldestHalf, isEligiblePair, toJsonl } from './lib/memory.js'
 import { buildArgs, parseResult } from './lib/cli.js'
 import { splitEdges, splitFences } from './lib/segments.js'
-import { containsJapanese, decideSubmission, isPassthroughCommand, LABELS } from './lib/input.js'
+import {
+  containsJapanese,
+  decideSubmission,
+  isMostlyJapanese,
+  isPassthroughCommand,
+  LABELS,
+  withFences,
+} from './lib/input.js'
 import { createDisplayBuffer, tableShapeMatches } from './lib/display.js'
 
 const STATUS_TEXT = 'ja⇄en'
@@ -21,8 +28,16 @@ async function historyPath($) {
   return `${tmp}/plamo-ja-bridge-${await $.session.id()}.jsonl`
 }
 
+// MessageDisplay calls for one reply arrive concurrently; one translation at a time keeps the shared
+// history file intact and the memory in reply order.
+function translate($, ctx, text, direction, timeoutMs) {
+  const run = ctx.queue.then(() => translateNow($, ctx, text, direction, timeoutMs))
+  ctx.queue = run.catch(() => {})
+  return run
+}
+
 // Runs one translation, shrinking the history on context_too_long the way the MCP server does.
-async function translate($, ctx, text, direction, timeoutMs) {
+async function translateNow($, ctx, text, direction, timeoutMs) {
   const [from, to] = direction === 'ja-en' ? ['ja', 'en'] : ['en', 'ja']
   let history = ctx.memory.select(direction, { maxPairs: ctx.cfg.historyPairs, maxChars: ctx.cfg.historyChars })
   for (;;) {
@@ -37,8 +52,8 @@ async function translate($, ctx, text, direction, timeoutMs) {
         stdin: text,
         timeoutMs,
       })
-    } catch {
-      return { ok: false, reason: 'timeout', contextTooLong: false }
+    } catch (err) {
+      return { ok: false, reason: err?.message || 'timeout', contextTooLong: false }
     }
     const result = parseResult(run)
     if (result.ok || !result.contextTooLong || history.length === 0) return result
@@ -91,14 +106,14 @@ async function submitJapanese($, ctx, e, next) {
   const ja = e.text.trim()
   const en = decision.custom.trim()
   if (!hasFence && isEligiblePair(ja, en, 'stop')) ctx.memory.add({ ja, en })
-  return next({ ...e, text: decision.custom })
+  return next({ ...e, text: withFences(decision.custom, segments) })
 }
 
 // A block that cannot be translated is shown as written: the display is the only thing at stake.
 async function renderBlock($, ctx, block) {
   if (block.kind !== 'paragraph' && block.kind !== 'table') return block.text
   const { lead, core, trail } = splitEdges(block.text)
-  if (core === '' || containsJapanese(core)) return block.text
+  if (core === '' || isMostlyJapanese(core)) return block.text
   let result
   try {
     result = await translate($, ctx, core, 'en-ja', OUTPUT_TIMEOUT_MS)
@@ -113,7 +128,7 @@ async function renderBlock($, ctx, block) {
 }
 
 export function register(on, options) {
-  const ctx = { cfg: resolveConfig(options), memory: createMemory() }
+  const ctx = { cfg: resolveConfig(options), memory: createMemory(), queue: Promise.resolve() }
   const displayBuffers = new Map()
   let enabled = ctx.cfg.enabledByDefault
 
@@ -128,6 +143,15 @@ export function register(on, options) {
       argumentHint: '[on|off|status]',
     })
     $.ui.status(enabled ? STATUS_TEXT : undefined)
+    return next(e)
+  })
+
+  // session.start does not fire after /clear or /resume, and the old conversation's pairs no longer apply.
+  on('session.end', async ($, e, next) => {
+    if (e.reason === 'clear' || e.reason === 'resume') {
+      ctx.memory.clear()
+      displayBuffers.clear()
+    }
     return next(e)
   })
 

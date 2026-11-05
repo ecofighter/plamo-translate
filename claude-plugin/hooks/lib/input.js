@@ -20,3 +20,18 @@ export function decideSubmission(answer) {
   if (answer === LABELS.original) return 'send-original'
   return { custom: answer }
 }
+
+// Claude often quotes a Japanese identifier in an English reply; only mostly-Japanese text is left as written.
+export function isMostlyJapanese(text) {
+  const japanese = (text.match(new RegExp(JAPANESE.source, 'g')) ?? []).length
+  const latin = (text.match(/[A-Za-z]/g) ?? []).length
+  return japanese > 0 && japanese / (japanese + latin) >= 0.3
+}
+
+// Custom English replaces the prose only; pasted code or logs in fences still reach Claude.
+export function withFences(custom, segments) {
+  const fences = segments.filter((s) => s.kind === 'fence').map((s) => s.text)
+  if (fences.length === 0) return custom
+  return [custom.replace(/\n+$/, ''), ...fences.map((f) => f.replace(/\n+$/, ''))].join('\n\n') +
+    (fences[fences.length - 1].endsWith('\n') ? '\n' : '')
+}

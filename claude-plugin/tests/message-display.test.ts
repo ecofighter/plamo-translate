@@ -10,6 +10,7 @@ interface Harness {
   writes: Array<{ path: string; content: string }>
   translate: (run: Run) => { exitCode: number; stdout: string; stderr: string }
   failWrite: boolean
+  events: string[]
 }
 
 function setup(on: any): Harness {
@@ -18,6 +19,7 @@ function setup(on: any): Harness {
     writes: [],
     translate: (run) => ({ exitCode: 0, stdout: done(`JA:${run.init.stdin}`), stderr: '' }),
     failWrite: false,
+    events: [],
   }
   mock.env(on, { TMPDIR: '/tmp' })
   on('session.start', () => ({ cwd: '/work' }))
@@ -26,10 +28,12 @@ function setup(on: any): Harness {
   on('session.id', () => ({ value: 'sess1' }))
   on('fs.write', ($: unknown, e: { path: string; content?: string; text?: string }) => {
     if (h.failWrite) return { deny: 'disk full' }
+    h.events.push('write')
     h.writes.push({ path: e.path, content: e.content ?? e.text ?? '' })
     return { value: undefined }
   })
   on('process.run', ($: unknown, e: Run) => {
+    h.events.push('run')
     h.runs.push(e)
     return { value: h.translate(e) }
   })
@@ -142,4 +146,36 @@ test('Japanese blocks are shown without translation', async ($, on) => {
   await turnOn($)
   expect(await show($, 'm1', 'すでに日本語です。\n\n')).toEqual({ displayContent: 'すでに日本語です。\n\n' })
   expect(h.runs.length).toBe(0)
+})
+
+test('English with a few Japanese words is translated', async ($, on) => {
+  const h = setup(on)
+  await turnOn($)
+  expect(await show($, 'm1', 'The `取得` helper returns None when the cache is empty.\n\n')).toEqual({
+    displayContent: 'JA:The `取得` helper returns None when the cache is empty.\n\n',
+  })
+  expect(h.runs.length).toBe(1)
+})
+
+test('concurrent batches translate one at a time', async ($, on) => {
+  const h = setup(on)
+  await turnOn($)
+  await show($, 'm1', 'Seed.\n\n')
+  h.events.length = 0
+  const [a, b] = await Promise.all([show($, 'm1', 'First.\n\n'), show($, 'm1', 'Second.\n\n')])
+  expect([a, b]).toEqual([{ displayContent: 'JA:First.\n\n' }, { displayContent: 'JA:Second.\n\n' }])
+  expect(h.events).toEqual(['write', 'run', 'write', 'run'])
+})
+
+test('/clear forgets the translation memory', async ($, on) => {
+  const h = setup(on)
+  on('session.end', () => ({ sessionId: 'sess1' }))
+  await turnOn($)
+  await show($, 'm1', 'Remember me.\n\n')
+  await $.session.end({ reason: 'clear' })
+  expect((await $.command.run({ command: 'ja', args: 'status' })).text).toBe(
+    '日英レイヤ: オン / 対訳 0 組 / 翻訳: plamo-translate',
+  )
+  await show($, 'm2', 'Fresh.\n\n')
+  expect(h.runs[h.runs.length - 1].argv).not.toContain('--history')
 })
