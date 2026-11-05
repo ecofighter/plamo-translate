@@ -233,3 +233,41 @@ async fn eof_before_terminal_is_protocol_error() {
     assert!(s.next().await.is_none());
     server.await.unwrap();
 }
+
+#[test]
+fn history_fixture_requests_match_client_serialization() {
+    let mut checked = 0;
+    for f in fixtures() {
+        let r = &f.request;
+        if r.get("v") != Some(&Value::from(1))
+            || r.get("op").and_then(Value::as_str) != Some("translate")
+            || !r.get("history").is_some_and(Value::is_array)
+        {
+            continue;
+        }
+        let str_field = |k: &str| r.get(k).and_then(Value::as_str).map(String::from);
+        let req = TranslateRequest {
+            text: str_field("text").unwrap_or_default(),
+            target_lang: str_field("target_lang").unwrap_or_default(),
+            source_lang: str_field("source_lang"),
+            context: str_field("context"),
+            history: serde_json::from_value(r["history"].clone())
+                .unwrap_or_else(|e| panic!("{}: {e}", f.name)),
+            glossary: r.get("glossary").map_or_else(Vec::new, |g| {
+                serde_json::from_value(g.clone()).unwrap_or_else(|e| panic!("{}: {e}", f.name))
+            }),
+            form: str_field("form"),
+            stream: r
+                .get("stream")
+                .and_then(Value::as_bool)
+                .unwrap_or_else(|| panic!("{}: fixture must state \"stream\" explicitly", f.name)),
+            max_tokens: r
+                .get("max_tokens")
+                .and_then(Value::as_u64)
+                .map(|n| n as u32),
+        };
+        assert_eq!(serde_json::to_value(&req).unwrap(), *r, "{}", f.name);
+        checked += 1;
+    }
+    assert!(checked >= 1);
+}
