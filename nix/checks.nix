@@ -11,24 +11,42 @@
 let
   hmTest =
     let
-      hm = home-manager.lib.homeManagerConfiguration {
-        inherit pkgs;
-        modules = [
-          hmModule
-          {
-            home = {
-              username = "t";
-              homeDirectory = "/Users/t";
-              stateVersion = "25.11";
-            };
-            services.plamo-translate = {
-              enable = true;
-              settings.idle_timeout_secs = 120;
-            };
-          }
-        ];
+      # Mirrors home-manager's modules/default.nix without its wrapper, which throws on
+      # failed assertions before `config` can be inspected.
+      hmLib = import "${home-manager}/modules/lib/stdlib-extended.nix" pkgs.lib;
+      evalHm =
+        {
+          homeDirectory ? "/Users/t",
+          extra ? { },
+        }:
+        (hmLib.evalModules {
+          class = "homeManager";
+          specialArgs.modulesPath = "${home-manager}/modules";
+          modules = [
+            hmModule
+            {
+              home = {
+                username = "t";
+                inherit homeDirectory;
+                stateVersion = "25.11";
+              };
+              services.plamo-translate.enable = true;
+            }
+            extra
+          ]
+          ++ import "${home-manager}/modules/modules.nix" {
+            inherit pkgs;
+            lib = hmLib;
+            check = true;
+          };
+        }).config;
+      failedAssertions = config: map (a: a.message) (builtins.filter (a: !a.assertion) config.assertions);
+      config = evalHm {
+        extra = {
+          services.plamo-translate.settings.idle_timeout_secs = 120;
+          xdg.configHome = "/Users/t/custom-xdg";
+        };
       };
-      inherit (hm) config;
       # Discarding context keeps the check from depending on the daemon/CLI builds;
       # the assertions only look at the store path strings.
       summary = builtins.unsafeDiscardStringContext (
@@ -36,7 +54,22 @@ let
           agent = config.launchd.agents.plamo-translate;
           hasDirsActivation = config.home.activation ? plamoTranslateDirs;
           dirsActivation = config.home.activation.plamoTranslateDirs or null;
-          failedAssertions = map (a: a.message) (builtins.filter (a: !a.assertion) config.assertions);
+          failedAssertions = failedAssertions config;
+          rejected = {
+            idleString = failedAssertions (evalHm {
+              extra.services.plamo-translate.settings.idle_timeout_secs = "600";
+            });
+            idleNegative = failedAssertions (evalHm {
+              extra.services.plamo-translate.settings.idle_timeout_secs = -1;
+            });
+            idleZero = failedAssertions (evalHm {
+              extra.services.plamo-translate.settings.idle_timeout_secs = 0;
+            });
+            # 52-byte home + 56 bytes of "/Library/Application Support/plamo-translate/daemon.sock" = 108 bytes.
+            longSocket = failedAssertions (evalHm {
+              homeDirectory = "/Users/" + builtins.concatStringsSep "" (builtins.genList (_: "u") 45);
+            });
+          };
         }
       );
     in
@@ -59,6 +92,11 @@ let
         jq -e '.agent.config.Label == "local.plamo-translate.daemon"' "$summaryPath"
         jq -e '.agent.restartTriggers | length == 1' "$summaryPath"
         jq -e '.hasDirsActivation' "$summaryPath"
+        jq -e '.agent.config.EnvironmentVariables.XDG_CONFIG_HOME == "/Users/t/custom-xdg"' "$summaryPath"
+        jq -e '.rejected.idleString | any(contains("idle_timeout_secs"))' "$summaryPath"
+        jq -e '.rejected.idleNegative | any(contains("idle_timeout_secs"))' "$summaryPath"
+        jq -e '.rejected.idleZero == []' "$summaryPath"
+        jq -e '.rejected.longSocket | any(contains("104"))' "$summaryPath"
         grep -qxF 'idle_timeout_secs = 120' "$configToml"
         grep -qxF "socket_path = \"$sock\"" "$configToml"
         touch $out

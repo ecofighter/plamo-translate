@@ -21,6 +21,8 @@ let
     socket_path = "${dataDir}/daemon.sock";
   };
   configFile = "plamo-translate/config.toml";
+  # sun_path limit; the CLI's `daemon install` enforces the same bound.
+  sunPathMax = 104;
 in
 {
   options.services.plamo-translate = {
@@ -50,6 +52,20 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        # tomlFormat accepts any TOML value; the daemon would crash-loop on a bad one.
+        assertion =
+          !(cfg.settings ? idle_timeout_secs)
+          || (builtins.isInt cfg.settings.idle_timeout_secs && cfg.settings.idle_timeout_secs >= 0);
+        message = "services.plamo-translate.settings.idle_timeout_secs must be a non-negative integer.";
+      }
+      {
+        assertion = builtins.stringLength settings.socket_path < sunPathMax;
+        message = "services.plamo-translate: socket path ${settings.socket_path} must be shorter than ${toString sunPathMax} bytes; use a shorter home directory.";
+      }
+    ];
+
     home.packages = [ cfg.package ];
 
     xdg.configFile.${configFile}.source = tomlFormat.generate "config.toml" settings;
@@ -59,6 +75,7 @@ in
       config = import ./launchd.nix { inherit lib; } {
         inherit homeDirectory settings;
         inherit (cfg) package;
+        xdgConfigHome = config.xdg.configHome;
       };
       restartTriggers = [ config.xdg.configFile.${configFile}.source ];
     };
