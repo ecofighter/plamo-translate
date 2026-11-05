@@ -27,6 +27,8 @@ from .protocol import (
 )
 
 MAX_QUEUE = 8
+# Request-side capabilities a client may check in `status` before relying on them.
+FEATURES = ("history",)
 SHUTDOWN_GRACE_SECS = 2.0
 _DISCARD_CHUNK = 64 * 1024
 _TERMINAL = frozenset({"done", "error", "status"})
@@ -315,6 +317,8 @@ class Server:
             queue_len=len(self._pending),
             version=self._version,
             protocol=PROTOCOL_VERSION,
+            features=list(FEATURES),
+            template_verified=self._engine.template_verified,
         )
 
 

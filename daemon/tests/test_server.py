@@ -8,7 +8,7 @@ import pytest
 
 from conftest import FakeEngine
 from plamo_translated.engine import TextStream
-from plamo_translated.protocol import MAX_LINE_BYTES
+from plamo_translated.protocol import MAX_LINE_BYTES, HistoryEntry
 from plamo_translated.server import MAX_QUEUE, Server
 
 VERSION = "9.9.9"
@@ -424,10 +424,12 @@ async def test_status_reports_fields():
         "queue_len": 0,
         "version": VERSION,
         "protocol": 1,
+        "features": ["history"],
     }
     assert isinstance(ev["uptime_secs"], int) and ev["uptime_secs"] >= 0
     await roundtrip(path, LOAD)
-    assert (await status_of(path))["loaded"] is True
+    after = await status_of(path)
+    assert (after["loaded"], after["template_verified"]) == (True, True)
 
 
 async def test_validation_precedes_load():
@@ -491,3 +493,19 @@ async def test_engine_without_finish_reason_is_internal_error():
 
     ev = await roundtrip_with(NoReason(), translate(stream=False))
     assert (ev[-1]["type"], ev[-1]["code"]) == ("error", "internal")
+
+
+async def test_history_reaches_engine_unchanged_and_is_never_dropped():
+    engine = loaded(input_tokens=32000)
+    history = [{"source": " a\n", "translation": "A ", "x": 1}, {"source": "b", "translation": "B"}]
+    (ev,) = await roundtrip_with(engine, translate(history=history, max_tokens=1000))
+    assert ev["code"] == "context_too_long"
+    assert [r.history for r in engine.calls] == [(HistoryEntry(" a\n", "A "), HistoryEntry("b", "B"))]
+
+
+async def test_status_reports_unverified_template():
+    class Drifted(FakeEngine):
+        template_verified = False
+
+    _, path, _ = await run_server(Drifted())
+    assert (await status_of(path))["template_verified"] is False

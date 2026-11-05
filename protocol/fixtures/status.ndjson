@@ -1,3 +1,3 @@
 {"fake":{}}
 {"v":1,"op":"status"}
-{"type":"status","model":"<any>","revision":"<any>","loaded":"<any>","uptime_secs":"<any>","idle_timeout_secs":"<any>","queue_len":"<any>","version":"<any>","protocol":1}
+{"type":"status","model":"<any>","revision":"<any>","loaded":"<any>","uptime_secs":"<any>","idle_timeout_secs":"<any>","queue_len":"<any>","version":"<any>","protocol":1,"features":["history"]}

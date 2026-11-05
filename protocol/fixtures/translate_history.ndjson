@@ -1,0 +1,3 @@
+{"fake":{"tokens":["You"," can"," also"," filter"," by"," owner","."],"input_tokens":74}}
+{"v":1,"op":"translate","text":"オーナーでフィルタリングすることもできます。","target_lang":"en","source_lang":"ja","history":[{"source":"プロジェクトの管理画面を開きます。","translation":"Open the project dashboard."},{"source":"進行中のタスクがすべて表示されます。","translation":"It lists all active tasks."}],"stream":false}
+{"type":"done","text":"You can also filter by owner.","finish_reason":"stop","usage":{"input_tokens":74,"output_tokens":7},"model":"<any>","revision":"<any>"}
