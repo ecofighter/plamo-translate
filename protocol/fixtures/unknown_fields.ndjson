@@ -1,0 +1,4 @@
+{"fake":{"tokens":["Hello"],"input_tokens":3}}
+{"v":1,"op":"translate","text":"こんにちは","target_lang":"en","future_field":{"a":1}}
+{"type":"delta","text":"Hello","x_future":1}
+{"type":"done","text":"Hello","usage":{"input_tokens":3,"output_tokens":1},"model":"<any>","revision":"<any>","x_future":[1,2]}

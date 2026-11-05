@@ -1,0 +1,3 @@
+{"fake":{}}
+{"v":1,"op":"translate","text":"hi"}
+{"type":"error","code":"invalid_request","message":"<any>"}

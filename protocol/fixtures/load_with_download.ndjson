@@ -1,0 +1,5 @@
+{"fake":{"download":true}}
+{"v":1,"op":"load"}
+{"type":"progress","stage":"downloading","done_bytes":"<any>","total_bytes":"<any>"}
+{"type":"progress","stage":"loading"}
+{"type":"done","text":"","usage":{"input_tokens":0,"output_tokens":0},"model":"<any>","revision":"<any>"}

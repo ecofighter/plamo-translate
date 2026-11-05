@@ -1,0 +1,7 @@
+{"fake":{"tokens":["The"," meeting"," is"," today"],"input_tokens":12}}
+{"v":1,"op":"translate","text":"会議は今日です","target_lang":"en"}
+{"type":"delta","text":"The"}
+{"type":"delta","text":" meeting"}
+{"type":"delta","text":" is"}
+{"type":"delta","text":" today"}
+{"type":"done","text":"The meeting is today","usage":{"input_tokens":12,"output_tokens":4},"model":"<any>","revision":"<any>"}

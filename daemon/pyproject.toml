@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "plamo-translated"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+plamo-translated = "plamo_translated.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/plamo_translated"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+markers = ["slow: tests that load the real model"]

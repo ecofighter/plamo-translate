@@ -1,0 +1,3 @@
+{"fake":{"load_error":"download failed"}}
+{"v":1,"op":"translate","text":"hi","target_lang":"ja"}
+{"type":"error","code":"model_load_failed","message":"<any>"}

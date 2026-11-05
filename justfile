@@ -1,6 +1,5 @@
-# Filled in by later tasks.
 test:
-    @echo "no tests yet"
+    cd daemon && pytest -m "not slow"
 
 # Filled in by later tasks.
 test-slow:
