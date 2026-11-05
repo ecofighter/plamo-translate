@@ -223,7 +223,11 @@ plamo-translate daemon {start|stop|restart|status|logs [-f]}
   - `plamo-translated`: `python3Packages.buildPythonApplication`。依存は `mlx-bin`、`mlx-lm`、`transformers`、`numba`、`huggingface-hub`。
     - **nixpkgs の `python3Packages.mlx` は使わない**。`MLX_BUILD_METAL=false` でビルドされた CPU 専用版であり、実用的な速度が出ないため。代わりに PyPI の wheel を使う `mlx-bin` と、Metal カーネルを含む `mlx-metal`（`macosVariant` は "26"。M5 / macOS 26 向けのカーネルを含むため）を使う。
     - `mlx-lm` は `mlx-lm.override { mlx = mlx-bin; }` で差し替え、クロージャに `mlx` が2つ入らないようにする。
-    - nixpkgs の `mlx-bin` は 0.32.0 で、`mlx-lm` 0.32.2 の要求（`mlx>=0.32.2`）を満たさない。flake 内の overlay で `wheel-sources.nix` 相当の版とハッシュを上げる。これは「必要なら」ではなく段階4の作業として行う。
+    - **MLX 系の3パッケージ（`mlx-bin`、`mlx-metal`、`mlx-lm`）は、nixpkgs の版に頼らず flake 側で PyPI の最新版に固定する。** 版と sha256 は `nix/mlx-versions.nix` の1ファイルにまとめ、overlay で3つを同時に差し替える。
+      - `mlx` の wheel は `mlx-metal==<同じ版>` を厳密に要求するため、`mlx-bin` と `mlx-metal` は必ず同じ版にそろえる。
+      - 2026-11-05 時点では、PyPI の最新は `mlx` / `mlx-metal` 0.32.4、`mlx-lm` 0.32.2。nixpkgs の `mlx-bin` / `mlx-metal` は 0.32.0 で、`mlx-lm` の要求（`mlx>=0.32.2`）を満たさない。`mlx-lm` は nixpkgs も最新と同じだが、追従の仕組みを一本化するため overlay の対象に含める。
+      - 更新は `just bump-mlx` で行う。PyPI の JSON API から3パッケージの最新版と wheel の sha256 を取得して `nix/mlx-versions.nix` を書き換え、続けて `nix flake check` と実モデルでの slow テストを実行する。通ったら commit する。浮動の最新版は使わず、常に「検証済みの最新版に固定」の状態を保つ。
+      - この overlay の作成は段階4の作業として行う。
   - `plamo-translate`: crane で CLI と MCP をビルドする。`postInstall` で `$out/libexec/bin/plamo-translated` へのシンボリックリンクを張り、CLI が Nix 環境でもデーモンを見つけられるようにする。
   - `default`: `plamo-translate`（デーモンを内包する）。
 - `homeManagerModules.default`（**主たる導入経路**。nix-darwin 構成の `home-manager.users.<user>.imports` に入れて使う）
@@ -283,7 +287,7 @@ plamo-translate daemon {start|stop|restart|status|logs [-f]}
 | リスク | 影響 | 対応 |
 |---|---|---|
 | nixpkgs の `mlx` が CPU 専用ビルド | 推論が実用にならない | `mlx-bin` + `mlx-metal` を使う（§7）。段階0で GPU の使用を確認する |
-| `mlx-bin` の版が `mlx-lm` の要求より古い | ビルド時の依存チェックで失敗する | overlay で版を上げる（段階4の作業） |
+| MLX 系パッケージの版のずれ（nixpkgs の `mlx-bin` / `mlx-metal` が `mlx-lm` の要求より古い、`mlx` と `mlx-metal` の不一致） | ビルド時の依存チェックで失敗する、または実行時に Metal カーネルが合わない | `nix/mlx-versions.nix` で3つを同時に最新版へ固定し、`just bump-mlx` で追従する（§7） |
 | モデルのコードが transformers 4.57.1 向けで、nixpkgs は 5 系 | tokenizer の import やテンプレート処理が失敗する | 段階0で確認する。失敗したら overlay で transformers を 4.57 系に固定できるかを検討する（mlx-lm 0.32.2 は transformers 5.7 以上を要求するので、mlx-lm の版も合わせて見直す） |
 | 上流の remote code の変更 | 予期しない挙動 | revision を固定する（§4） |
 | 作者の nix-darwin 構成に home-manager が未導入 | 導入の初回に構成変更が必要 | 段階5で `home-manager.darwinModules.home-manager` を追加する手順を書く。既存の `users.users.<user>.packages` などと競合しないか確認する |
