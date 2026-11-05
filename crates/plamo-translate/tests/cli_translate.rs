@@ -184,6 +184,44 @@ fn status_prints_model_and_loaded() {
 }
 
 #[test]
+fn json_includes_finish_reason() {
+    let f = fake_daemon(&[
+        r#"{"type":"done","text":"The meeting","finish_reason":"stop","usage":{"input_tokens":3,"output_tokens":2},"model":"m","revision":"r"}"#,
+    ]);
+    let out = cmd(&f).args(["--json", "-t", "en", "x"]).output().unwrap();
+    assert!(out.status.success());
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["finish_reason"], "stop");
+
+    let f = fake_daemon(&STREAM);
+    let out = cmd(&f).args(["--json", "-t", "en", "x"]).output().unwrap();
+    assert!(out.status.success());
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v.as_object().unwrap().contains_key("finish_reason"));
+    assert!(v["finish_reason"].is_null());
+}
+
+#[test]
+fn status_prints_features_and_template_verified() {
+    let f = fake_daemon(&[
+        r#"{"type":"status","model":"pfnet/m","revision":"abc","loaded":true,"uptime_secs":42,"idle_timeout_secs":600,"queue_len":0,"version":"0.1.0","protocol":1,"features":["history"],"template_verified":true}"#,
+    ]);
+    cmd(&f).arg("status").assert().success().stdout(contains(
+        "protocol: 1\nfeatures: history\ntemplate_verified: true\n",
+    ));
+
+    let f = fake_daemon(&[
+        r#"{"type":"status","model":"pfnet/m","revision":"abc","loaded":true,"uptime_secs":42,"idle_timeout_secs":600,"queue_len":0,"version":"0.1.0","protocol":1}"#,
+    ]);
+    cmd(&f)
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(contains("features: -\n"))
+        .stdout(contains("template_verified: -\n"));
+}
+
+#[test]
 fn text_that_is_not_a_subcommand_is_translated() {
     let f = fake_daemon(&STREAM);
     cmd(&f).args(["-t", "en", "statuses"]).assert().success();

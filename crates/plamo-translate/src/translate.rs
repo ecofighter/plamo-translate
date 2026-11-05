@@ -141,6 +141,7 @@ impl Progress {
 
 fn done_json(
     text: &str,
+    finish_reason: &Option<String>,
     usage: &Option<plamo_client::Usage>,
     model: &Option<String>,
     revision: &Option<String>,
@@ -148,6 +149,7 @@ fn done_json(
     serde_json::json!({
         "type": "done",
         "text": text,
+        "finish_reason": finish_reason,
         "usage": usage.as_ref().map(|u| serde_json::json!({
             "input_tokens": u.input_tokens,
             "output_tokens": u.output_tokens,
@@ -212,15 +214,18 @@ async fn translate(client: &Client, req: &TranslateRequest, json: bool, no_strea
             }
             Event::Done {
                 text,
+                finish_reason,
                 usage,
                 model,
                 revision,
-                ..
             } => {
                 progress.clear();
                 if json {
                     write(
-                        &format!("{}\n", done_json(&text, &usage, &model, &revision)),
+                        &format!(
+                            "{}\n",
+                            done_json(&text, &finish_reason, &usage, &model, &revision)
+                        ),
                         &mut last_byte,
                     );
                 } else {
@@ -261,7 +266,7 @@ fn snake_case(pascal: &str) -> String {
 
 pub(crate) fn format_status(s: &Status) -> String {
     format!(
-        "model: {}\nrevision: {}\nloaded: {}\nuptime_secs: {}\nidle_timeout_secs: {}\nqueue_len: {}\nversion: {}\nprotocol: {}\n",
+        "model: {}\nrevision: {}\nloaded: {}\nuptime_secs: {}\nidle_timeout_secs: {}\nqueue_len: {}\nversion: {}\nprotocol: {}\nfeatures: {}\ntemplate_verified: {}\n",
         s.model,
         s.revision,
         s.loaded,
@@ -269,7 +274,13 @@ pub(crate) fn format_status(s: &Status) -> String {
         s.idle_timeout_secs,
         s.queue_len,
         s.version,
-        s.protocol
+        s.protocol,
+        match s.features.as_deref() {
+            None | Some([]) => "-".to_owned(),
+            Some(f) => f.join(", "),
+        },
+        s.template_verified
+            .map_or_else(|| "-".to_owned(), |v| v.to_string()),
     )
 }
 
