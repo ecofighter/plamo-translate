@@ -11,7 +11,7 @@ from plamo_translated.protocol import DaemonError, HistoryEntry, TranslateReques
 pytestmark = pytest.mark.slow
 
 SLOW_MODEL = "pfnet/plamo-3-translate-0.8b-MLX-4bit"
-SLOW_REVISION = "main"
+SLOW_REVISION = "e5fe5b7f26ebaeae48db0ce644b932d1d9b91aaa"
 
 
 @pytest.fixture(scope="module")

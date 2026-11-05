@@ -110,7 +110,7 @@ socket_path = "~/Library/Application Support/plamo-translate/daemon.sock"
 - `activation`: launchd の `launch_activate_socket("Listeners", int**, size_t*)`（`launch.h`、libSystem）を ctypes で呼び、listen 済みの fd を受け取る。返された fd 配列は `free()` で解放する。呼び出しは名前ごとに1回だけ。`--socket PATH` が与えられたら自分で bind する（開発用・テスト用）。
 - `config`: 上記の探索順で TOML（`tomllib`）を読み、dataclass に変換する。
 - `pfml3`: PFML3 の規則を持つ純粋関数のモジュール（mlx を import しない）。
-  - `validate(req)`: 意味的な検証。`parse_request` の直後に `server` が呼ぶ。順序は history の各組（`source`、`translation`）、`text`、`target_lang`、`source_lang`、`context`、`form`、glossary の各項目（`source`、`target`）で、各テキスト項目は空の検査を予約トークンの検査より先に行う。最初の違反を `invalid_request` で返す。メッセージは chat template の文言に項目名（`history[0].source` など）を入れたもの。`<|plamo:` を含むテキストは拒否する（tokenizer がこの文字列を制御トークンに変換し、無効化する手段がないため。経緯は `docs/superpowers/notes/2026-11-05-pfml3-tokenizer-findings.md`）。言語コードは `re.fullmatch(r"[a-z]{2,3}(-[a-z]{4})?", value)` または `ja(easy)`。
+  - `validate(req)`: 意味的な検証。`parse_request` の直後に `server` が呼ぶ。順序は history の各組（`source`、`translation`）、`text`、`target_lang`、`source_lang`、`context`、`form`、glossary の各項目（`source`、`target`）で、各テキスト項目は空の検査を予約トークンの検査より先に行う。最初の違反を `invalid_request` で返す。メッセージはデーモン独自の固定文字列で、項目名（`history[0].source` など）を含む。正確な文言は `daemon/tests/test_pfml3.py` と fixture が定める（chat template とは一部異なる。たとえば `target_lang=""` は言語コードのメッセージになる）。oracle のテストは受理と拒否が template と一致することだけを比べる。`<|plamo:` を含むテキストは拒否する（tokenizer がこの文字列を制御トークンに変換し、無効化する手段がないため。経緯は `docs/superpowers/notes/2026-11-05-pfml3-tokenizer-findings.md`）。言語コードは `re.fullmatch(r"[a-z]{2,3}(-[a-z]{4})?", value)` または `ja(easy)`。
   - `build_prompt(req)`: BOS を含む PFML3 文字列。要素の順序は `dataset`、`context`（空文字列でなければ）、history の各組の `input` と `output`、`glossary`（空でなければ）、今回の `input`、`output`（`form` があれば付ける）と `<|plamo:msg|>`。空白は一切加えず、削らない。
   - `prompt_ids(tokenizer, req)`: `build_prompt` の結果を `add_special_tokens=False` で1回だけ encode する（先頭は BOS 1個）。
   - `check_tokenizer(tokenizer)`: 7つの制御文字列（`<|plamo:bos|>`、`tag`、`key`、`val`、`msg`、`index`、`item`）がそれぞれ unk でない1個の id になり、`tag` と `bos` の id が eos id に含まれることを確認する。満たさなければ `model_load_failed`。
@@ -146,7 +146,7 @@ socket_path = "~/Library/Application Support/plamo-translate/daemon.sock"
 - `op` が `load` の場合は、モデルのダウンロードとロードだけを行い、`progress` と `done` を返す（`model pull` 用）。
 - `max_tokens` が null の場合は、`min(4 * 入力トークン数 + 256, 32768 - 入力トークン数)` を使う。
 - `target_lang` に `"auto"` は渡さない（auto の解決はクライアント側で行う）。
-- `history` は省略可能。過去の原文と訳文の組を古い順に並べる。省略、`null`、`[]` は同じ扱い。要素の未知のキーは無視する。デーモンは組を削らず、プロンプト全体（history を含む）と `max_tokens` の合計が 32,768 を超えたら `context_too_long` を返す。組を減らして再送するかはクライアントが決める。
+- `history` は省略可能。過去の原文と訳文の組を古い順に並べる。省略、`null`、`[]` は同じ扱い。要素の未知のキーは無視する。デーモンは組を削らず、プロンプト全体（history を含む）と `max_tokens` の合計が 32,768 を超えたら `context_too_long` を返す。組を減らして再送するかはクライアントが決める。再送する場合は、試行のたびに古い方から `ceil(n/2)` 組を削り、クライアントが指定した `max_tokens` は変えず、履歴が空になったら止める（CLI は再送せず、MCP server は再送する）。
 
 **レスポンス**（デーモンから複数行）
 ```json
@@ -252,7 +252,11 @@ plamo-translate daemon {start|stop|restart|status|logs [-f]}
       - 2026-11-05 時点では、PyPI の最新は `mlx` / `mlx-metal` 0.32.4、`mlx-lm` 0.32.2。nixpkgs の `mlx-bin` / `mlx-metal` は 0.32.0 で、`mlx-lm` の要求（`mlx>=0.32.2`）を満たさない。`mlx-lm` は nixpkgs も最新と同じだが、追従の仕組みを一本化するため overlay の対象に含める。
       - 更新は `just bump-mlx` で行う。PyPI の JSON API から3パッケージの最新版と wheel の sha256 を取得して `nix/mlx-versions.nix` を書き換え、続けて `nix flake check` と実モデルでの slow テストを実行する。通ったら commit する。浮動の最新版は使わず、常に「検証済みの最新版に固定」の状態を保つ。
       - この overlay の作成は段階4の作業として行う。
-  - `plamo-translate`: crane で CLI と MCP をビルドする。`postInstall` で `$out/libexec/bin/plamo-translated` へのシンボリックリンクを張り、CLI が Nix 環境でもデーモンを見つけられるようにする。
+  - `plamo-translate`: nixpkgs の `rustPlatform.buildRustPackage` で CLI と MCP をビルドする（crane は使わない）。依存は `cargoLock.lockFile` で vendor する。`postInstall` で `$out/libexec/bin/plamo-translated` へのシンボリックリンクを張り、CLI が Nix 環境でもデーモンを見つけられるようにする。パッケージ自身はテストを実行しない（`doCheck = false`。`checks.cargo-test` が実行する）。
+  - `checks.cargo-test` と `checks.clippy` は、パッケージと共有の `rustArgs`（`pname`、`version`、`src`、`cargoLock`）から作る別々の `buildRustPackage`。パッケージを `overrideAttrs` して作らない（`postInstall` を通じて Python と MLX のクロージャに依存してしまうため）。
+    - どちらも debug（dev）プロファイルで動かす。コードに `cfg(debug_assertions)` やプロファイルの上書きが入ったら、cargo-test の `buildType = "debug"` を外して release でテストする。
+    - Nix のサンドボックスが有効なマシンでソケットのテストが EPERM で落ちたら、cargo-test に `__darwinAllowLocalNetworking = true` を足す。
+  - Rust のソースは `Cargo.toml`、`Cargo.lock`、`crates/` 全体（insta の保留中スナップショットを除く）、`protocol/fixtures`。新しいクレートや fixture を足しても Nix 側の編集はいらない。
   - `default`: `plamo-translate`（デーモンを内包する）。
 - `homeManagerModules.default`（**主たる導入経路**。nix-darwin 構成の `home-manager.users.<user>.imports` に入れて使う）
   ```nix
@@ -292,7 +296,7 @@ plamo-translate daemon {start|stop|restart|status|logs [-f]}
 
 ## 10. テスト方針
 - **プロトコル fixtures**: `protocol/fixtures/` に、リクエストとレスポンス列の組を NDJSON で置く（正常系、stream:false、各エラーコード、未知フィールド）。pytest（デーモンが fixture どおりに応答するか）と Rust（クライアントが fixture を正しく解釈するか）の両方から読む。
-- **デーモン**（pytest + pytest-asyncio）: `FakeEngine` を差し込んで、FIFO の直列化、`busy`、切断時の中断（待ち行列中・生成中・`stream:false` の各場合）、アイドル時の exit（終了直前に受け付けた接続を取りこぼさないこと）、SIGTERM、`context_too_long`、検証がキューとロードより先に行われること、`done.text` の末尾の処理と `finish_reason` を確認する。`pfml3` は golden 文字列と検証規則の単体テストで確認する。`activation` は `--socket` 経路だけをテストする（launchd 経路は手動確認）。実モデル（`0.8b-MLX-4bit`）を使う結合テストは `@pytest.mark.slow` を付ける。
+- **デーモン**（pytest + pytest-asyncio）: `FakeEngine` を差し込んで、FIFO の直列化、`busy`、切断時の中断（待ち行列中・生成中・`stream:false` の各場合）、アイドル時の exit（終了直前に受け付けた接続を取りこぼさないこと）、SIGTERM、`context_too_long`、検証がキューとロードより先に行われること、`done.text` の末尾の処理と `finish_reason` を確認する。`pfml3` は golden 文字列と検証規則の単体テストで確認する。`activation` は `--socket` 経路だけをテストする（launchd 経路は手動確認）。実モデルを使う結合テストは `@pytest.mark.slow` を付ける。slow テストには、固定リビジョンの 2b（既定モデル）と 0.8b（`e5fe5b7f26ebaeae48db0ce644b932d1d9b91aaa`）のキャッシュが必要で、`HF_HUB_OFFLINE=1` で動く。キャッシュがないと skip ではなく失敗する。oracle の対象は `PLAMO_ORACLE_MODELS`（カンマ区切りの `repo@revision`）で変えられる。
 - **plamo-client**: tokio のフェイク UDS サーバーで fixture を再生する。`resolve_target` と TSV パーサーは単体テストで確認する。
 - **CLI**: `assert_cmd` に `PLAMO_TRANSLATE_SOCKET` でフェイクサーバーを渡す。plist の生成は `insta` のスナップショットで、launchctl の呼び出しはフェイクの `Launchctl` で、デーモン実行ファイルの探索順は単体テストで確認する。
 - **MCP**: rmcp のインプロセスクライアントで `tools/list` と `tools/call` を確認する。

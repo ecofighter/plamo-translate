@@ -138,7 +138,7 @@ MLX 系の `mlx-bin`、`mlx-metal`、`mlx-lm` は `nix/mlx-versions.nix` で同�
 just bump-mlx   # scripts/bump_mlx.py で版と sha256 を更新 -> nix flake check -> just test-slow
 ```
 
-通ったら commit する。開発用のテストは `just test` (slow を除く pytest と cargo test)、`just test-slow` (実モデル)。
+通ったら commit する。開発用のテストは `just test` (slow を除く pytest と cargo test)、`just test-slow` (実モデル。固定リビジョンの 2b と 0.8b のキャッシュが必要で、`HF_HUB_OFFLINE=1` で動く)。
 
 ## トラブルシュート
 

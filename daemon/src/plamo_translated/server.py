@@ -192,6 +192,8 @@ class Server:
                     job.emit(protocol.delta(piece))
             if job.cancelled.is_set():
                 return
+            # Every translate done must carry finish_reason; mlx-lm is pinned and the slow tests that
+            # `just bump-mlx` runs assert it, so reaching this means a changed mlx-lm.
             if text_stream.finish_reason is None:
                 raise DaemonError("internal", "generation ended without a finish reason")
             job.emit(

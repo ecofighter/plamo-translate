@@ -19,6 +19,8 @@ The FakeEngine ends every uninterrupted generation with `finish_reason` `"stop"`
 
 The daemon test starts the FakeEngine with the model already loaded unless `download` or `load_error` is set, so only those scenarios include load `progress` events.
 
+Every fixture whose request carries a `history` array states `"stream"` explicitly: the Rust client always serializes `stream`, and the client tests compare fixture requests with its serialization.
+
 Matching: the string `"<any>"` matches any value. Expected events are matched as a subset of the actual event's keys, except keys prefixed with `x_`, which only exist to exercise forward compatibility. Daemon tests ignore `x_` keys in expected events; client tests feed the lines verbatim and must ignore unknown keys.
 
 Event fields that fixtures assert where they matter:
