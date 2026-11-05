@@ -1,6 +1,7 @@
+mod daemon;
 mod translate;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use plamo_client::{Client, Config};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -44,37 +45,19 @@ enum Command {
     /// Manage the launchd daemon
     Daemon {
         #[command(subcommand)]
-        action: DaemonAction,
+        action: daemon::DaemonCmd,
     },
 }
 
 #[derive(Subcommand)]
 enum ModelAction {
+    /// Download and load the model now (op=load)
     Pull,
+    /// Print where the model weights are stored
     Path,
 }
 
-#[derive(Subcommand)]
-enum DaemonAction {
-    Install(InstallArgs),
-    Uninstall,
-    Start,
-    Stop,
-    Restart,
-    Status,
-    Logs {
-        #[arg(short, long)]
-        follow: bool,
-    },
-}
-
-#[derive(Args)]
-struct InstallArgs {
-    #[arg(long)]
-    daemon_bin: Option<PathBuf>,
-}
-
-fn client_for(config: &Config) -> Client {
+pub(crate) fn client_for(config: &Config) -> Client {
     let client = Client::new(config.socket_path.clone());
     // Test-only override: a missing socket is retried for the full 5 s otherwise.
     match std::env::var("PLAMO_TRANSLATE_CONNECT_TIMEOUT_MS")
@@ -96,13 +79,30 @@ async fn main() {
             std::process::exit(ExitCode::Usage as i32);
         }
     };
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
     let client = client_for(&config);
     let code = match cli.command {
         None => translate::run(&client, &config, cli.translate).await,
         Some(Command::Status) => translate::status(&client).await,
-        Some(Command::Model { .. }) | Some(Command::Daemon { .. }) => {
-            eprintln!("not implemented yet");
-            ExitCode::Usage as i32
+        Some(Command::Model {
+            action: ModelAction::Pull,
+        }) => translate::pull(&client).await,
+        Some(Command::Model {
+            action: ModelAction::Path,
+        }) => {
+            println!("{}", daemon::hub_dir(&home).display());
+            ExitCode::Ok as i32
+        }
+        Some(Command::Daemon { action }) => {
+            match daemon::run(action, &config, &daemon::launchctl::SystemLaunchctl, &home).await {
+                Ok(code) => code as i32,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::Translation as i32
+                }
+            }
         }
     };
     std::process::exit(code);

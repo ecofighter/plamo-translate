@@ -1,0 +1,112 @@
+gui/501/com.apple.mediastream.mstreamd = {
+	active count = 0
+	path = /System/Library/LaunchAgents/com.apple.mediastream.mstreamd.plist
+	type = LaunchAgent
+	state = not running
+
+	program = /System/Library/PrivateFrameworks/MediaStream.framework/Versions/A/Support/mstreamd
+	inherited environment = {
+		SSH_AUTH_SOCK => /var/run/com.apple.launchd.HqCvytx6BA/Listeners
+	}
+
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		OSLogRateLimit => 64
+		MallocSpaceEfficient => 1
+		XPC_SERVICE_NAME => com.apple.mediastream.mstreamd
+	}
+
+	domain = gui/501 [100015]
+	asid = 100015
+	minimum runtime = 10
+	base minimum runtime = 10
+	exit timeout = 5
+	runs = 1
+	last exit code = 0
+
+	semaphores = {
+		after crash => 1
+	}
+
+	event triggers = {
+		com.apple.photostream.idslaunchnotification => {
+			keepalive = 0
+			service = com.apple.mediastream.mstreamd
+			stream = com.apple.notifyd.matching
+			monitor = com.apple.notifyd
+			descriptor = {
+				"Notification" => "com.apple.photostream.idslaunchnotification"
+			}
+		}
+	}
+
+	endpoints = {
+		"com.apple.mediastream.mstreamd.sharing.push-dev" = {
+			port = 0xfdf23
+			active = 0
+			managed = 1
+			reset = 0
+			hide = 0
+			watching = 1
+		}
+		"com.apple.mediastream.sharing" = {
+			port = 0xd7e13
+			active = 0
+			managed = 1
+			reset = 0
+			hide = 0
+			watching = 1
+		}
+		"com.apple.mediastream.mstreamd.sharing.push-prod" = {
+			port = 0xd7d93
+			active = 0
+			managed = 1
+			reset = 0
+			hide = 0
+			watching = 1
+		}
+	}
+
+	event channels = {
+		"com.apple.notifyd.matching" = {
+			port = 0xd773b
+			active = 0
+			managed = 1
+			reset = 0
+			hide = 0
+			watching = 1
+		}
+	}
+
+	resource coalition = {
+		ID = 1242
+		type = resource
+		state = active
+		active count = 1
+		name = com.apple.mediastream.mstreamd
+	}
+
+	jetsam coalition = {
+		ID = 1243
+		type = jetsam
+		state = active
+		active count = 1
+		name = com.apple.mediastream.mstreamd
+	}
+
+	spawn type = adaptive (6)
+	jetsam priority = 60
+	jetsam memory limit (active, soft) = 60 MB
+	jetsam memory limit (inactive, soft) = 60 MB
+	jetsamproperties category = daemon
+	jetsam thread limit = 32
+	cpumon = default
+	exponential throttling grace limit = 10
+	job state = exited
+	sanitizer flags = 0x0
+
+	properties = supports transactions | supports pressured exit | system service | exponential throttling | tle system
+}

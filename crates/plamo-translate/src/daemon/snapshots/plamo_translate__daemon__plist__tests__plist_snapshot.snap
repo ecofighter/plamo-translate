@@ -1,0 +1,37 @@
+---
+source: crates/plamo-translate/src/daemon/plist.rs
+expression: "render_plist(&spec(\"cli\"))"
+---
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>local.plamo-translate.daemon</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/nix/profile/libexec/bin/plamo-translated</string>
+	</array>
+	<key>Sockets</key>
+	<dict>
+		<key>Listeners</key>
+		<dict>
+			<key>SockPathName</key>
+			<string>/Users/u/Library/Application Support/plamo-translate/daemon.sock</string>
+			<key>SockPathMode</key>
+			<integer>384</integer>
+		</dict>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/Users/u/Library/Logs/plamo-translate/daemon.stderr.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/u/Library/Logs/plamo-translate/daemon.stderr.log</string>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PLAMO_TRANSLATE_MANAGED_BY</key>
+		<string>cli</string>
+	</dict>
+</dict>
+</plist>

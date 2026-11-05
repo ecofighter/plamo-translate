@@ -2,8 +2,8 @@ use crate::{EXIT_INTERRUPTED, ExitCode};
 use clap::Args;
 use futures::StreamExt;
 use plamo_client::{
-    Client, Config, Error, Event, GlossaryEntry, Status, TranslateRequest, merge_glossaries,
-    parse_glossary, resolve_target,
+    Client, Config, Error, ErrorCode, Event, GlossaryEntry, Status, TranslateRequest,
+    merge_glossaries, parse_glossary, resolve_target,
 };
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -233,13 +233,16 @@ async fn translate(client: &Client, req: &TranslateRequest, json: bool, no_strea
             }
             Event::Error { code, message } => {
                 progress.clear();
-                let code = format!("{code:?}");
-                eprintln!("error: {}: {message}", snake_case(&code));
-                return ExitCode::Translation as i32;
+                return report_daemon_error(&code, &message);
             }
             Event::Status(_) | Event::Unknown => {}
         }
     }
+    ExitCode::Translation as i32
+}
+
+fn report_daemon_error(code: &ErrorCode, message: &str) -> i32 {
+    eprintln!("error: {}: {message}", snake_case(&format!("{code:?}")));
     ExitCode::Translation as i32
 }
 
@@ -254,7 +257,7 @@ fn snake_case(pascal: &str) -> String {
     out
 }
 
-fn format_status(s: &Status) -> String {
+pub(crate) fn format_status(s: &Status) -> String {
     format!(
         "model: {}\nrevision: {}\nloaded: {}\nuptime_secs: {}\nidle_timeout_secs: {}\nqueue_len: {}\nversion: {}\nprotocol: {}\n",
         s.model,
@@ -276,4 +279,52 @@ pub async fn status(client: &Client) -> i32 {
         }
         Err(e) => report_error(&e),
     }
+}
+
+pub async fn pull(client: &Client) -> i32 {
+    tokio::select! {
+        code = load_model(client) => code,
+        _ = tokio::signal::ctrl_c() => EXIT_INTERRUPTED,
+    }
+}
+
+async fn load_model(client: &Client) -> i32 {
+    let mut events = match client.load().await {
+        Ok(s) => s,
+        Err(e) => return report_error(&e),
+    };
+    let mut progress = Progress {
+        enabled: std::io::stderr().is_terminal(),
+        dirty: false,
+    };
+    while let Some(item) = events.next().await {
+        match item {
+            Err(e) => {
+                progress.clear();
+                return report_error(&e);
+            }
+            Ok(Event::Progress {
+                stage,
+                done_bytes,
+                total_bytes,
+            }) => progress.show(&stage, done_bytes, total_bytes),
+            Ok(Event::Done {
+                model, revision, ..
+            }) => {
+                progress.clear();
+                println!(
+                    "model ready: {} @ {}",
+                    model.as_deref().unwrap_or("-"),
+                    revision.as_deref().unwrap_or("-")
+                );
+                return ExitCode::Ok as i32;
+            }
+            Ok(Event::Error { code, message }) => {
+                progress.clear();
+                return report_daemon_error(&code, &message);
+            }
+            Ok(Event::Delta { .. } | Event::Status(_) | Event::Unknown) => {}
+        }
+    }
+    ExitCode::Translation as i32
 }
