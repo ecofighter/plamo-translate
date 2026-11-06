@@ -179,3 +179,144 @@ test('/clear forgets the translation memory', async ($, on) => {
   await show($, 'm2', 'Fresh.\n\n')
   expect(h.runs[h.runs.length - 1].argv).not.toContain('--history')
 })
+
+interface ClockedHarness {
+  clock: ReturnType<typeof mock.clock>
+  runs: Run[]
+  events: string[]
+  toasts: string[]
+  slow: Set<string>
+  failing: Set<string>
+}
+
+// The fakes answer on the mock clock: the harness holds every hook to its budget in real time.
+function setupClocked(on: any): ClockedHarness {
+  const h: ClockedHarness = {
+    clock: mock.clock(on),
+    runs: [],
+    events: [],
+    toasts: [],
+    slow: new Set(['Slow.']),
+    failing: new Set(),
+  }
+  mock.env(on, { TMPDIR: '/tmp' })
+  on('session.start', () => ({ cwd: '/work' }))
+  on('command.register', () => ({ value: undefined }))
+  on('command.list', () => ({ value: [{ name: 'ja', description: '' }] }))
+  on('turn.start', ($: unknown, e: { turnId: string }) => ({ turnId: e.turnId }))
+  on('ui.status', () => ({ value: undefined }))
+  on('ui.toast', ($: unknown, e: { text: string }) => {
+    h.toasts.push(e.text)
+    return { value: undefined }
+  })
+  on('session.id', () => ({ value: 'sess1' }))
+  on('fs.write', () => {
+    h.events.push('write')
+    return { value: undefined }
+  })
+  on('process.run', async ($: unknown, e: Run) => {
+    h.events.push('run')
+    h.runs.push(e)
+    const text = e.init.stdin ?? ''
+    if (h.slow.has(text)) await h.clock.sleep(30000)
+    if (h.failing.has(text)) return { value: { exitCode: 1, stdout: '', stderr: 'error: model_load_failed: x\n' } }
+    return { value: { exitCode: 0, stdout: done(`JA:${text}`), stderr: '' } }
+  })
+  on('classic.MessageDisplay', () => ({}))
+  return h
+}
+
+async function elapse(h: ClockedHarness, ms: number) {
+  await h.clock.settle()
+  await h.clock.advance(ms)
+}
+
+const ranTexts = (h: ClockedHarness) => h.runs.map((r) => r.init.stdin)
+
+test('a slow block holds later batches instead of letting them through untranslated', async ($, on) => {
+  const h = setupClocked(on)
+  await turnOn($)
+  const first = show($, 'm1', 'Slow.\n\n')
+  await elapse(h, 2000)
+  expect(await first).toEqual({ displayContent: '' })
+  const second = show($, 'm1', 'Next.\n\n')
+  await elapse(h, 2000)
+  expect(await second).toEqual({ displayContent: '' })
+  await elapse(h, 30000)
+  expect(await show($, 'm1', '', true)).toEqual({ displayContent: 'JA:Slow.\n\nJA:Next.\n\n' })
+})
+
+test('the final batch translates queued blocks itself', async ($, on) => {
+  const h = setupClocked(on)
+  await turnOn($)
+  const inFlight = show($, 'm0', 'Slow.\n\n')
+  await elapse(h, 2000)
+  expect(await inFlight).toEqual({ displayContent: '' })
+  const queued = show($, 'm1', 'A.\n\n')
+  await elapse(h, 2000)
+  expect(await queued).toEqual({ displayContent: '' })
+  expect(await show($, 'm1', 'B.', true)).toEqual({ displayContent: 'JA:A.\n\nJA:B.' })
+  expect(ranTexts(h)).toEqual(['Slow.', 'A.', 'B.'])
+})
+
+test('the final batch shows an in-flight block that misses its deadline as written, with a notice', async ($, on) => {
+  const h = setupClocked(on)
+  await turnOn($)
+  const first = show($, 'm1', 'Slow.\n\n')
+  await elapse(h, 2000)
+  expect(await first).toEqual({ displayContent: '' })
+  const last = show($, 'm1', '', true)
+  await elapse(h, 8000)
+  expect(await last).toEqual({ displayContent: 'Slow.\n\n' })
+  expect(h.toasts.length).toBe(1)
+  expect(h.toasts[0]).toContain('英語のまま')
+  expect(ranTexts(h).filter((t) => t === 'Slow.').length).toBe(1)
+})
+
+test('a failed block is shown as written with a notice', async ($, on) => {
+  const h = setupClocked(on)
+  h.failing.add('Bad.')
+  await turnOn($)
+  expect(await show($, 'm1', 'Bad.\n\n')).toEqual({ displayContent: 'Bad.\n\n' })
+  expect(h.toasts).toEqual([])
+  expect(await show($, 'm1', 'Good.', true)).toEqual({ displayContent: 'JA:Good.' })
+  expect(h.toasts).toEqual(['一部の段落を英語のまま表示しました (1 件: model_load_failed: x)。'])
+})
+
+test('disabling mid-message shows pending blocks as written', async ($, on) => {
+  const h = setupClocked(on)
+  await turnOn($)
+  const first = show($, 'm1', 'Slow.\n\n')
+  await elapse(h, 2000)
+  expect(await first).toEqual({ displayContent: '' })
+  await $.command.run({ command: 'ja', args: 'off' })
+  expect(await show($, 'm1', 'More.\n')).toEqual({ displayContent: 'Slow.\n\nMore.\n' })
+  await elapse(h, 30000)
+  expect(await show($, 'm1', 'Last.', true)).toEqual({})
+  expect(ranTexts(h)).toEqual(['Slow.'])
+})
+
+test("a new turn drops an unfinished message's queued blocks", async ($, on) => {
+  const h = setupClocked(on)
+  await turnOn($)
+  const first = show($, 'm1', 'Slow.\n\n')
+  await elapse(h, 2000)
+  expect(await first).toEqual({ displayContent: '' })
+  const second = show($, 'm1', 'A.\n\n')
+  await elapse(h, 2000)
+  expect(await second).toEqual({ displayContent: '' })
+  await $.turn.start({ text: '', turnId: 't2' })
+  await elapse(h, 30000)
+  expect(ranTexts(h)).toEqual(['Slow.'])
+})
+
+test('a repeated session start keeps one worker', async ($, on) => {
+  const h = setup(on)
+  await turnOn($)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  await show($, 'm1', 'Seed.\n\n')
+  h.events.length = 0
+  const [a, b] = await Promise.all([show($, 'm1', 'First.\n\n'), show($, 'm1', 'Second.\n\n')])
+  expect([a, b]).toEqual([{ displayContent: 'JA:First.\n\n' }, { displayContent: 'JA:Second.\n\n' }])
+  expect(h.events).toEqual(['write', 'run', 'write', 'run'])
+})

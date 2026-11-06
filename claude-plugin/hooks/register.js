@@ -11,15 +11,48 @@ import {
   LABELS,
   withFences,
 } from './lib/input.js'
-import { createDisplayBuffer, tableShapeMatches } from './lib/display.js'
+import { tableShapeMatches } from './lib/display.js'
+import { ABORTED, untilAborted } from './lib/doc.js'
+import {
+  abandon,
+  arrive,
+  beginInput,
+  beginTakeover,
+  boundedWait,
+  BUDGET_MARGIN_MS,
+  cancelQueued,
+  createPipeline,
+  DEADLINE,
+  dropMessages,
+  endInput,
+  endTakeover,
+  finalTake,
+  findDispatch,
+  hasUnsettled,
+  MISSED_REASON,
+  popIfIdle,
+  release,
+  rescue,
+  runJob,
+  runningSlot,
+  settle,
+  takeoverTimeoutMs,
+  takeReady,
+  waitBudgetMs,
+  waitForWork,
+  wake,
+  whenSettled,
+} from './lib/pipeline.js'
 
 const STATUS_TEXT = 'ja⇄en'
 const INPUT_TIMEOUT_MS = 60000
 const OUTPUT_TIMEOUT_MS = 20000
-// An empty displayContent hides a batch (checked in an interactive session on Claude Code v2.1.317),
-// so a paragraph can be held until it is complete.
-const HOLD_INCOMPLETE = true
+const NOTICE_TIMEOUT_MS = 8000
 const DROP_REASON = '送信をやめました。'
+const INPUT_FIRST_REASON = '入力の翻訳を優先'
+const TABLE_SHAPE_REASON = 'table shape changed'
+const PARTIAL_REASON = 'partial'
+const RESCUE_NOTICE = '表示の翻訳でエラーが起きたため英語のまま表示しました。'
 // The engine replaces the plugin's copy mid-session (a hooks worker respawn) and runs register and
 // session.start again; the switch lives in session state so that does not turn the layer off.
 const ENABLED = { plugin: 'plamo-ja-bridge', key: 'enabled' }
@@ -32,11 +65,22 @@ const COMMAND = {
 const confirmQuestion = (en) => `英訳を確認してください。\n\n${en}\n\nこの英訳で送りますか?`
 const failureQuestion = (reason) => `翻訳に失敗しました (${reason})。どうしますか?`
 const crashReason = (kind) => `日英レイヤでエラーが起きたため送信を止めました (${kind})。/ja off で無効にできます。`
+const failureNotice = (n, reason) => `一部の段落を英語のまま表示しました (${n} 件: ${reason})。`
+
+const NEVER = new Promise(() => {})
 
 async function loadEnabled($, ctx) {
   const { value } = await $.state.get(ENABLED)
   ctx.enabled = value ?? ctx.cfg.enabledByDefault
   return ctx.enabled
+}
+
+// Display dispatches that find the switch unread share one read, so they resume in arrival order.
+function loadEnabledOnce($, ctx) {
+  ctx.enabledLoad ??= loadEnabled($, ctx).finally(() => {
+    ctx.enabledLoad = undefined
+  })
+  return ctx.enabledLoad
 }
 
 async function isEnabled($, ctx) {
@@ -48,17 +92,23 @@ async function setEnabled($, ctx, value) {
   await $.state.set(ENABLED, value)
 }
 
-async function historyPath($) {
-  const tmp = ((await $.env.get('TMPDIR')) ?? '/tmp').replace(/\/$/, '')
-  return `${tmp}/plamo-ja-bridge-${await $.session.id()}.jsonl`
+function debug($, text) {
+  $.ui.log(text, { to: 'debug' })
 }
 
-// MessageDisplay calls for one reply arrive concurrently; one translation at a time keeps the shared
-// history file intact and the memory in reply order.
-function translate($, ctx, text, direction, timeoutMs) {
-  const run = ctx.queue.then(() => translateNow($, ctx, text, direction, timeoutMs))
-  ctx.queue = run.catch(() => {})
-  return run
+// Translations of input and display can now run at the same time, so each gets a history file of
+// its own; slot 0 keeps the file name used before.
+function acquireHistorySlot(ctx) {
+  let n = 0
+  while (ctx.historySlots.has(n)) n++
+  ctx.historySlots.add(n)
+  return n
+}
+
+async function historyPath($, slot) {
+  const tmp = ((await $.env.get('TMPDIR')) ?? '/tmp').replace(/\/$/, '')
+  const suffix = slot === 0 ? '' : `-${slot}`
+  return `${tmp}/plamo-ja-bridge-${await $.session.id()}${suffix}.jsonl`
 }
 
 // Runs one translation, shrinking the history on context_too_long the way the MCP server does.
@@ -66,19 +116,24 @@ async function translateNow($, ctx, text, direction, timeoutMs) {
   const [from, to] = direction === 'ja-en' ? ['ja', 'en'] : ['en', 'ja']
   let history = ctx.memory.select(direction, { maxPairs: ctx.cfg.historyPairs, maxChars: ctx.cfg.historyChars })
   for (;;) {
-    let historyFile
-    if (history.length > 0) {
-      historyFile = await historyPath($)
-      await $.fs.write(historyFile, toJsonl(history))
-    }
+    const slot = history.length > 0 ? acquireHistorySlot(ctx) : undefined
     let run
     try {
-      run = await $.process.run([ctx.cfg.translator, ...buildArgs({ from, to, form: ctx.cfg.form, historyFile })], {
-        stdin: text,
-        timeoutMs,
-      })
-    } catch (err) {
-      return { ok: false, reason: err?.message || 'timeout', contextTooLong: false }
+      let historyFile
+      if (slot !== undefined) {
+        historyFile = await historyPath($, slot)
+        await $.fs.write(historyFile, toJsonl(history))
+      }
+      try {
+        run = await $.process.run([ctx.cfg.translator, ...buildArgs({ from, to, form: ctx.cfg.form, historyFile })], {
+          stdin: text,
+          timeoutMs,
+        })
+      } catch (err) {
+        return { ok: false, reason: err?.message || 'timeout', contextTooLong: false }
+      }
+    } finally {
+      if (slot !== undefined) ctx.historySlots.delete(slot)
     }
     const result = parseResult(run)
     if (result.ok || !result.contextTooLong || history.length === 0) return result
@@ -86,9 +141,18 @@ async function translateNow($, ctx, text, direction, timeoutMs) {
   }
 }
 
-async function ask($, question, options) {
+// The display side starts nothing new while a prompt translates: the daemon serves one request at a
+// time, and the prompt is what the user is waiting on.
+function translateInput($, ctx, text, signal) {
+  beginInput(ctx.display)
+  const run = translateNow($, ctx, text, 'ja-en', INPUT_TIMEOUT_MS).finally(() => endInput(ctx.display))
+  return untilAborted(run, signal)
+}
+
+async function ask($, question, options, signal) {
   try {
-    return await $.ui.ask(question, options)
+    const answer = await untilAborted($.ui.ask(question, options), signal)
+    return answer === ABORTED ? null : answer
   } catch {
     return null
   }
@@ -107,9 +171,10 @@ async function submitJapanese($, ctx, e, next) {
       continue
     }
     const { lead, core, trail } = splitEdges(s.text)
-    const result = await translate($, ctx, core, 'ja-en', INPUT_TIMEOUT_MS)
+    const result = await translateInput($, ctx, core, next.signal)
+    if (result === ABORTED) return { drop: DROP_REASON }
     if (!result.ok) {
-      const answer = await ask($, failureQuestion(result.reason), [LABELS.original, LABELS.cancel])
+      const answer = await ask($, failureQuestion(result.reason), [LABELS.original, LABELS.cancel], next.signal)
       return answer === LABELS.original ? next(e) : { drop: DROP_REASON }
     }
     const translation = result.text.trim()
@@ -118,7 +183,7 @@ async function submitJapanese($, ctx, e, next) {
   }
 
   const answer = ctx.cfg.confirm
-    ? await ask($, confirmQuestion(english), [LABELS.send, LABELS.original, LABELS.cancel])
+    ? await ask($, confirmQuestion(english), [LABELS.send, LABELS.original, LABELS.cancel], next.signal)
     : LABELS.send
   const decision = decideSubmission(answer)
   if (decision === 'drop') return { drop: DROP_REASON }
@@ -135,31 +200,191 @@ async function submitJapanese($, ctx, e, next) {
 }
 
 // A block that cannot be translated is shown as written: the display is the only thing at stake.
-async function renderBlock($, ctx, block) {
-  if (block.kind !== 'paragraph' && block.kind !== 'table') return block.text
+// The pair goes to memory even when the result comes too late to be shown.
+async function translateBlock($, ctx, slot, { timeoutMs }) {
+  const { block } = slot
   const { lead, core, trail } = splitEdges(block.text)
-  if (core === '' || isMostlyJapanese(core)) return block.text
-  let result
-  try {
-    result = await translate($, ctx, core, 'en-ja', OUTPUT_TIMEOUT_MS)
-  } catch {
-    return block.text
-  }
-  if (!result.ok) return block.text
+  if (core === '' || isMostlyJapanese(core)) return { text: block.text }
+  const result = await translateNow($, ctx, core, 'en-ja', timeoutMs)
+  if (!result.ok) return { text: block.text, failReason: result.reason }
   const ja = result.text.trim()
-  if (block.kind === 'table' && !tableShapeMatches(core, ja)) return block.text
+  if (block.kind === 'table' && !tableShapeMatches(core, ja)) return { text: block.text, failReason: TABLE_SHAPE_REASON }
   if (isEligiblePair(core, ja, result.finishReason)) ctx.memory.add({ ja, en: core })
-  return lead + ja + trail
+  return { text: lead + ja + trail }
+}
+
+const translateJob = ($, ctx) => (slot) => translateBlock($, ctx, slot, { timeoutMs: OUTPUT_TIMEOUT_MS })
+
+// Display translations run here, outside any dispatch, so no dispatch waits on them past its budget.
+// A newer session.start bumps the generation, and the older loop ends at its next turn.
+async function runDisplayWorker($, ctx, generation) {
+  const pipe = ctx.display
+  while (generation === ctx.workerGen) {
+    const job = popIfIdle(pipe)
+    if (job) await runJob(pipe, job, translateJob($, ctx))
+    else await waitForWork(pipe)
+  }
+}
+
+function startDisplayWorker($, ctx) {
+  ctx.workerGen += 1
+  wake(ctx.display)
+  runDisplayWorker($, ctx, ctx.workerGen).catch(() => {})
+}
+
+// A host that cannot time a wait leaves it to its promise and the signal; reading that as an expired
+// deadline would show every block untranslated.
+function hostSleep($, ms, options) {
+  return $.clock.sleep(ms, options).catch(() => NEVER)
+}
+
+function clockNow($, signal) {
+  return untilAborted($.clock.now().catch(() => Date.now()), signal)
+}
+
+// One deadline per dispatch, on the host clock, shared by all of its waits; each wait is also held
+// under the budget the engine meters, read fresh, since that is what decides whether the hook is
+// treated as absent.
+async function dispatchDeadline($, next, final) {
+  const now = await clockNow($, next.signal)
+  if (now === ABORTED) return ABORTED
+  return now + waitBudgetMs(next.budget.remainingMs, final)
+}
+
+async function waitUntil($, next, deadline, promise) {
+  const now = await clockNow($, next.signal)
+  if (now === ABORTED) return ABORTED
+  const ms = Math.min(deadline - now, next.budget.remainingMs - BUDGET_MARGIN_MS)
+  return boundedWait(promise, ms, (sleepMs, options) => hostSleep($, sleepMs, options), next.signal)
+}
+
+// Once a dispatch has shown text, an earlier one of the same message shows nothing more: the engine
+// places each batch where its own delta was, so later text from it would appear out of order.
+function overtaken(ctx, d) {
+  return (ctx.shownSeq.get(d.state) ?? -1) > d.seq
+}
+
+function markShown(ctx, d) {
+  ctx.shownSeq.set(d.state, Math.max(ctx.shownSeq.get(d.state) ?? -1, d.seq))
+}
+
+async function showBatch($, ctx, d, next) {
+  const pipe = ctx.display
+  const deadline = await dispatchDeadline($, next, false)
+  if (deadline === ABORTED) return {}
+  const previous = await waitUntil($, next, deadline, d.prevTurn)
+  if (previous === ABORTED || d.abandoned) return {}
+  if (previous === DEADLINE) debug($, 'display: an earlier batch of the message was still busy at the deadline')
+
+  while (hasUnsettled(d)) {
+    const job = popIfIdle(pipe)
+    if (job) debug($, 'display: help-run, translating the next queued block in the batch')
+    const waited = job
+      ? await waitUntil($, next, deadline, runJob(pipe, job, translateJob($, ctx)))
+      : await waitUntil($, next, deadline, Promise.race([whenSettled(d), waitForWork(pipe)]))
+    if (waited === ABORTED || d.abandoned) return {}
+    if (waited === DEADLINE) {
+      debug($, 'display: deadline reached; untranslated blocks are held for a later batch')
+      break
+    }
+  }
+
+  if (overtaken(ctx, d)) return { displayContent: '' }
+  const text = takeReady(d)
+  if (text === null) return {}
+  markShown(ctx, d)
+  return { displayContent: text }
+}
+
+// Translates the blocks the final batch took over with its own calls, which the budget does not
+// meter; it bounds itself instead, and gives way to a prompt.
+async function takeOver($, ctx, d, slots, next) {
+  if (slots.length === 0) return true
+  const pipe = ctx.display
+  beginTakeover(pipe)
+  try {
+    const started = Date.now()
+    for (const [i, slot] of slots.entries()) {
+      if (next.signal.aborted || d.abandoned) return false
+      const timeoutMs = takeoverTimeoutMs(started, Date.now(), OUTPUT_TIMEOUT_MS)
+      const stopReason = pipe.inputActive > 0 ? INPUT_FIRST_REASON : timeoutMs === null ? MISSED_REASON : undefined
+      if (stopReason !== undefined) {
+        debug($, `display: takeover stopped (${stopReason}); ${slots.length - i} block(s) shown as written`)
+        for (const rest of slots.slice(i)) settle(rest, { text: rest.block.text, failReason: stopReason })
+        return true
+      }
+      let result
+      try {
+        result = await untilAborted(translateBlock($, ctx, slot, { timeoutMs }), next.signal)
+      } catch (err) {
+        result = { text: slot.block.text, failReason: err?.message || 'error' }
+      }
+      if (result === ABORTED) return false
+      settle(slot, result)
+    }
+    return true
+  } finally {
+    endTakeover(pipe)
+  }
+}
+
+// Returns false when the dispatch was aborted or abandoned, so the caller makes no further calls.
+async function finishMessage($, ctx, d, next) {
+  const deadline = await dispatchDeadline($, next, true)
+  if (deadline === ABORTED) return false
+  const previous = await waitUntil($, next, deadline, d.prevTurn)
+  if (previous === ABORTED || d.abandoned) return false
+  if (previous === DEADLINE) debug($, 'display: an earlier batch of the message was still busy at the final deadline')
+
+  const claimed = cancelQueued(ctx.display, d.state)
+  const inFlight = runningSlot(d.state)
+  if (inFlight) {
+    const waited = await waitUntil($, next, deadline, inFlight.settled)
+    if (waited === ABORTED || d.abandoned) return false
+    if (waited === DEADLINE) debug($, 'display: an in-flight block missed the final deadline; shown as written')
+  }
+  return takeOver($, ctx, d, claimed, next)
+}
+
+function noticeFailures($, failures, partial) {
+  for (const reason of failures) debug($, `display: block shown as written (${reason})`)
+  const n = failures.length + partial
+  if (n > 0) $.ui.toast(failureNotice(n, failures[0] ?? PARTIAL_REASON), { timeoutMs: NOTICE_TIMEOUT_MS })
+}
+
+async function showFinal($, ctx, d, next) {
+  ctx.finishing.add(d.state)
+  let live = false
+  try {
+    live = await finishMessage($, ctx, d, next)
+  } catch (err) {
+    debug($, `display: final batch failed (${err?.message || 'error'}); the rest is shown as written`)
+  }
+  const { text, failures, partial } = finalTake(ctx.display, d)
+  markShown(ctx, d)
+  if (live) noticeFailures($, failures, partial)
+  return { displayContent: text }
 }
 
 export function register(on, options) {
-  const ctx = { cfg: resolveConfig(options), memory: createMemory(), queue: Promise.resolve(), enabled: undefined }
-  const displayBuffers = new Map()
+  const cfg = resolveConfig(options)
+  const ctx = {
+    cfg,
+    memory: createMemory(),
+    enabled: undefined,
+    enabledLoad: undefined,
+    display: createPipeline({ flushLines: cfg.flushLines }),
+    historySlots: new Set(),
+    workerGen: 0,
+    shownSeq: new WeakMap(),
+    finishing: new WeakSet(),
+  }
 
   const stateLabel = () => (ctx.enabled ? 'オン' : 'オフ')
 
   on('session.start', async ($, e, next) => {
     ctx.memory.clear()
+    startDisplayWorker($, ctx)
     await loadEnabled($, ctx)
     await $.command.register(COMMAND)
     $.ui.status(ctx.enabled ? STATUS_TEXT : undefined)
@@ -167,8 +392,12 @@ export function register(on, options) {
   })
 
   // /ja has gone missing mid-session (only /reload-plugins brought it back); each main turn restores it
-  // and the status line.
+  // and the status line. Messages of earlier turns get no further batch, so their queued blocks would
+  // only delay this turn's reply; a message whose final batch is running finishes on its own.
   on('turn.start', async ($, e, next) => {
+    if (e.agentId === undefined) {
+      dropMessages(ctx.display, (state) => state.turnId !== e.turnId && !ctx.finishing.has(state))
+    }
     const result = await next(e)
     if (e.agentId !== undefined) return result
     try {
@@ -183,7 +412,7 @@ export function register(on, options) {
   on('session.end', async ($, e, next) => {
     if (e.reason === 'clear' || e.reason === 'resume') {
       ctx.memory.clear()
-      displayBuffers.clear()
+      dropMessages(ctx.display)
     }
     return next(e)
   })
@@ -209,18 +438,41 @@ export function register(on, options) {
   })
 
   on('classic.MessageDisplay', async ($, e, next) => {
-    const held = displayBuffers.get(e.message_id)
-    if (!(await isEnabled($, ctx))) {
-      if (!held) return next(e)
-      displayBuffers.delete(e.message_id)
-      return { displayContent: held.takeAll().map((b) => b.text).join('') + e.delta }
+    if (ctx.enabled === undefined && (await untilAborted(loadEnabledOnce($, ctx), next.signal)) === ABORTED) return {}
+    if (!ctx.enabled) {
+      const state = ctx.display.messages.get(e.message_id)
+      if (!state) return next(e)
+      return { displayContent: release(ctx.display, state) + e.delta }
     }
-    const buffer = held ?? createDisplayBuffer({ flushLines: ctx.cfg.flushLines, holdIncomplete: HOLD_INCOMPLETE })
-    displayBuffers.set(e.message_id, buffer)
-    const blocks = buffer.push(e.delta, e.final)
-    if (e.final) displayBuffers.delete(e.message_id)
-    let shown = ''
-    for (const block of blocks) shown += await renderBlock($, ctx, block)
-    return { displayContent: shown }
+    // Before any await: arrival order decides the display order.
+    const d = arrive(ctx.display, {
+      messageId: e.message_id,
+      key: e.index,
+      delta: e.delta,
+      final: e.final,
+      turnId: e.turn_id,
+    })
+    try {
+      return await (e.final ? showFinal($, ctx, d, next) : showBatch($, ctx, d, next))
+    } finally {
+      d.finishTurn()
+    }
+  }).catch(($, e, next) => {
+    const pipe = ctx.display
+    const d = findDispatch(pipe, e.message_id, e.index)
+    if (!d) {
+      if (next.called) return next(e)
+      const state = pipe.messages.get(e.message_id)
+      $.ui.toast(RESCUE_NOTICE)
+      return { displayContent: (state ? release(pipe, state) : '') + e.delta }
+    }
+    if (overtaken(ctx, d)) {
+      abandon(d)
+      return { displayContent: '' }
+    }
+    const text = rescue(pipe, d, { final: e.final })
+    markShown(ctx, d)
+    $.ui.toast(RESCUE_NOTICE)
+    return { displayContent: text }
   })
 }

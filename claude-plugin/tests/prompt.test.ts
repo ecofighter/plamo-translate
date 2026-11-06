@@ -265,3 +265,81 @@ test('custom English keeps the prompt fences', async ($, on) => {
   await turnOn($)
   expect(await submit($, '直して\n```\nlog\n```\n')).toEqual({ text: 'Fix this\n\n```\nlog\n```\n' })
 })
+
+interface ClockedHarness {
+  clock: ReturnType<typeof mock.clock>
+  runs: Run[]
+  finished: string[]
+  answers: string[]
+  slow: (run: Run) => boolean
+}
+
+// The fakes answer on the mock clock: the harness holds every hook to its budget in real time.
+function setupClocked(on: any, slow: (run: Run) => boolean): ClockedHarness {
+  const h: ClockedHarness = { clock: mock.clock(on), runs: [], finished: [], answers: [], slow }
+  mock.env(on, { TMPDIR: '/tmp/' })
+  on('session.start', () => ({ cwd: '/work' }))
+  on('command.register', () => ({ value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+  on('session.id', () => ({ value: 'sess1' }))
+  on('fs.write', () => ({ value: undefined }))
+  on('process.run', async ($: unknown, e: Run) => {
+    h.runs.push(e)
+    if (h.slow(e)) await h.clock.sleep(30000)
+    const text = e.init.stdin ?? ''
+    h.finished.push(text)
+    const translation = e.argv[e.argv.indexOf('-s') + 1] === 'ja' ? `EN<${text}>` : `JA:${text}`
+    return { value: { exitCode: 0, stdout: done(translation), stderr: '' } }
+  })
+  on('tool.call', ($: unknown, e: { questions: Array<{ question: string }> }) => {
+    const question = e.questions[0].question
+    return { result: { answers: { [question]: h.answers.shift() ?? LABELS.send } } }
+  })
+  on('prompt.submit', ($: unknown, e: { text: string }) => ({ text: e.text }))
+  on('classic.MessageDisplay', () => ({}))
+  return h
+}
+
+let displayIndex = 0
+const display = ($: any, delta: string) =>
+  $.classic.MessageDisplay({
+    hook_event_name: 'MessageDisplay',
+    session_id: 's',
+    transcript_path: '/t',
+    cwd: '/w',
+    turn_id: 't1',
+    message_id: 'm1',
+    index: displayIndex++,
+    final: false,
+    delta,
+  })
+
+test('a prompt does not wait behind display translations', async ($, on) => {
+  const h = setupClocked(on, (run) => run.init.stdin === 'Slow.')
+  await turnOn($)
+  await submit($, '一つ目')
+  const shown = display($, 'Slow.\n\n')
+  await h.clock.settle()
+  expect(await submit($, '二つ目')).toEqual({ text: 'EN<二つ目>' })
+  expect(h.finished).not.toContain('Slow.')
+  const prompt = h.runs.find((r) => r.init.stdin === '二つ目')!
+  expect(prompt.argv.slice(-2)).toEqual(['--history', '/tmp/plamo-ja-bridge-sess1-1.jsonl'])
+  await h.clock.advance(2000)
+  expect(await shown).toEqual({ displayContent: '' })
+})
+
+test('a prompt translation pauses the display worker', async ($, on) => {
+  const h = setupClocked(on, (run) => run.init.stdin === '直して')
+  await turnOn($)
+  const prompt = submit($, '直して')
+  await h.clock.settle()
+  const shown = display($, 'A.\n\n')
+  await h.clock.settle()
+  await h.clock.advance(2000)
+  expect(await shown).toEqual({ displayContent: '' })
+  expect(h.runs.map((r) => r.init.stdin)).toEqual(['直して'])
+  await h.clock.advance(30000)
+  expect(await prompt).toEqual({ text: 'EN<直して>' })
+  await h.clock.settle()
+  expect(h.runs.map((r) => r.init.stdin)).toEqual(['直して', 'A.'])
+})
