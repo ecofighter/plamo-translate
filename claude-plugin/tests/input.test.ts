@@ -48,3 +48,17 @@ test('withFences appends the prompt fences to custom English', () => {
   expect(withFences('Fix this\n', segments)).toBe('Fix this\n\n```\nlog\n```\n\n~~~\nmore\n~~~')
   expect(withFences('Fix this', [{ kind: 'text', text: '直して' }])).toBe('Fix this')
 })
+
+import { confirmPreview } from '../hooks/lib/input.js'
+
+test('confirmPreview keeps short text and elides long text', () => {
+  const short = 'a'.repeat(1500)
+  expect(confirmPreview(short)).toBe(`英訳を確認してください。\n\n${short}\n\nこの英訳で送りますか?`)
+
+  const long = 'h'.repeat(1200) + 'm'.repeat(500) + 't'.repeat(300)
+  const question = confirmPreview(long)
+  expect(question).toBe(
+    `英訳を確認してください (全 2000 文字、中略あり)。\n\n${'h'.repeat(1200)}\n\n…(中略 500 文字)…\n\n${'t'.repeat(300)}\n\nこの英訳で送りますか?`,
+  )
+  expect(question).not.toContain('m')
+})

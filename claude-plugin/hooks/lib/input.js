@@ -43,3 +43,18 @@ export function withFences(custom, segments) {
   return [custom.replace(/\n+$/, ''), ...fences.map((f) => f.replace(/\n+$/, ''))].join('\n\n') +
     (fences[fences.length - 1].endsWith('\n') ? '\n' : '')
 }
+
+export const CONFIRM_PREVIEW_CHARS = 1500
+const PREVIEW_HEAD_CHARS = 1200
+const PREVIEW_TAIL_CHARS = 300
+
+// A long translation would push the choices off the screen, so the question shows only its ends.
+export function confirmPreview(english) {
+  if (english.length <= CONFIRM_PREVIEW_CHARS) {
+    return `英訳を確認してください。\n\n${english}\n\nこの英訳で送りますか?`
+  }
+  const head = english.slice(0, PREVIEW_HEAD_CHARS)
+  const tail = english.slice(english.length - PREVIEW_TAIL_CHARS)
+  const omitted = english.length - PREVIEW_HEAD_CHARS - PREVIEW_TAIL_CHARS
+  return `英訳を確認してください (全 ${english.length} 文字、中略あり)。\n\n${head}\n\n…(中略 ${omitted} 文字)…\n\n${tail}\n\nこの英訳で送りますか?`
+}
