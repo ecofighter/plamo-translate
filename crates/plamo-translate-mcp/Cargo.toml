@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 futures = "0.3.34"
 plamo-client = { path = "../plamo-client", features = ["schemars"] }
+plamo-doc = { path = "../plamo-doc" }
 rmcp = { version = "=3.8.0", features = ["server", "transport-io", "macros"] }
 schemars = "1"
 serde = { version = "1.0.229", features = ["derive"] }

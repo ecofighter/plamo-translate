@@ -4,7 +4,7 @@ Apple silicon 上で PLaMo-3-translate (MLX) を使い、日英を中心とし�
 
 - `plamo-translated`: Python のデーモン。launchd のソケットアクティベーションで、最初の接続時に起動し、モデルをロードして推論する。アイドルが続くと自分で終了してメモリを解放する
 - `plamo-translate`: Rust 製の CLI
-- `plamo-translate-mcp`: Rust 製の stdio MCP server (`translate` tool)
+- `plamo-translate-mcp`: Rust 製の stdio MCP server (`translate` と `translate_document` tool)
 - Nix flake: パッケージ、home-manager モジュール (nix-darwin から使う)、操作用 app
 
 ## ライセンス
@@ -171,9 +171,26 @@ Claude Desktop のチャットでは `~/Library/Application Support/Claude/claud
 
 Claude Desktop の Code タブのローカルセッションは、このファイルのサーバーも `~/.claude.json` のサーバーも読む。どちらかに登録すれば Code タブでも使える。
 
-`translate` tool が 1 つ使える。引数は `text`、`target_lang` (必須。`ja`、`en`、`zh-hans`、`zh-hant`、`ko`、`fr`、`de`、`es`、`ja(easy)` など)、`source_lang`、`context`、`glossary` (`[{source, target}]`)、`form` (`polite` / `plain`、`target_lang=ja` のときだけ)、`history` (`[{source, translation}]`、同じ文書の前の部分とその訳を古い順に)。config の `glossary_file` も適用され、引数の glossary が優先される。履歴を含めてモデルの上限を超える場合は、古い組から半分ずつ削って再試行し、削ったことを `note:` で始まる 2 つ目の content に書く。打ち切られた訳などの履歴に使えない結果にも同じ形で注記する。
+`translate` と `translate_document` の 2 つの tool が使える。`translate` は短い文向けで、引数は `text`、`target_lang` (必須。`ja`、`en`、`zh-hans`、`zh-hant`、`ko`、`fr`、`de`、`es`、`ja(easy)` など)、`source_lang`、`context`、`glossary` (`[{source, target}]`)、`form` (`polite` / `plain`、`target_lang=ja` のときだけ)、`history` (`[{source, translation}]`、同じ文書の前の部分とその訳を古い順に)。config の `glossary_file` も適用され、引数の glossary が優先される。履歴を含めてモデルの上限を超える場合は、古い組から半分ずつ削って再試行し、削ったことを `note:` で始まる 2 つ目の content に書く。打ち切られた訳などの履歴に使えない結果にも同じ形で注記する。
 
-1 回の呼び出しのタイムアウトは 300 秒 (初回のダウンロードを含むため)。環境変数 `PLAMO_TRANSLATE_MCP_TIMEOUT_SECS` で秒数を変更できる。
+`translate_document` は `plamo-translate doc` と同じ方法で文書全体を訳す。引数は次のとおり。
+
+| 引数 | 内容 |
+|---|---|
+| `text` / `input_path` | 訳す文書。どちらか一方を渡す。`input_path` は UTF-8 のファイルの絶対パス |
+| `output_path` | 訳を書くファイルの絶対パス。`input_path` と別のファイルにする。指定すると、結果は訳ではなく `wrote PATH (M pieces, N bytes)` になる |
+| `overwrite` | `output_path` が既にあるとき上書きする。既定は `false` (あればエラー) |
+| `format` | `auto` / `text` / `markdown`。既定は `auto` |
+| `target_lang` (必須)、`source_lang`、`context`、`glossary`、`form` | `translate` と同じ |
+| `history_path` | 履歴の JSONL (CLI の `--history` と同じ形式) の絶対パス。あれば最初に読む |
+| `history_append` | 訳したピースを `history_path` に追記する (なければ作る)。`history_path` が必要。既定は `false` |
+| `history_bytes` | ピースごとに送る履歴のバイト数。既定は 8000。0 で履歴を使わず、デーモンの対応の確認もしない |
+
+引数の誤り (`text` と `input_path` の両方か片方もない、絶対パスでない、`output_path` が `input_path` と同じかディレクトリ、`history_path` のない `history_append` など) は、デーモンに接続する前にエラーになる。
+
+1 つ目の content は訳 (`output_path` のときは書いたことの要約)。2 つ目の content は訳の一部ではなく、`note:` / `warning:` の行を並べる。`format` が `auto` のときの判定結果、訳さなかったブロック、ピースの警告 (すべての種類)、訳しきれなかったピースの数、履歴の追記の失敗が入る。50 行を超えた分は `note: ... and N more` にまとめる。訳しきれなかったピースがあってもエラーにはならない。途中で止まったときはエラーになり、止まったピースを示す。`text` で渡したときは、それまでの訳を 2 つ目の content で返す。`output_path` のときは `<output_path>.part` に書いていき、最後まで訳せたときだけ `output_path` に名前を変える。失敗すると `.part` が残り、次の呼び出しで上書きされる。同じ `output_path` への同時の呼び出しには対応しない。`text` で渡すと文書が会話に 2 回 (引数と結果) 入るので、ファイルなら `input_path` と `output_path` を使う。
+
+`translate` の 1 回の呼び出しのタイムアウトは 300 秒 (初回のダウンロードを含むため)。環境変数 `PLAMO_TRANSLATE_MCP_TIMEOUT_SECS` で秒数を変更できる。`translate_document` では、この秒数はデーモンから何も届かない時間の上限になる。呼び出し全体の上限は `PLAMO_TRANSLATE_MCP_DOC_TIMEOUT_SECS` (既定 3600 秒)。環境変数は `claude mcp add plamo-translate -e PLAMO_TRANSLATE_MCP_DOC_TIMEOUT_SECS=7200 -- plamo-translate-mcp` のように、Claude Desktop では設定の `"env"` に書く。進捗は MCP の progress 通知で送るが、クライアント側のタイムアウトがそれで延びるかは確かめていない。Claude Code では、長い文書は下の skill (CLI) で訳す方が確実。
 
 ## Claude Code の日英レイヤ (`plamo-ja-bridge`)
 

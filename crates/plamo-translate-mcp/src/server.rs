@@ -1,3 +1,4 @@
+use crate::document::{self, DOCUMENT_DESCRIPTION, TranslateDocumentArgs};
 use futures::StreamExt;
 use plamo_client::{
     Client, Config, Error, ErrorCode, Event, GlossaryEntry, HistoryEntry, TranslateRequest,
@@ -17,8 +18,10 @@ use tokio::time::Instant;
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
 pub const TIMEOUT_ENV: &str = "PLAMO_TRANSLATE_MCP_TIMEOUT_SECS";
+pub const DEFAULT_DOC_TIMEOUT: Duration = Duration::from_secs(3600);
+pub const DOC_TIMEOUT_ENV: &str = "PLAMO_TRANSLATE_MCP_DOC_TIMEOUT_SECS";
 
-const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+pub(crate) const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
 const TOOL_DESCRIPTION: &str = "Translate text with the local PLaMo-3-translate model. \
 target_lang examples: ja, en, zh-hans, zh-hant, ko, fr, de, es, ja(easy) (plain Japanese for learners). \
@@ -26,12 +29,16 @@ form (polite | plain) is only valid when target_lang=ja. \
 glossary entries ({source, target}) are applied on top of the user's configured glossary_file. \
 For a document translated in several calls, pass the earlier parts as history ({source, translation}, oldest first, translation exactly as this tool returned it) to keep terms and style consistent. \
 If the prompt would exceed the model's context window, the oldest history pairs are dropped automatically. \
-A second content block starting with \"note:\" is not part of the translation; follow it.";
+A second content block starting with \"note:\" is not part of the translation; follow it. \
+For a whole document or Markdown with headings, lists or code blocks, use translate_document instead.";
 
 pub struct PlamoServer {
-    client: Client,
-    config_glossary: Vec<GlossaryEntry>,
-    timeout: Duration,
+    pub(crate) client: Client,
+    pub(crate) config_glossary: Vec<GlossaryEntry>,
+    /// The whole `translate` call; for `translate_document`, the wait for each daemon event.
+    pub(crate) timeout: Duration,
+    /// The whole `translate_document` call.
+    pub(crate) doc_timeout: Duration,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
@@ -42,7 +49,7 @@ pub enum Form {
 }
 
 impl Form {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Form::Polite => "polite",
             Form::Plain => "plain",
@@ -79,11 +86,17 @@ enum Attempt {
 }
 
 impl PlamoServer {
-    pub fn new(client: Client, config_glossary: Vec<GlossaryEntry>, timeout: Duration) -> Self {
+    pub fn new(
+        client: Client,
+        config_glossary: Vec<GlossaryEntry>,
+        timeout: Duration,
+        doc_timeout: Duration,
+    ) -> Self {
         Self {
             client,
             config_glossary,
             timeout,
+            doc_timeout,
         }
     }
 
@@ -99,10 +112,12 @@ impl PlamoServer {
             _ => Vec::new(),
         };
         let timeout = parse_timeout(std::env::var(TIMEOUT_ENV).ok().as_deref())?;
+        let doc_timeout = parse_doc_timeout(std::env::var(DOC_TIMEOUT_ENV).ok().as_deref())?;
         Ok(Self::new(
             Client::new(config.socket_path),
             config_glossary,
             timeout,
+            doc_timeout,
         ))
     }
 
@@ -235,6 +250,15 @@ impl PlamoServer {
             }
         }
     }
+
+    #[tool(description = DOCUMENT_DESCRIPTION)]
+    async fn translate_document(
+        &self,
+        Parameters(args): Parameters<TranslateDocumentArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        document::run(self, args, context).await
+    }
 }
 
 #[tool_handler(
@@ -243,7 +267,7 @@ impl PlamoServer {
 )]
 impl ServerHandler for PlamoServer {}
 
-fn error_result(message: String) -> CallToolResult {
+pub(crate) fn error_result(message: String) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message)])
 }
 
@@ -287,7 +311,7 @@ fn context_too_long_text(message: &str, supplied: usize) -> String {
     }
 }
 
-fn describe_client_error(err: &Error) -> String {
+pub(crate) fn describe_client_error(err: &Error) -> String {
     match err {
         Error::DaemonUnreachable {
             socket_path,
@@ -316,12 +340,20 @@ fn code_name(code: ErrorCode) -> &'static str {
 }
 
 pub fn parse_timeout(value: Option<&str>) -> Result<Duration, String> {
+    parse_secs(value, TIMEOUT_ENV, DEFAULT_TIMEOUT)
+}
+
+pub fn parse_doc_timeout(value: Option<&str>) -> Result<Duration, String> {
+    parse_secs(value, DOC_TIMEOUT_ENV, DEFAULT_DOC_TIMEOUT)
+}
+
+fn parse_secs(value: Option<&str>, env: &str, default: Duration) -> Result<Duration, String> {
     match value.map(str::trim) {
-        None | Some("") => Ok(DEFAULT_TIMEOUT),
+        None | Some("") => Ok(default),
         Some(v) => match v.parse::<u64>() {
             Ok(secs) if secs > 0 => Ok(Duration::from_secs(secs)),
             _ => Err(format!(
-                "{TIMEOUT_ENV} must be a positive integer number of seconds, got {v:?}"
+                "{env} must be a positive integer number of seconds, got {v:?}"
             )),
         },
     }
@@ -450,7 +482,7 @@ impl ProgressTracker {
     }
 }
 
-fn stage_label(stage: &str) -> &str {
+pub(crate) fn stage_label(stage: &str) -> &str {
     match stage {
         "downloading" => "downloading model",
         "loading" => "loading model",
