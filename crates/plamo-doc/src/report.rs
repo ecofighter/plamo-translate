@@ -63,8 +63,8 @@ impl fmt::Display for Warning {
 
 #[derive(Debug)]
 pub struct Stop {
-    /// The piece being translated when the run stopped; `None` when no piece was in
-    /// progress (the history preflight, or writing verbatim text between pieces).
+    /// The first piece whose output is incomplete (for a write failure between pieces, the
+    /// next one); `None` only when the history preflight failed.
     pub piece: Option<String>,
     pub cause: StopCause,
 }

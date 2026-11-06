@@ -439,7 +439,11 @@ pub(crate) async fn drive<U: DocUnit, B: Backend, S: Sink>(
     let mut stop = None;
     for item in batch.items {
         let result = match item {
-            Item::Keep(s) => run.write(&s, None).await,
+            Item::Keep(s) => {
+                // Callers resume or report from the first piece whose output is incomplete.
+                let next = (n > 0).then(|| format!("{}/{n}", (index + 1).min(n)));
+                run.write(&s, next.as_deref()).await
+            }
             Item::Unit(u) => {
                 index += 1;
                 let result = ctx.piece(&mut run, u, index, n).await;
@@ -1059,6 +1063,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_error_between_pieces_names_the_next_piece() {
+        let b = ScriptedBackend::new(vec![stop_done("A")]);
+        let items = vec![Item::Keep("```\ncode\n```\n".into()), Item::Unit(t("a"))];
+        let report = drive(&b, job(items), &no_split, &mut FailingSink).await;
+        let stop = report.stop.expect("stopped");
+        assert_eq!(stop.piece.as_deref(), Some("1/1"));
+        assert!(matches!(stop.cause, StopCause::Output(_)));
+        assert!(b.requests().is_empty());
+    }
+
+    #[tokio::test]
     async fn length_split_part_with_structure_issue_is_not_split_again() {
         let b = ScriptedBackend::new(vec![
             length_done("TRUNC"),
@@ -1218,8 +1233,12 @@ mod tests {
         j.record = Some(path.clone());
         let r = run(&b, j, &no_split).await;
         assert_eq!(r.code, 1);
-        let lines: Vec<HistoryEntry> =
-            plamo_client::parse_history(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.ends_with('\n') && !written.contains("\n\n"),
+            "{written:?}"
+        );
+        let lines: Vec<HistoryEntry> = plamo_client::parse_history(&written).unwrap();
         let (s, tr) = t("a").history_pair(" A \n").unwrap();
         assert_eq!(lines, vec![pair("s", "t"), pair(&s, &tr), pair("c", "C")]);
     }
