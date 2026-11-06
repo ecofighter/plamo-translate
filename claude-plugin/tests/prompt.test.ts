@@ -597,3 +597,33 @@ test('the confirm dialog offers the full text for a long translation', async ($,
   expect(h.logs.length).toBe(Math.ceil(english.length / 1900))
   for (const chunk of h.logs) expect(chunk.length).toBeLessThanOrEqual(1900)
 })
+
+// A hook above that settles first, as the user's Esc does: the prompt dispatch beneath it aborts.
+const interrupter = {
+  name: 'interrupter',
+  tier: 'prepend' as const,
+  register: (on: any) => {
+    on('prompt.submit', async ($: any, e: unknown, next: any) => {
+      const inner = next(e)
+      inner.catch(() => {})
+      return Promise.race([inner, $.clock.sleep(1000).then(() => ({ drop: 'interrupted' }))])
+    })
+  },
+}
+
+test('an aborted long prompt resumes the display before doc ends', { plugins: [interrupter] }, async ($, on) => {
+  const h = setupClocked(on, (run) => (run.argv[1] === 'doc' ? 300000 : 0))
+  await turnOn($)
+  const prompt = submit($, LONG_JA)
+  await h.clock.settle()
+  const shown = display($, 'A.\n\n')
+  await h.clock.settle()
+  expect(h.runs.map((r) => r.init.stdin)).toEqual([LONG_JA])
+  await h.clock.advance(1000)
+  expect(await prompt).toEqual({ drop: 'interrupted' })
+  await h.clock.settle()
+  expect(h.runs.map((r) => r.init.stdin)).toEqual([LONG_JA, 'A.'])
+  expect(h.finished).not.toContain(LONG_JA)
+  await h.clock.advance(1000)
+  expect(await shown).toEqual({ displayContent: 'JA:A.\n\n' })
+})

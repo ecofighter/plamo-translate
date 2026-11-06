@@ -348,3 +348,91 @@ test('a rescued batch leaves a debug line and a notice', async ($, on) => {
   expect(h.toasts).toEqual(['表示の翻訳でエラーが起きたため英語のまま表示しました。'])
   expect(h.logs.some((l) => l.includes('rescue'))).toBe(true)
 })
+
+type Reply = { exitCode: number; stdout: string; stderr: string }
+
+interface TimedHarness {
+  clock: ReturnType<typeof mock.clock>
+  runs: Run[]
+  toasts: string[]
+  logs: string[]
+  delays: Map<string, number>
+  reply: (run: Run) => Reply
+}
+
+// Each fake call takes the time `delays` gives its stdin, on the mock clock; `reply` answers it.
+function setupTimed(on: any): TimedHarness {
+  const h: TimedHarness = {
+    clock: mock.clock(on),
+    runs: [],
+    toasts: [],
+    logs: [],
+    delays: new Map(),
+    reply: (run) => ({ exitCode: 0, stdout: done(`JA:${run.init.stdin}`), stderr: '' }),
+  }
+  mock.env(on, { TMPDIR: '/tmp' })
+  on('session.start', () => ({ cwd: '/work' }))
+  on('command.register', () => ({ value: undefined }))
+  on('command.list', () => ({ value: [{ name: 'ja', description: '' }] }))
+  on('ui.status', () => ({ value: undefined }))
+  on('ui.toast', ($: unknown, e: { text: string }) => {
+    h.toasts.push(e.text)
+    return { value: undefined }
+  })
+  on('ui.log', ($: unknown, e: { text: string }) => {
+    h.logs.push(e.text)
+    return { value: undefined }
+  })
+  on('session.id', () => ({ value: 'sess1' }))
+  on('fs.write', () => ({ value: undefined }))
+  on('process.run', async ($: unknown, e: Run) => {
+    h.runs.push(e)
+    const delay = h.delays.get(e.init.stdin ?? '')
+    if (delay !== undefined) await h.clock.sleep(delay)
+    return { value: h.reply(e) }
+  })
+  on('classic.MessageDisplay', () => ({}))
+  return h
+}
+
+async function pass(h: { clock: ReturnType<typeof mock.clock> }, ms: number) {
+  await h.clock.settle()
+  await h.clock.advance(ms)
+}
+
+test('a takeover caps each call by its remaining time and stops near its limit', async ($, on) => {
+  const h = setupTimed(on)
+  h.delays.set('Busy.', 30000)
+  for (const t of ['A.', 'B.', 'C.', 'D.']) h.delays.set(t, 25000)
+  await turnOn($)
+  const busy = show($, 'm0', 'Busy.\n\n')
+  await pass(h, 2000)
+  expect(await busy).toEqual({ displayContent: '' })
+  const last = show($, 'm1', 'A.\n\nB.\n\nC.\n\nD.', true)
+  for (let i = 0; i < 4; i++) await pass(h, 25000)
+  expect(await last).toEqual({ displayContent: 'JA:A.\n\nJA:B.\n\nJA:C.\n\nD.' })
+  const takeover = h.runs.filter((r) => r.init.stdin !== 'Busy.')
+  expect(takeover.map((r) => [r.init.stdin, r.init.timeoutMs])).toEqual([
+    ['A.', 20000],
+    ['B.', 20000],
+    ['C.', 10000],
+  ])
+  expect(h.toasts).toEqual(['一部の段落を英語のまま表示しました (1 件: 間に合わず)。'])
+})
+
+test('a streaming batch starts no help-run with too little time left', async ($, on) => {
+  const h = setupTimed(on)
+  h.delays.set('Slow.', 30000)
+  // No session start, so no worker: the batches translate the queue themselves.
+  await $.command.run({ command: 'ja', args: 'on' })
+  const first = show($, 'm1', 'Slow.\n\n')
+  await pass(h, 2000)
+  expect(await first).toEqual({ displayContent: '' })
+  await pass(h, 26500)
+  const second = show($, 'm1', 'Next.\n\n')
+  await pass(h, 1500)
+  await pass(h, 500)
+  expect(await second).toEqual({ displayContent: 'JA:Slow.\n\n' })
+  expect(h.runs.map((r) => r.init.stdin)).toEqual(['Slow.'])
+  expect(await show($, 'm1', '', true)).toEqual({ displayContent: 'JA:Next.\n\n' })
+})

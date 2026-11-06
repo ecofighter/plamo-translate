@@ -17,6 +17,7 @@ import { tableShapeMatches } from './lib/display.js'
 import { ABORTED, buildDocArgs, docTimeoutMs, parseDocRun, untilAborted, utf8Bytes } from './lib/doc.js'
 import {
   abandon,
+  ABORTED_REASON,
   arrive,
   beginInput,
   beginTakeover,
@@ -56,6 +57,9 @@ const DOC_TOO_OLD_NOTICE = '長文の分割翻訳には plamo-translate 0.2.0 �
 // Failures a run split into pieces can get past; a timeout is not one, since doc would only take longer.
 const DOC_RETRY_REASONS = new Set(['empty translation', 'reserved token in translation'])
 const OUTPUT_TIMEOUT_MS = 20000
+// Half a streaming batch's wait. The takeover's 3 s floor would rule out every help-run, since a
+// streaming batch waits at most 2 s; under 1 s a single call seldom ends before the batch returns.
+const HELP_RUN_MIN_MS = 1000
 const NOTICE_TIMEOUT_MS = 8000
 const DROP_REASON = '送信をやめました。'
 const INPUT_FIRST_REASON = '入力の翻訳を優先'
@@ -107,6 +111,14 @@ function debug($, text) {
   $.ui.log(text, { to: 'debug' })
 }
 
+// For code outside any dispatch, where a throw would end the display worker or turn a wait that
+// should never fire into an expired one: losing a diagnostic line is the lesser harm.
+function debugQuietly($, text) {
+  try {
+    debug($, text)
+  } catch {}
+}
+
 // Translations of input and display can now run at the same time, so each gets a history file of
 // its own; slot 0 keeps the file name used before.
 function acquireHistorySlot(ctx) {
@@ -125,13 +137,13 @@ async function historyPath($, slot) {
 const fixedTimeout = (timeoutMs) => () => ({ timeoutMs })
 
 // Runs one translation, shrinking the history on context_too_long the way the MCP server does.
-// `nextCall()` is asked before every daemon call, reruns included: `{ timeoutMs }` for the call, or
-// `{ stopReason }` to start no further call.
+// `nextCall()` is asked before every daemon call, reruns included: it gives (or resolves to)
+// `{ timeoutMs }` for the call, or `{ stopReason }` to start no further call.
 async function translateNow($, ctx, text, direction, nextCall) {
   const [from, to] = direction === 'ja-en' ? ['ja', 'en'] : ['en', 'ja']
   let history = ctx.memory.select(direction, { maxPairs: ctx.cfg.historyPairs, maxChars: ctx.cfg.historyChars })
   for (;;) {
-    const { timeoutMs, stopReason } = nextCall()
+    const { timeoutMs, stopReason } = await nextCall()
     if (stopReason !== undefined) return { ok: false, reason: stopReason, contextTooLong: false, stopped: true }
     const slot = history.length > 0 ? acquireHistorySlot(ctx) : undefined
     let run
@@ -201,14 +213,24 @@ async function execDoc($, ctx, { text, direction, timeoutMs }) {
   return result
 }
 
-// `pauseDisplay` holds new display work until the process ends, as a prompt's single calls do.
+// `pauseDisplay` holds new display work while the prompt waits on the run. An abort resumes the
+// display at once rather than when the process ends, which can take up to ten minutes; the history
+// file stays claimed until then, and other runs use other files.
 function runDoc($, ctx, { text, direction, timeoutMs, pauseDisplay = false }, signal) {
   if (!docAvailable(ctx)) return Promise.resolve({ ok: false, unsupported: true })
-  if (pauseDisplay) beginInput(ctx.display)
-  const run = execDoc($, ctx, { text, direction, timeoutMs }).finally(() => {
-    if (pauseDisplay) endInput(ctx.display)
+  let paused = pauseDisplay
+  const resumeDisplay = () => {
+    if (!paused) return
+    paused = false
+    endInput(ctx.display)
+  }
+  if (paused) beginInput(ctx.display)
+  const run = execDoc($, ctx, { text, direction, timeoutMs }).finally(resumeDisplay)
+  return untilAborted(run, signal).then((r) => {
+    if (r !== ABORTED) return r
+    resumeDisplay()
+    return { ok: false, reason: 'interrupted' }
   })
-  return untilAborted(run, signal).then((r) => (r === ABORTED ? { ok: false, reason: 'interrupted' } : r))
 }
 
 async function translateInputDoc($, ctx, text, signal) {
@@ -217,7 +239,7 @@ async function translateInputDoc($, ctx, text, signal) {
     const timeoutMs = docTimeoutMs(utf8Bytes(text))
     return await runDoc($, ctx, { text, direction: 'ja-en', timeoutMs, pauseDisplay: true }, signal)
   } finally {
-    $.ui.status(STATUS_TEXT)
+    $.ui.status(ctx.enabled ? STATUS_TEXT : undefined)
   }
 }
 
@@ -304,6 +326,7 @@ async function submitJapanese($, ctx, e, next) {
     if (next.signal.aborted) return { drop: DROP_REASON }
     // An old CLI leaves the single calls, which still translate a long prompt piece by piece.
     if (!doc.unsupported) return sendDocResult($, ctx, e, next, segments, doc, doc.reason)
+    debug($, 'input: doc is unavailable; translating the long prompt piece by piece')
   }
 
   const pairs = []
@@ -364,9 +387,9 @@ async function runDisplayWorker($, ctx, generation) {
       continue
     }
     const result = await runJob(pipe, job, translateJob($, ctx))
-    if (result.failReason !== undefined) debug($, `plamo-ja-bridge: worker job failed: ${result.failReason}`)
+    if (result.failReason !== undefined) debugQuietly($, `plamo-ja-bridge: worker job failed: ${result.failReason}`)
   }
-  debug($, 'display worker superseded by a newer session start')
+  debugQuietly($, 'display worker superseded by a newer session start')
 }
 
 function startDisplayWorker($, ctx) {
@@ -382,7 +405,7 @@ function hostSleep($, ctx, ms, options) {
   return $.clock.sleep(ms, options).catch((err) => {
     if (!options?.signal?.aborted && !ctx.sleepRefusalLogged) {
       ctx.sleepRefusalLogged = true
-      debug($, `display: the host clock refused a wait (${err?.message || 'error'}); waits now end only with their work or the signal`)
+      debugQuietly($, `display: the host clock refused a wait (${err?.message || 'error'}); waits now end only with their work or the signal`)
     }
     return NEVER
   })
@@ -437,14 +460,15 @@ async function showBatch($, ctx, d, next) {
 
   const heldBack = 'display: deadline reached; untranslated blocks are held for a later batch'
   while (hasUnsettled(d)) {
-    // Checked before popping: a help-run started with no time left would only run on after return.
+    // Checked before popping: a help-run started with too little time left would only run on after
+    // return, keeping the daemon busy for a block this batch can no longer show.
     const ms = await waitMs($, next, deadline)
     if (ms === ABORTED || next.signal.aborted || d.abandoned) return {}
     if (ms <= 0) {
       debug($, heldBack)
       break
     }
-    const job = popIfIdle(pipe)
+    const job = ms >= HELP_RUN_MIN_MS ? popIfIdle(pipe) : null
     if (job) debug($, 'display: help-run, translating the next queued block in the batch')
     const waited = await waitFor(
       $,
@@ -473,16 +497,23 @@ async function takeOver($, ctx, d, slots, next) {
   if (slots.length === 0) return true
   const pipe = ctx.display
   beginTakeover(pipe)
-  const started = Date.now()
-  // Asked before every daemon call, history-halving reruns included, so the takeover stays within
-  // its time and starts nothing while a prompt translates.
-  const nextCall = () => {
-    if (pipe.inputActive > 0) return { stopReason: INPUT_FIRST_REASON }
-    const timeoutMs = takeoverTimeoutMs(started, Date.now(), OUTPUT_TIMEOUT_MS)
-    return timeoutMs === null ? { stopReason: MISSED_REASON } : { timeoutMs }
-  }
   const stopped = (reason, left) => debug($, `display: takeover stopped (${reason}); ${left} block(s) shown as written`)
   try {
+    // The host clock, like the dispatch deadlines, so the takeover's limit is one the host can drive.
+    const started = await clockNow($, next.signal)
+    if (started === ABORTED) {
+      stopped('aborted', slots.length)
+      return false
+    }
+    // Asked before every daemon call, history-halving reruns included, so the takeover stays within
+    // its time and starts nothing while a prompt translates.
+    const nextCall = async () => {
+      const now = await clockNow($, next.signal)
+      if (now === ABORTED) return { stopReason: ABORTED_REASON }
+      if (pipe.inputActive > 0) return { stopReason: INPUT_FIRST_REASON }
+      const timeoutMs = takeoverTimeoutMs(started, now, OUTPUT_TIMEOUT_MS)
+      return timeoutMs === null ? { stopReason: MISSED_REASON } : { timeoutMs }
+    }
     for (const [i, slot] of slots.entries()) {
       if (next.signal.aborted || d.abandoned) {
         stopped(next.signal.aborted ? 'aborted' : 'abandoned', slots.length - i)
@@ -631,6 +662,7 @@ export function register(on, options) {
     if (ctx.enabled === undefined) {
       // The read may be another dispatch's, so waiting on it is metered like any other wait.
       const loaded = await waitFor($, ctx, next, next.budget.remainingMs - BUDGET_MARGIN_MS, loadEnabledOnce($, ctx))
+      if (loaded === DEADLINE) debug($, 'display: the on/off switch was still unread at the deadline; batch shown as written')
       if (loaded === ABORTED || loaded === DEADLINE) return {}
     }
     if (!ctx.enabled) {
