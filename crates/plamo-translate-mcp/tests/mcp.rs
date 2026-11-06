@@ -1139,3 +1139,107 @@ async fn document_history_bytes_zero_skips_preflight() {
         assert!(r.get("history").is_none(), "{r}");
     }
 }
+
+#[tokio::test]
+async fn document_rejects_part_path_equal_to_input() {
+    let fake = fake_daemon_fn(echo());
+    let input = fake.path("x.md.part");
+    std::fs::write(&input, "Hi.\n").unwrap();
+    let output = fake.path("x.md");
+    let session = connect(doc_server_for(&fake)).await;
+    let result = call_document(
+        &session,
+        json!({"input_path": path_str(&input), "output_path": path_str(&output), "target_lang": "en"}),
+    )
+    .await;
+    assert!(is_error(&result), "{result}");
+    assert!(
+        text_of(&result)
+            .starts_with("invalid arguments: output_path.part must differ from input_path"),
+        "{result}"
+    );
+    assert_eq!(std::fs::read_to_string(&input).unwrap(), "Hi.\n");
+    assert!(!output.exists());
+    assert!(fake.requests().is_empty());
+}
+
+#[tokio::test]
+async fn document_rejects_history_path_aliasing_document() {
+    let fake = fake_daemon_fn(echo());
+    std::fs::create_dir(fake.path("sub")).unwrap();
+    let input = fake.path("in.md");
+    std::fs::write(&input, "Hi.\n").unwrap();
+    let output = fake.path("out.md");
+    let session = connect(doc_server_for(&fake)).await;
+    let cases = [
+        json!({
+            "input_path": path_str(&input),
+            "history_path": path_str(&fake.path("sub/../in.md")),
+            "history_append": true,
+            "target_lang": "en"
+        }),
+        json!({
+            "input_path": path_str(&input),
+            "output_path": path_str(&output),
+            "history_path": path_str(&output),
+            "target_lang": "en"
+        }),
+        json!({
+            "text": "Hi.",
+            "output_path": path_str(&output),
+            "history_path": path_str(&fake.path("out.md.part")),
+            "history_append": true,
+            "target_lang": "en"
+        }),
+    ];
+    for args in cases {
+        let result = call_document(&session, args.clone()).await;
+        assert!(is_error(&result), "{args}: {result}");
+        assert!(
+            text_of(&result).starts_with(
+                "invalid arguments: history_path must differ from input_path and output_path"
+            ),
+            "{args}: {result}"
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&input).unwrap(), "Hi.\n");
+    assert!(!output.exists());
+    assert!(!fake.path("out.md.part").exists());
+    assert!(fake.requests().is_empty());
+}
+
+#[tokio::test]
+async fn document_text_mode_stop_at_first_piece_promises_no_partial() {
+    let fake = fake_daemon_fn(echo_failing_at(Some(1)));
+    let session = connect(doc_server_for(&fake)).await;
+    let result = call_document(
+        &session,
+        json!({"text": three_paras(), "target_lang": "en"}),
+    )
+    .await;
+    assert!(is_error(&result), "{result}");
+    assert_eq!(text_of(&result), "internal: boom; stopped at piece 1/3");
+    assert_eq!(content_len(&result), 1, "{result}");
+}
+
+// Multi-threaded because the test blocks on the fake daemon while the server must keep running.
+#[tokio::test(flavor = "multi_thread")]
+async fn document_cancellation_closes_daemon_connection() {
+    let fake = fake_daemon_fn(|_, _| {});
+    let session = connect(doc_server_for(&fake)).await;
+    let handle = session
+        .client
+        .send_cancellable_request(
+            ClientRequest::CallToolRequest(Request::new(document_params(
+                json!({"text": "Hello.", "target_lang": "ja", "history_bytes": 0}),
+            ))),
+            PeerRequestOptions::no_options(),
+        )
+        .await
+        .unwrap();
+    fake.requests.recv_timeout(WAIT).unwrap();
+    handle.cancel(Some("test".into())).await.unwrap();
+    fake.closed
+        .recv_timeout(WAIT)
+        .expect("daemon connection was not closed after cancellation");
+}

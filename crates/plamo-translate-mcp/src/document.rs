@@ -165,12 +165,13 @@ fn validate(
             .map_err(|e| format!("cannot read input_path {}: {e}", path.display()))?,
         (None, None) => unreachable!("checked above"),
     };
+    check_distinct_paths(
+        args.input_path.as_deref(),
+        args.output_path.as_deref(),
+        args.history_path.as_deref(),
+    )?;
     let output = match &args.output_path {
-        Some(path) => Some(open_output(
-            path,
-            args.input_path.as_deref(),
-            args.overwrite.unwrap_or(false),
-        )?),
+        Some(path) => Some(open_output(path, args.overwrite.unwrap_or(false))?),
         None => None,
     };
     let seed = match &args.history_path {
@@ -203,28 +204,52 @@ fn validate(
 
 /// Checks the output path and creates (or truncates) `<path>.part`, so that a bad path
 /// fails before any daemon time is spent.
-fn open_output(path: &Path, input: Option<&Path>, overwrite: bool) -> Result<FileOutput, String> {
-    if let Some(input) = input
-        && let (Ok(a), Some(b)) = (std::fs::canonicalize(input), canonical_target(path))
-        && a == b
-    {
-        return Err("invalid arguments: output_path must differ from input_path".into());
-    }
+fn open_output(path: &Path, overwrite: bool) -> Result<FileOutput, String> {
     if path.is_dir() {
         return Err("output_path is a directory".into());
     }
     if path.exists() && !overwrite {
         return Err("output_path exists; pass overwrite=true to replace it".into());
     }
-    let mut part = path.as_os_str().to_owned();
-    part.push(".part");
-    let part = PathBuf::from(part);
+    let part = part_path(path);
     let file = File::create(&part).map_err(|e| format!("cannot create {}: {e}", part.display()))?;
     Ok(FileOutput {
         path: path.to_owned(),
         part,
         file,
     })
+}
+
+/// Refuses paths that name the same file, which would truncate the source document
+/// (output or its `.part`) or append history lines to a document file.
+fn check_distinct_paths(
+    input: Option<&Path>,
+    output: Option<&Path>,
+    history: Option<&Path>,
+) -> Result<(), String> {
+    let input = input.and_then(canonical_target);
+    let output_part = output.and_then(|p| canonical_target(&part_path(p)));
+    let output = output.and_then(canonical_target);
+    let history = history.and_then(canonical_target);
+    let same = |a: &Option<PathBuf>, b: &Option<PathBuf>| a.is_some() && a == b;
+    if same(&output, &input) {
+        return Err("invalid arguments: output_path must differ from input_path".into());
+    }
+    if same(&output_part, &input) {
+        return Err("invalid arguments: output_path.part must differ from input_path".into());
+    }
+    if same(&history, &input) || same(&history, &output) || same(&history, &output_part) {
+        return Err(
+            "invalid arguments: history_path must differ from input_path and output_path".into(),
+        );
+    }
+    Ok(())
+}
+
+fn part_path(path: &Path) -> PathBuf {
+    let mut part = path.as_os_str().to_owned();
+    part.push(".part");
+    PathBuf::from(part)
 }
 
 /// The canonical path `path` names, whether or not the file exists yet.
@@ -337,13 +362,15 @@ fn stopped(stop: &Stop, out: Out, part: Option<&Path>, event_timeout: Duration) 
     let mut message = stop_cause_text(&stop.cause, event_timeout);
     if let Some(label) = &stop.piece {
         message.push_str(&format!("; stopped at piece {label}"));
-        match part {
-            Some(part) => {
+        let translated_before = piece_number(label).saturating_sub(1);
+        match (part, &out) {
+            (Some(part), _) => {
                 message.push_str(&format!("; the pieces before it are in {}", part.display()))
             }
-            None => message.push_str(&format!(
-                "; the {} pieces before it follow in the next content block; to continue, call again with the untranslated remainder",
-                piece_number(label).saturating_sub(1)
+            // Nothing translated yet: there is no partial to point at or remainder to continue from.
+            (None, Out::Text(partial)) if translated_before == 0 || partial.is_empty() => {}
+            (None, _) => message.push_str(&format!(
+                "; the {translated_before} pieces before it follow in the next content block; to continue, call again with the untranslated remainder"
             )),
         }
     }
