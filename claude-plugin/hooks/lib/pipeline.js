@@ -92,6 +92,7 @@ function newSlot(block, messageId) {
     heavy: translatable && utf8Bytes(splitEdges(block.text).core) > OUTPUT_DOC_BYTES,
     text: translatable ? undefined : block.text,
     failReason: undefined,
+    singleReason: undefined,
     partial: false,
     emitted: false,
     settled,
@@ -331,11 +332,13 @@ export async function runJob(pipe, job, translate) {
 }
 
 // Only a slot still running is put back: one claimed or shown meanwhile belongs to that dispatch.
-function requeueJob(pipe, job, { heavy = false }) {
+// `singleReason` is why its single call failed, kept for when doc fails as well.
+function requeueJob(pipe, job, { heavy = false, singleReason }) {
   const { slot } = job
   if (slot.emitted || slot.state !== 'running') return false
   slot.state = 'queued'
   if (heavy) slot.heavy = true
+  if (singleReason !== undefined) slot.singleReason = singleReason
   pipe.queue.unshift(job)
   if (pipe.running === job) pipe.running = null
   wake(pipe)

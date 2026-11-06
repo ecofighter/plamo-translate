@@ -316,18 +316,18 @@ async function sendDocResult($, ctx, e, next, segments, doc, failReason) {
 const worthDoc = (result) =>
   result.contextTooLong || result.reason.startsWith('finish_reason ') || DOC_RETRY_REASONS.has(result.reason)
 
-async function submitJapanese($, ctx, e, next) {
-  const segments = splitFences(e.text)
-  const needsTranslation = (s) => s.kind === 'text' && containsJapanese(s.text)
-  if (!segments.some(needsTranslation)) return next(e)
+const needsTranslation = (s) => s.kind === 'text' && containsJapanese(s.text)
 
+// The translation part of a prompt, without any dialog. Its outcome is one of `{ aborted }`,
+// `{ failure }` (a reason to ask about), `{ doc, failReason }` or `{ english, pairs }`.
+async function translatePrompt($, ctx, text, segments, signal) {
   const japaneseBytes = segments.filter(needsTranslation).reduce((n, s) => n + utf8Bytes(s.text), 0)
   if (japaneseBytes > INPUT_DOC_BYTES && docAvailable(ctx)) {
     debug($, `input: ${japaneseBytes} bytes of Japanese; translating the prompt with doc`)
-    const doc = await translateInputDoc($, ctx, e.text, next.signal)
-    if (next.signal.aborted) return { drop: DROP_REASON }
+    const doc = await translateInputDoc($, ctx, text, signal)
+    if (signal.aborted) return { aborted: true }
     // An old CLI leaves the single calls, which still translate a long prompt piece by piece.
-    if (!doc.unsupported) return sendDocResult($, ctx, e, next, segments, doc, doc.reason)
+    if (!doc.unsupported) return { doc, failReason: doc.reason }
     debug($, 'input: doc is unavailable; translating the long prompt piece by piece')
   }
 
@@ -339,19 +339,39 @@ async function submitJapanese($, ctx, e, next) {
       continue
     }
     const { lead, core, trail } = splitEdges(s.text)
-    const result = await translateInput($, ctx, core, next.signal)
-    if (result === ABORTED) return { drop: DROP_REASON }
+    const result = await translateInput($, ctx, core, signal)
+    if (result === ABORTED) return { aborted: true }
     if (!result.ok) {
-      if (!worthDoc(result) || !docAvailable(ctx)) return askFailure($, e, next, result.reason)
+      if (!worthDoc(result) || !docAvailable(ctx)) return { failure: result.reason }
       debug($, `input: single call failed (${result.reason}); translating the prompt with doc`)
-      const doc = await translateInputDoc($, ctx, e.text, next.signal)
-      if (next.signal.aborted) return { drop: DROP_REASON }
-      return sendDocResult($, ctx, e, next, segments, doc, result.reason)
+      const doc = await translateInputDoc($, ctx, text, signal)
+      if (signal.aborted) return { aborted: true }
+      return { doc, failReason: result.reason }
     }
     const translation = result.text.trim()
     pairs.push({ ja: core, en: translation, finishReason: result.finishReason })
     english += lead + translation + trail
   }
+  return { english, pairs }
+}
+
+async function submitJapanese($, ctx, e, next) {
+  const segments = splitFences(e.text)
+  if (!segments.some(needsTranslation)) return next(e)
+
+  // One pause over every call of the prompt, so no display call slips into the gaps between them;
+  // it ends before any dialog, where the user may take their time.
+  beginInput(ctx.display)
+  let outcome
+  try {
+    outcome = await translatePrompt($, ctx, e.text, segments, next.signal)
+  } finally {
+    endInput(ctx.display)
+  }
+  if (outcome.aborted) return { drop: DROP_REASON }
+  if (outcome.failure !== undefined) return askFailure($, e, next, outcome.failure)
+  if (outcome.doc) return sendDocResult($, ctx, e, next, segments, outcome.doc, outcome.failReason)
+  const { english, pairs } = outcome
 
   const answer = ctx.cfg.confirm ? await confirmEnglish($, english, [], next.signal) : LABELS.send
   return send(ctx, e, next, segments, english, answer, () => {
@@ -363,7 +383,9 @@ async function submitJapanese($, ctx, e, next) {
 // `singleReason` is what a failed doc run reports, when a single call failed first.
 async function translateBlockWithDoc($, ctx, block, { lead, core, trail }, { nextCall, signal }, singleReason) {
   const { timeoutMs, stopReason } = await nextCall(docTimeoutMs(utf8Bytes(core)))
-  if (stopReason !== undefined) return { text: block.text, failReason: stopReason, stopped: true }
+  if (stopReason !== undefined) {
+    return { text: block.text, failReason: stopReason, stopped: true, needsDoc: true, singleReason }
+  }
   const doc = await runDoc($, ctx, { text: core, direction: 'en-ja', timeoutMs }, signal)
   // The takeover already showed the block and logged its stop; anything more would contradict it.
   if (signal?.aborted) return { text: block.text, failReason: ABORTED_REASON }
@@ -394,10 +416,14 @@ async function translateBlock($, ctx, slot, { nextCall, signal, deferDoc = false
   const calls = { nextCall, signal }
 
   if (slot.heavy && docAvailable(ctx)) {
-    debug($, `display: ${utf8Bytes(core)} bytes in one block; translating it with doc`)
-    const doc = await translateBlockWithDoc($, ctx, block, edges, calls, undefined)
+    if (slot.singleReason !== undefined) {
+      debug($, `display: translating a block with doc after its single call failed (${slot.singleReason})`)
+    } else {
+      debug($, `display: ${utf8Bytes(core)} bytes in one block; translating it with doc`)
+    }
+    const doc = await translateBlockWithDoc($, ctx, block, edges, calls, slot.singleReason)
     if (doc) return doc
-    debug($, 'display: doc is unavailable; translating the long block with a single call')
+    debug($, 'display: doc is unavailable; translating the block with a single call')
   }
 
   const result = await translateNow($, ctx, core, 'en-ja', () => nextCall(OUTPUT_TIMEOUT_MS))
@@ -418,7 +444,7 @@ async function translateBlock($, ctx, slot, { nextCall, signal, deferDoc = false
   if (!docAvailable(ctx)) return { text: block.text, failReason }
   if (deferDoc) {
     debug($, `display: single call failed (${failReason}); the block is left for the final batch to translate with doc`)
-    return { requeue: true, heavy: true }
+    return { requeue: true, heavy: true, singleReason: failReason }
   }
   debug($, `display: single call failed (${failReason}); translating the block with doc`)
   return (await translateBlockWithDoc($, ctx, block, edges, calls, failReason)) ?? { text: block.text, failReason }
@@ -430,11 +456,14 @@ const yieldToInput = (pipe) => (callMax) =>
   pipe.inputActive > 0 ? { stopReason: INPUT_FIRST_REASON } : { timeoutMs: callMax }
 
 // A block stopped for a prompt is not a failure: it goes back to the queue, to run after the prompt
-// or to be taken over by the final batch. A help-run leaves doc to the final batch, whose takeover is
-// bounded by its time limit and the dispatch's signal; a help-run's work outlives its dispatch.
+// or to be taken over by the final batch. One stopped at its doc step goes back as heavy, with its
+// single-call reason, so no one repeats the call that already failed. A help-run leaves doc to the
+// final batch, whose takeover is bounded by its time limit and the dispatch's signal; a help-run's
+// work outlives its dispatch.
 const translateJob = ($, ctx, { deferDoc }) => async (slot) => {
   const result = await translateBlock($, ctx, slot, { nextCall: yieldToInput(ctx.display), deferDoc })
-  return result.stopped ? { requeue: true } : result
+  if (!result.stopped) return result
+  return { requeue: true, heavy: result.needsDoc === true, singleReason: result.singleReason }
 }
 
 // Display translations run here, outside any dispatch, so no dispatch waits on them past its budget.
