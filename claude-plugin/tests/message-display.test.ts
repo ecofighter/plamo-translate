@@ -619,3 +619,27 @@ test('no display call starts between two text segments of a prompt', { options: 
   await pass(h, 0)
   expect(runKinds(h)).toEqual(['single:一つ目です。', 'single:二つ目です。', 'single:World.'])
 })
+
+test('the worker starts no doc retry for a block the final batch already showed', async ($, on) => {
+  const h = setupTimed(on)
+  h.delays.set('Slow.', 30000)
+  h.reply = (run) => {
+    if (isDoc(run)) return docReply(`DOC:${run.init.stdin}\n`)
+    if (run.init.stdin === 'Slow.') return singleReply('途中まで', 'length')
+    return singleReply(`JA:${run.init.stdin}`)
+  }
+  await turnOn($)
+  const first = show($, 'm1', 'Slow.\n\n')
+  await pass(h, 2000)
+  expect(await first).toEqual({ displayContent: '' })
+  const last = show($, 'm1', '', true)
+  await pass(h, 8000)
+  expect(await last).toEqual({ displayContent: 'Slow.\n\n' })
+  await pass(h, 20000)
+  await pass(h, 0)
+  expect(runKinds(h)).toEqual(['single:Slow.'])
+  const next = show($, 'm2', 'Next.\n\n')
+  await pass(h, 0)
+  expect(await next).toEqual({ displayContent: 'JA:Next.\n\n' })
+  expect(runKinds(h)).toEqual(['single:Slow.', 'single:Next.'])
+})

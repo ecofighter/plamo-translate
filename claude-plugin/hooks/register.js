@@ -63,6 +63,7 @@ const HELP_RUN_MIN_MS = 1000
 const NOTICE_TIMEOUT_MS = 8000
 const DROP_REASON = '送信をやめました。'
 const INPUT_FIRST_REASON = '入力の翻訳を優先'
+const SETTLED_ELSEWHERE_REASON = 'block already shown or claimed'
 const TABLE_SHAPE_REASON = 'table shape changed'
 const RESCUE_NOTICE = '表示の翻訳でエラーが起きたため英語のまま表示しました。'
 // The engine replaces the plugin's copy mid-session (a hooks worker respawn) and runs register and
@@ -170,12 +171,27 @@ async function translateNow($, ctx, text, direction, nextCall) {
   }
 }
 
-// The display side starts nothing new while a prompt translates: the daemon serves one request at a
-// time, and the prompt is what the user is waiting on.
-function translateInput($, ctx, text, signal) {
+// Returns the resume, which may be called more than once: on abort and again when the process ends.
+function pauseDisplay(ctx) {
+  let paused = true
   beginInput(ctx.display)
-  const run = translateNow($, ctx, text, 'ja-en', fixedTimeout(INPUT_TIMEOUT_MS)).finally(() => endInput(ctx.display))
-  return untilAborted(run, signal)
+  return () => {
+    if (!paused) return
+    paused = false
+    endInput(ctx.display)
+  }
+}
+
+// The display side starts nothing new while a prompt translates: the daemon serves one request at a
+// time, and the prompt is what the user is waiting on. An abort resumes the display at once, as a doc
+// run's does: no one waits on the prompt any more.
+function translateInput($, ctx, text, signal) {
+  const resumeDisplay = pauseDisplay(ctx)
+  const run = translateNow($, ctx, text, 'ja-en', fixedTimeout(INPUT_TIMEOUT_MS)).finally(resumeDisplay)
+  return untilAborted(run, signal).then((r) => {
+    if (r === ABORTED) resumeDisplay()
+    return r
+  })
 }
 
 const docAvailable = (ctx) => ctx.cfg.useDoc && !ctx.docTooOld
@@ -216,15 +232,9 @@ async function execDoc($, ctx, { text, direction, timeoutMs }) {
 // `pauseDisplay` holds new display work while the prompt waits on the run. An abort resumes the
 // display at once rather than when the process ends, which can take up to ten minutes; the history
 // file stays claimed until then, and other runs use other files.
-function runDoc($, ctx, { text, direction, timeoutMs, pauseDisplay = false }, signal) {
+function runDoc($, ctx, { text, direction, timeoutMs, pauseDisplay: pause = false }, signal) {
   if (!docAvailable(ctx)) return Promise.resolve({ ok: false, unsupported: true })
-  let paused = pauseDisplay
-  const resumeDisplay = () => {
-    if (!paused) return
-    paused = false
-    endInput(ctx.display)
-  }
-  if (paused) beginInput(ctx.display)
+  const resumeDisplay = pause ? pauseDisplay(ctx) : () => {}
   const run = execDoc($, ctx, { text, direction, timeoutMs }).finally(resumeDisplay)
   // The display worker has no dispatch, so nothing can abort its run.
   if (!signal) return run
@@ -451,9 +461,13 @@ async function translateBlock($, ctx, slot, { nextCall, signal, deferDoc = false
 }
 
 // Outside a takeover a call is bounded only by its own kind's limit, and none starts while a prompt
-// translates: the daemon serves one request at a time.
-const yieldToInput = (pipe) => (callMax) =>
-  pipe.inputActive > 0 ? { stopReason: INPUT_FIRST_REASON } : { timeoutMs: callMax }
+// translates: the daemon serves one request at a time. None starts either once the block was shown or
+// claimed elsewhere, since its result could no longer be shown and would only hold the daemon (a doc
+// retry for up to minutes) from the blocks still waiting.
+const yieldToInput = (pipe, slot) => (callMax) => {
+  if (slot.state !== 'running') return { stopReason: SETTLED_ELSEWHERE_REASON }
+  return pipe.inputActive > 0 ? { stopReason: INPUT_FIRST_REASON } : { timeoutMs: callMax }
+}
 
 // A block stopped for a prompt is not a failure: it goes back to the queue, to run after the prompt
 // or to be taken over by the final batch. One stopped at its doc step goes back as heavy, with its
@@ -461,7 +475,7 @@ const yieldToInput = (pipe) => (callMax) =>
 // final batch, whose takeover is bounded by its time limit and the dispatch's signal; a help-run's
 // work outlives its dispatch.
 const translateJob = ($, ctx, { deferDoc }) => async (slot) => {
-  const result = await translateBlock($, ctx, slot, { nextCall: yieldToInput(ctx.display), deferDoc })
+  const result = await translateBlock($, ctx, slot, { nextCall: yieldToInput(ctx.display, slot), deferDoc })
   if (!result.stopped) return result
   return { requeue: true, heavy: result.needsDoc === true, singleReason: result.singleReason }
 }
