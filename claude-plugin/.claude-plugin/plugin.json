@@ -52,6 +52,12 @@
       "description": "Show a paragraph without blank lines after this many lines",
       "default": 20,
       "min": 1
+    },
+    "useDoc": {
+      "type": "boolean",
+      "title": "Use plamo-translate doc for long text",
+      "description": "Translate long prompts, and reply blocks a single call cannot handle, with `plamo-translate doc` (needs plamo-translate 0.2.0+)",
+      "default": true
     }
   }
 }

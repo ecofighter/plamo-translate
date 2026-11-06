@@ -9,6 +9,7 @@ const DEFAULTS = {
   historyChars: 6000,
   form: undefined,
   flushLines: 20,
+  useDoc: true,
 }
 
 test('defaults when no options are given', () => {
@@ -37,4 +38,15 @@ test('invalid values fall back to defaults', () => {
 
 test('zero history pairs is allowed', () => {
   expect(resolveConfig({ historyPairs: 0 }).historyPairs).toBe(0)
+})
+
+test('useDoc defaults to true', () => {
+  expect(resolveConfig({}).useDoc).toBe(true)
+  expect(resolveConfig(undefined).useDoc).toBe(true)
+})
+
+test('useDoc false is kept, non-boolean falls back', () => {
+  expect(resolveConfig({ useDoc: false }).useDoc).toBe(false)
+  expect(resolveConfig({ useDoc: 'no' }).useDoc).toBe(true)
+  expect(resolveConfig({ useDoc: 0 }).useDoc).toBe(true)
 })

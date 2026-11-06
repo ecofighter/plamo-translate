@@ -6,6 +6,7 @@ const DEFAULTS = Object.freeze({
   historyChars: 6000,
   form: undefined,
   flushLines: 20,
+  useDoc: true,
 })
 
 const isNonNegativeInt = (v) => Number.isInteger(v) && v >= 0
@@ -21,5 +22,6 @@ export function resolveConfig(options) {
     historyChars: isNonNegativeInt(o.historyChars) ? o.historyChars : DEFAULTS.historyChars,
     form: o.form === 'polite' || o.form === 'plain' ? o.form : DEFAULTS.form,
     flushLines: isPositiveInt(o.flushLines) ? o.flushLines : DEFAULTS.flushLines,
+    useDoc: typeof o.useDoc === 'boolean' ? o.useDoc : DEFAULTS.useDoc,
   }
 }
