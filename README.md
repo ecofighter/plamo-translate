@@ -194,7 +194,7 @@ Claude Desktop の Code タブのローカルセッションは、このファ�
 
 ## Claude Code の日英レイヤ (`plamo-ja-bridge`)
 
-Claude Code の mod。日本語で入力すると英訳して Claude に送り、Claude の英語の応答を段落ごとに和訳して表示する。Claude には英文だけが届き、transcript にも英文が残る。翻訳には `plamo-translate` CLI を使うので、CLI とデーモンを先に導入しておく。動作はターミナルの Claude Code v2.1.317 で確かめた。Claude Desktop の Code タブでは確かめていない。
+Claude Code の mod。日本語で入力すると英訳して Claude に送り、Claude の英語の応答を段落ごとに和訳して表示する。Claude には英文だけが届き、transcript にも英文が残る。翻訳には `plamo-translate` CLI を使うので、CLI とデーモンを先に導入しておく。文書ファイルを訳す skill (下記) も含む。動作はターミナルの Claude Code v2.1.317 で確かめた。Claude Desktop の Code タブでは確かめていない。
 
 ### 導入
 
@@ -260,6 +260,18 @@ Desktop は起動時にログインシェルの環境変数を読む。`plamo-tr
 - ツールの呼び出しと結果、許可の確認、選択肢つきの質問、思考過程は英語のまま表示する。
 - 和訳は Claude の生成より遅れて表示され、応答が終わってから数秒かかることがある。和訳が終わる前に次のプロンプトを送ると、その応答は英語の原文で表示されることがある。
 - Claude が日本語で答えた段落は、そのまま表示する。
+
+### 文書ファイルの翻訳 (skill)
+
+`translate-document` skill を含む。Markdown やテキストのファイルの翻訳を頼むと (例: 「docs/guide.md を英訳して」)、Claude が `plamo-translate doc` を実行して訳を別のファイルに書く。`/plamo-ja-bridge:translate-document docs/guide.md en` で明示的に呼ぶこともできる。`/ja` のオン・オフとは関係なく使える。
+
+- 0.2.0 以降の CLI が必要 (`--report json` を使う)。plugin と CLI は別々に更新されるので、CLI が古いと訳さずに更新を促す
+- 出力は元のファイルと同じ場所の `<名前>.<言語>.<拡張子>` (`README.md` → `README.ja.md`)。同じ名前のファイルがあれば上書きの前に確認する。訳先を指定しなければ、日本語の文書は英語に、それ以外は日本語に訳す
+- `plamo-translate doc` は、skill を呼び出したターンの間だけ確認なしで実行する。後のターンでの再実行や、出力ファイルへの書き込み (`>`) は、通常どおり権限の確認を受ける
+- 用語集や履歴のファイルは、頼んだときだけ出力と同じ場所に作る
+- 訳しきれなかったピースや途中での停止は、Claude が `--report json` の要約をもとに報告する
+- 訳を公開するときは、モデルの出力であることを明示する (「ライセンス」を参照)。Claude は最後にそのことを伝え、ファイルの先頭に注記を入れるかを尋ねる
+- この plugin は MCP server を含まない。MCP の `translate_document` を使うときは「使い方 (MCP)」のとおり別に登録する
 
 ## 設定 (`config.toml`)
 

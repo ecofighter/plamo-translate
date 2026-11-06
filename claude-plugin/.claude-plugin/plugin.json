@@ -1,7 +1,7 @@
 {
   "name": "plamo-ja-bridge",
   "version": "0.1.1",
-  "description": "Translate Japanese prompts to English and English replies to Japanese with plamo-translate",
+  "description": "Translate Japanese prompts to English and English replies to Japanese, and translate documents, with plamo-translate",
   "author": { "name": "Shota Arakaki" },
   "repository": "https://github.com/ecofighter/plamo-translate",
   "license": "MIT OR Apache-2.0",

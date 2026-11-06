@@ -8,7 +8,7 @@
     {
       "name": "plamo-ja-bridge",
       "source": "./claude-plugin",
-      "description": "Japanese-English translation layer for Claude Code using plamo-translate"
+      "description": "Japanese-English translation layer and document translation skill for Claude Code using plamo-translate"
     }
   ]
 }
