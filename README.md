@@ -107,12 +107,13 @@ plamo-translate doc -t en --format text --history-bytes 0 < notes.txt
 
 | オプション | 内容 |
 |---|---|
-| `--format auto\|text\|markdown` | 入力の形式。既定は `auto` で、内容から判定して stderr に `note: input format: markdown (auto-detected; use --format to override)` を出す。この `note:` は `auto` のときだけ出る |
+| `--format auto\|text\|markdown` | 入力の形式。既定は `auto` で、内容から判定する。判定の結果は `--verbose` のときだけ stderr に `note: input format: markdown (auto-detected; use --format to override)` で出る |
 | `--history FILE` | 履歴の JSONL (形式は上と同じ)。文書の前の部分として扱い、最初のピースから履歴に入る。stdin は文書用なので `-` は指定できない |
 | `--history-last N` | `--history` のうち新しい N 組だけを読む。読み込み時の絞り込みだけで、訳したピースには効かない |
 | `--history-append` | 訳したピースを 1 つ書くたびに、原文と訳文の組を `--history` のファイルに追記する (なければ作る)。途中から再開する機能はない |
 | `--history-bytes BYTES` | ピースごとに送る履歴の大きさ (UTF-8 のバイト数、原文と訳文の合計)。既定は 8000。新しい組から古い方へ入れ、収まらなくなったところで止める。最新の 1 組は常に送る。0 で履歴を使わない |
 | `--report text\|json` | stderr の形式。既定は `text`。`json` では stderr を 1 行に 1 つの JSON (JSON Lines) で書き、最後の行に結果の要約を出す (下記)。stdout は変わらない。0.2.0 から |
+| `--verbose` | 判定した入力の形式 (`note: input format: …`) と、履歴に使わなかったピースの警告 (`warning: piece N/M: not used as history: …`) も stderr に出す。ほかの警告とエラーは指定しなくても出る。訳と終了コードは変わらない。`--report json` では無視される。0.2.0 から |
 | `-t, -s, --context, --context-file, --glossary, --form` | 上の表と同じ |
 
 `TEXT`、`--no-stream`、`--json` はない。プログラムから結果を読むときは `--report json` を使う。オプションは `doc` の後ろに書く。`plamo-translate -t ja doc` は単語 "doc" の翻訳になり、`plamo-translate doc` はこのサブコマンドを実行する。単語 "doc" を訳すときは `echo doc | plamo-translate -t en` のように stdin で渡す。

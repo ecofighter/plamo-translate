@@ -54,11 +54,16 @@ pub struct DocArgs {
     /// Diagnostics on stderr: human-readable text, or JSON Lines ending with a summary object
     #[arg(long, value_enum, default_value_t = ReportArg::Text)]
     report: ReportArg,
+    /// Also print the lines that say nothing about the output text (detected input format, pieces not used as history)
+    #[arg(long)]
+    verbose: bool,
 }
 
 pub async fn run(client: &Client, config: &Config, args: DocArgs) -> i32 {
     let diag = match args.report {
-        ReportArg::Text => Diag::Text,
+        ReportArg::Text => Diag::Text {
+            verbose: args.verbose,
+        },
         ReportArg::Json => Diag::Json,
     };
     let mut stderr = std::io::stderr();
@@ -143,7 +148,7 @@ pub async fn run(client: &Client, config: &Config, args: DocArgs) -> i32 {
         warnings: Vec::new(),
         progress: Progress {
             // Json mode promises that stderr holds nothing but JSON Lines.
-            enabled: diag == Diag::Text && std::io::stderr().is_terminal(),
+            enabled: !diag.is_json() && std::io::stderr().is_terminal(),
             dirty: false,
             prefix: String::new(),
         },
@@ -236,7 +241,7 @@ fn exit_code(report: &Report) -> i32 {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Diag {
-    Text,
+    Text { verbose: bool },
     Json,
 }
 
@@ -245,10 +250,14 @@ fn emit(w: &mut dyn Write, value: Value) {
 }
 
 impl Diag {
+    fn is_json(self) -> bool {
+        self == Diag::Json
+    }
+
     fn usage_error(self, w: &mut dyn Write, message: impl std::fmt::Display) -> i32 {
         let code = ExitCode::Usage as i32;
         match self {
-            Diag::Text => {
+            Diag::Text { .. } => {
                 let _ = writeln!(w, "error: {message}");
             }
             Diag::Json => {
@@ -265,8 +274,8 @@ impl Diag {
     fn render_prelude(self, w: &mut dyn Write, doc: &Document) {
         let detected = doc.format_detected();
         match self {
-            Diag::Text => {
-                if detected {
+            Diag::Text { verbose } => {
+                if detected && verbose {
                     render_format_note(w, doc.format());
                 }
             }
@@ -278,7 +287,7 @@ impl Diag {
         for note in doc.notes() {
             if note.kind != NoteKind::IndentedCode || detected {
                 match self {
-                    Diag::Text => render_note(w, note),
+                    Diag::Text { .. } => render_note(w, note),
                     Diag::Json => emit(
                         w,
                         json!({
@@ -295,7 +304,11 @@ impl Diag {
 
     fn render_warning(self, w: &mut dyn Write, warning: &Warning) {
         match self {
-            Diag::Text => render_warning(w, warning),
+            Diag::Text { verbose } => {
+                if verbose || !warning.kind.informational() {
+                    render_warning(w, warning);
+                }
+            }
             Diag::Json if warning.kind == WarningKind::HistoryAppend => emit(
                 w,
                 json!({"type": "error", "kind": "history_append", "message": warning.message}),
@@ -315,7 +328,7 @@ impl Diag {
 
     fn render_stdout_failure(self, w: &mut dyn Write, e: &std::io::Error) {
         match self {
-            Diag::Text => {
+            Diag::Text { .. } => {
                 let _ = writeln!(w, "error: cannot write stdout: {e}");
             }
             Diag::Json => emit(
@@ -327,7 +340,7 @@ impl Diag {
 
     fn render_trailer(self, w: &mut dyn Write, report: &Report) {
         match self {
-            Diag::Text => render_trailer(w, report),
+            Diag::Text { .. } => render_trailer(w, report),
             Diag::Json => {
                 if let Some(stop) = &report.stop {
                     emit(w, stop_json(stop));

@@ -438,7 +438,7 @@ fn doc_driver_auto_format_prints_a_note() {
     let input = "# Title\n\nBody text.\n";
     let f = fake_daemon_fn(echo("history"));
     cmd(&f)
-        .args(["doc", "-t", "en"])
+        .args(["doc", "-t", "en", "--verbose"])
         .write_stdin(input)
         .assert()
         .success()
@@ -642,4 +642,59 @@ fn version_is_0_2_0() {
         .assert()
         .success()
         .stdout("plamo-translate 0.2.0\n");
+}
+
+fn done_without_finish_reason(text: &str) -> String {
+    serde_json::json!({
+        "type": "done",
+        "text": text,
+        "finish_reason": null,
+        "usage": null,
+        "model": "m",
+        "revision": "r",
+    })
+    .to_string()
+}
+
+fn unfinished_history_daemon() -> Fake {
+    fake_daemon_fn(|req| match req["op"].as_str() {
+        Some("status") => vec![status_line("history")],
+        _ => vec![done_without_finish_reason(req["text"].as_str().unwrap())],
+    })
+}
+
+#[test]
+fn doc_default_stderr_hides_format_note_and_not_history() {
+    let f = unfinished_history_daemon();
+    cmd(&f)
+        .args(["doc", "-t", "en"])
+        .write_stdin("# Title\n\nBody text.\n")
+        .assert()
+        .success()
+        .stderr("");
+}
+
+#[test]
+fn doc_verbose_shows_format_note_and_not_history() {
+    let f = unfinished_history_daemon();
+    cmd(&f)
+        .args(["doc", "-t", "en", "--verbose"])
+        .write_stdin("# Title\n\nBody text.\n")
+        .assert()
+        .success()
+        .stderr(contains(
+            "note: input format: markdown (auto-detected; use --format to override)",
+        ))
+        .stderr(contains("not used as history"));
+}
+
+#[test]
+fn doc_default_stderr_keeps_untranslated_block_warning() {
+    let f = fake_daemon_fn(echo("history"));
+    cmd(&f)
+        .args(["doc", "-t", "en"])
+        .write_stdin("# Title\n\nBody text.\n\n<div>raw html</div>\n")
+        .assert()
+        .success()
+        .stderr(contains("warning: line 5: HTML block left untranslated"));
 }
