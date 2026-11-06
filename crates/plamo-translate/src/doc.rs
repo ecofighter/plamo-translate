@@ -1,14 +1,16 @@
 use crate::EXIT_INTERRUPTED;
 use crate::ExitCode;
 use crate::translate::{
-    Progress, RequestOpts, load_opts, read_history, usage_error, write_daemon_error, write_error,
+    Progress, RequestOpts, load_opts, read_history, write_daemon_error, write_error,
 };
 use clap::Args;
 use plamo_client::{Client, Config, Error, TranslateRequest, resolve_target};
 use plamo_doc::{
-    ClientBackend, Format, Job, Limits, Note, NoteKind, ProgressEvent, Report, Sink, Stop,
-    StopCause, Warning, WarningKind, prepare, translate,
+    ClientBackend, Document, Format, Job, Limits, Note, NoteKind, ProgressEvent, Report, Sink,
+    Stop, StopCause, Warning, WarningKind, error_code_name, prepare, translate,
 };
+use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 
@@ -18,6 +20,13 @@ enum FormatArg {
     Auto,
     Text,
     Markdown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, clap::ValueEnum)]
+enum ReportArg {
+    #[default]
+    Text,
+    Json,
 }
 
 #[derive(Args)]
@@ -42,59 +51,69 @@ pub struct DocArgs {
     /// History sent with each piece, in UTF-8 bytes (the newest pair is always sent); 0 disables history
     #[arg(long, value_name = "BYTES", default_value_t = 8000)]
     history_bytes: usize,
+    /// Diagnostics on stderr: human-readable text, or JSON Lines ending with a summary object
+    #[arg(long, value_enum, default_value_t = ReportArg::Text)]
+    report: ReportArg,
 }
 
 pub async fn run(client: &Client, config: &Config, args: DocArgs) -> i32 {
+    let diag = match args.report {
+        ReportArg::Text => Diag::Text,
+        ReportArg::Json => Diag::Json,
+    };
+    let mut stderr = std::io::stderr();
     let mut input = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut input) {
-        return usage_error(format!("cannot read stdin: {e}"));
+        return diag.usage_error(&mut stderr, format!("cannot read stdin: {e}"));
     }
     if input.trim().is_empty() {
-        return usage_error("no text given (pipe the document to stdin)");
+        return diag.usage_error(&mut stderr, "no text given (pipe the document to stdin)");
     }
     let opts = match load_opts(config, args.opts) {
         Ok(o) => o,
-        Err(m) => return usage_error(m),
+        Err(m) => return diag.usage_error(&mut stderr, m),
     };
     let seed = match &args.history {
         Some(p) if p.as_os_str() == "-" => {
-            return usage_error(
+            return diag.usage_error(
+                &mut stderr,
                 "--history does not read stdin (stdin is reserved for the document); pass a file path",
             );
         }
         Some(p) => match read_history(p, args.history_append, args.history_last) {
             Ok(h) => h,
-            Err(m) => return usage_error(m),
+            Err(m) => return diag.usage_error(&mut stderr, m),
         },
         None => Vec::new(),
     };
     let record = args.history.filter(|_| args.history_append);
     let doc = prepare(&input, into_format(args.format), &Limits::default());
-    let auto = doc.format_detected();
+    let format = doc.format();
+    let pieces = doc.pieces();
 
-    let mut stderr = std::io::stderr();
-    if auto {
-        render_format_note(&mut stderr, doc.format());
-    }
-    for note in doc.notes() {
-        if note.kind != NoteKind::IndentedCode || auto {
-            render_note(&mut stderr, note);
-        }
-    }
+    diag.render_prelude(&mut stderr, &doc);
 
     let mut stdout = std::io::stdout();
     // Before resolving the target: with nothing to translate, "auto" has no text to look at.
-    if doc.pieces() == 0 {
+    if pieces == 0 {
         let written = stdout
             .write_all(input.as_bytes())
             .and_then(|()| stdout.flush());
-        return match written {
-            Ok(()) => ExitCode::Ok as i32,
+        let (code, complete) = match written {
+            Ok(()) => (ExitCode::Ok as i32, true),
             Err(e) => {
-                let _ = writeln!(stderr, "error: cannot write stdout: {e}");
-                ExitCode::Translation as i32
+                diag.render_stdout_failure(&mut stderr, &e);
+                (ExitCode::Translation as i32, false)
             }
         };
+        diag.render_summary(
+            &mut stderr,
+            &Summary {
+                complete,
+                ..Summary::empty(code, Some(format))
+            },
+        );
+        return code;
     }
 
     let target_lang = match opts.to {
@@ -120,8 +139,11 @@ pub async fn run(client: &Client, config: &Config, args: DocArgs) -> i32 {
     let mut sink = CliSink {
         stdout,
         stderr,
+        diag,
+        warnings: Vec::new(),
         progress: Progress {
-            enabled: std::io::stderr().is_terminal(),
+            // Json mode promises that stderr holds nothing but JSON Lines.
+            enabled: diag == Diag::Text && std::io::stderr().is_terminal(),
             dirty: false,
             prefix: String::new(),
         },
@@ -137,10 +159,18 @@ pub async fn run(client: &Client, config: &Config, args: DocArgs) -> i32 {
     sink.progress.clear();
     match report {
         Some(report) => {
-            render_trailer(&mut sink.stderr, &report);
-            exit_code(&report)
+            let code = exit_code(&report);
+            diag.render_trailer(&mut sink.stderr, &report);
+            diag.render_summary(&mut sink.stderr, &Summary::of_report(&report, code, format));
+            code
         }
-        None => EXIT_INTERRUPTED,
+        None => {
+            // The run was dropped mid-flight, so its report is gone; rebuild the counts
+            // from the warnings the sink saw.
+            let summary = Summary::interrupted(&sink.warnings, pieces, format);
+            diag.render_summary(&mut sink.stderr, &summary);
+            EXIT_INTERRUPTED
+        }
     }
 }
 
@@ -155,6 +185,8 @@ fn into_format(arg: FormatArg) -> Option<Format> {
 struct CliSink {
     stdout: std::io::Stdout,
     stderr: std::io::Stderr,
+    diag: Diag,
+    warnings: Vec<Warning>,
     progress: Progress,
 }
 
@@ -167,7 +199,8 @@ impl Sink for CliSink {
 
     async fn warn(&mut self, warning: &Warning) {
         self.progress.clear();
-        render_warning(&mut self.stderr, warning);
+        self.diag.render_warning(&mut self.stderr, warning);
+        self.warnings.push(warning.clone());
     }
 
     async fn progress(&mut self, event: &ProgressEvent) {
@@ -198,6 +231,217 @@ fn exit_code(report: &Report) -> i32 {
             ExitCode::Translation as i32
         }
         None => ExitCode::Ok as i32,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Diag {
+    Text,
+    Json,
+}
+
+fn emit(w: &mut dyn Write, value: Value) {
+    let _ = writeln!(w, "{value}");
+}
+
+impl Diag {
+    fn usage_error(self, w: &mut dyn Write, message: impl std::fmt::Display) -> i32 {
+        let code = ExitCode::Usage as i32;
+        match self {
+            Diag::Text => {
+                let _ = writeln!(w, "error: {message}");
+            }
+            Diag::Json => {
+                emit(
+                    w,
+                    json!({"type": "error", "kind": "usage", "message": message.to_string()}),
+                );
+                self.render_summary(w, &Summary::empty(code, None));
+            }
+        }
+        code
+    }
+
+    fn render_prelude(self, w: &mut dyn Write, doc: &Document) {
+        let detected = doc.format_detected();
+        match self {
+            Diag::Text => {
+                if detected {
+                    render_format_note(w, doc.format());
+                }
+            }
+            Diag::Json => emit(
+                w,
+                json!({"type": "format", "format": doc.format().as_str(), "detected": detected}),
+            ),
+        }
+        for note in doc.notes() {
+            if note.kind != NoteKind::IndentedCode || detected {
+                match self {
+                    Diag::Text => render_note(w, note),
+                    Diag::Json => emit(
+                        w,
+                        json!({
+                            "type": "note",
+                            "line": note.line,
+                            "kind": note.kind.as_str(),
+                            "message": note.to_string(),
+                        }),
+                    ),
+                }
+            }
+        }
+    }
+
+    fn render_warning(self, w: &mut dyn Write, warning: &Warning) {
+        match self {
+            Diag::Text => render_warning(w, warning),
+            Diag::Json if warning.kind == WarningKind::HistoryAppend => emit(
+                w,
+                json!({"type": "error", "kind": "history_append", "message": warning.message}),
+            ),
+            Diag::Json => emit(
+                w,
+                json!({
+                    "type": "warning",
+                    "piece": warning.piece,
+                    "kind": warning.kind.as_str(),
+                    "degrades": warning.kind.degrades(),
+                    "message": warning.message,
+                }),
+            ),
+        }
+    }
+
+    fn render_stdout_failure(self, w: &mut dyn Write, e: &std::io::Error) {
+        match self {
+            Diag::Text => {
+                let _ = writeln!(w, "error: cannot write stdout: {e}");
+            }
+            Diag::Json => emit(
+                w,
+                json!({"type": "error", "kind": "output", "message": format!("cannot write stdout: {e}")}),
+            ),
+        }
+    }
+
+    fn render_trailer(self, w: &mut dyn Write, report: &Report) {
+        match self {
+            Diag::Text => render_trailer(w, report),
+            Diag::Json => {
+                if let Some(stop) = &report.stop {
+                    emit(w, stop_json(stop));
+                }
+            }
+        }
+    }
+
+    fn render_summary(self, w: &mut dyn Write, summary: &Summary) {
+        if self == Diag::Json {
+            emit(w, summary.to_json());
+        }
+    }
+}
+
+fn stop_json(stop: &Stop) -> Value {
+    let mut object = match &stop.cause {
+        StopCause::Client(e) => {
+            let code = match e {
+                Error::DaemonUnreachable { .. } => "daemon_unreachable",
+                Error::HistoryUnsupported => "history_unsupported",
+                Error::Io(_) => "io",
+                Error::Protocol(_) => "protocol",
+            };
+            json!({"type": "error", "kind": "client", "code": code, "message": e.to_string()})
+        }
+        StopCause::Daemon { code, message } => json!({
+            "type": "error",
+            "kind": "daemon",
+            "code": error_code_name(code),
+            "message": message,
+        }),
+        StopCause::Output(e) => json!({
+            "type": "error",
+            "kind": "output",
+            "message": format!("cannot write stdout: {e}"),
+        }),
+    };
+    if let Some(label) = &stop.piece {
+        object["piece"] = json!(label);
+    }
+    object
+}
+
+struct Summary {
+    exit_code: i32,
+    format: Option<Format>,
+    pieces: usize,
+    degraded: usize,
+    warnings: usize,
+    stopped_at: Option<String>,
+    complete: bool,
+    history_append_failed: bool,
+}
+
+impl Summary {
+    /// A run that ended before any piece was attempted.
+    fn empty(exit_code: i32, format: Option<Format>) -> Self {
+        Summary {
+            exit_code,
+            format,
+            pieces: 0,
+            degraded: 0,
+            warnings: 0,
+            stopped_at: None,
+            complete: false,
+            history_append_failed: false,
+        }
+    }
+
+    fn of_report(report: &Report, exit_code: i32, format: Format) -> Self {
+        Summary {
+            exit_code,
+            format: Some(format),
+            pieces: report.pieces,
+            degraded: report.degraded,
+            warnings: report.warnings.len(),
+            stopped_at: report.stop.as_ref().and_then(|s| s.piece.clone()),
+            complete: report.complete(),
+            history_append_failed: report.history_append_failed(),
+        }
+    }
+
+    fn interrupted(warnings: &[Warning], pieces: usize, format: Format) -> Self {
+        // "K/M.s" is a part of piece "K/M"; a piece counts once however many parts degrade.
+        let degraded: HashSet<&str> = warnings
+            .iter()
+            .filter(|w| w.kind.degrades())
+            .map(|w| w.piece.split('.').next().unwrap_or(&w.piece))
+            .collect();
+        Summary {
+            pieces,
+            degraded: degraded.len(),
+            warnings: warnings.len(),
+            history_append_failed: warnings
+                .iter()
+                .any(|w| w.kind == WarningKind::HistoryAppend),
+            ..Summary::empty(EXIT_INTERRUPTED, Some(format))
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "type": "summary",
+            "v": 1,
+            "exit_code": self.exit_code,
+            "format": self.format.map(|f| f.as_str()),
+            "pieces": self.pieces,
+            "degraded": self.degraded,
+            "warnings": self.warnings,
+            "stopped_at": self.stopped_at,
+            "complete": self.complete,
+            "history_append_failed": self.history_append_failed,
+        })
     }
 }
 
@@ -233,7 +477,9 @@ fn render_stop(w: &mut dyn Write, stop: &Stop) {
             let _ = writeln!(w, "error: cannot write stdout: {e}");
         }
     }
-    if let Some(label) = &stop.piece {
+    // A failed stdout makes "stdout holds everything translated" untrue.
+    let stdout_failed = matches!(stop.cause, StopCause::Output(_));
+    if let Some(label) = stop.piece.as_ref().filter(|_| !stdout_failed) {
         let _ = writeln!(
             w,
             "error: stopped at piece {label}; stdout holds everything translated before it"
@@ -365,7 +611,7 @@ mod tests {
                     Some("2/3")
                 )
             )),
-            format!("error: cannot write stdout: closed\n{tail}")
+            "error: cannot write stdout: closed\n"
         );
 
         let degraded = Report {

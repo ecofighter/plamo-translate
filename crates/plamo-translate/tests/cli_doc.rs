@@ -452,3 +452,194 @@ fn doc_driver_auto_format_prints_a_note() {
         .success()
         .stderr(contains("note:").not());
 }
+
+fn json_lines(stderr: &[u8]) -> Vec<Value> {
+    let text = String::from_utf8(stderr.to_vec()).unwrap();
+    assert!(text.is_empty() || text.ends_with('\n'), "{text:?}");
+    text.lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSON ({e}): {l:?}")))
+        .collect()
+}
+
+#[test]
+fn doc_report_json_emits_format_warnings_and_summary() {
+    let count = AtomicUsize::new(0);
+    let f = fake_daemon_fn(move |req| match req["op"].as_str() {
+        Some("status") => vec![status_line("history")],
+        _ => match count.fetch_add(1, Ordering::SeqCst) + 1 {
+            2 => vec![done("cut off", "length")],
+            k => vec![done(&format!("X{k}"), "stop")],
+        },
+    });
+    let out = cmd(&f)
+        .args([
+            "doc",
+            "-t",
+            "en",
+            "--history-bytes",
+            "0",
+            "--report",
+            "json",
+        ])
+        .write_stdin(format!(
+            "{}\n\n{}\n\n{}\n",
+            para(1),
+            "x".repeat(2500),
+            para(3)
+        ))
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "X1\n\ncut off\n\nX3\n"
+    );
+    let lines = json_lines(&out.stderr);
+    assert_eq!(
+        lines[0],
+        serde_json::json!({"type": "format", "format": "text", "detected": true})
+    );
+    let warning = lines
+        .iter()
+        .find(|l| l["type"] == "warning")
+        .expect("a warning line");
+    assert_eq!(warning["kind"], "truncated");
+    assert_eq!(warning["piece"], "2/3");
+    assert_eq!(warning["degrades"], true);
+    assert!(warning["message"].is_string());
+    let summary = lines.last().unwrap();
+    assert_eq!(
+        summary,
+        &serde_json::json!({
+            "type": "summary",
+            "v": 1,
+            "exit_code": 1,
+            "format": "text",
+            "pieces": 3,
+            "degraded": 1,
+            "warnings": 1,
+            "stopped_at": null,
+            "complete": true,
+            "history_append_failed": false,
+        })
+    );
+    assert_eq!(lines.iter().filter(|l| l["type"] == "summary").count(), 1);
+}
+
+#[test]
+fn doc_report_json_summary_on_daemon_error() {
+    let count = AtomicUsize::new(0);
+    let f = fake_daemon_fn(move |req| match req["op"].as_str() {
+        Some("status") => vec![status_line("history")],
+        _ => match count.fetch_add(1, Ordering::SeqCst) + 1 {
+            2 => vec![error_line("internal", "boom")],
+            k => vec![done(&format!("X{k}"), "stop")],
+        },
+    });
+    let out = cmd(&f)
+        .args(["doc", "-t", "en", "--report", "json"])
+        .write_stdin(three_paras())
+        .assert()
+        .code(1)
+        .stdout("X1\n\n")
+        .get_output()
+        .clone();
+    let lines = json_lines(&out.stderr);
+    let error = lines.iter().find(|l| l["type"] == "error").unwrap();
+    assert_eq!(error["kind"], "daemon");
+    assert_eq!(error["code"], "internal");
+    assert_eq!(error["piece"], "2/3");
+    assert!(error["message"].as_str().unwrap().contains("boom"));
+    let summary = lines.last().unwrap();
+    assert_eq!(summary["type"], "summary");
+    assert_eq!(summary["exit_code"], 1);
+    assert_eq!(summary["complete"], false);
+    assert_eq!(summary["stopped_at"], "2/3");
+}
+
+#[test]
+fn doc_report_json_unreachable() {
+    let dir = TempDir::new().unwrap();
+    let out = Command::cargo_bin("plamo-translate")
+        .unwrap()
+        .env("PLAMO_TRANSLATE_SOCKET", dir.path().join("nope.sock"))
+        .env("PLAMO_TRANSLATE_CONFIG", dir.path().join("none.toml"))
+        .env("PLAMO_TRANSLATE_CONNECT_TIMEOUT_MS", "300")
+        .args(["doc", "-t", "en", "--report", "json"])
+        .write_stdin(three_paras())
+        .assert()
+        .code(3)
+        .stdout("")
+        .get_output()
+        .clone();
+    let lines = json_lines(&out.stderr);
+    let error = lines.iter().find(|l| l["type"] == "error").unwrap();
+    assert_eq!(error["kind"], "client");
+    assert_eq!(error["code"], "daemon_unreachable");
+    let summary = lines.last().unwrap();
+    assert_eq!(summary["type"], "summary");
+    assert_eq!(summary["exit_code"], 3);
+    assert_eq!(summary["complete"], false);
+}
+
+#[test]
+fn doc_report_json_usage_error_has_null_format() {
+    let f = fake_daemon_fn(echo("history"));
+    let out = cmd(&f)
+        .args(["doc", "-t", "en", "--report", "json"])
+        .write_stdin("  \n")
+        .assert()
+        .code(2)
+        .get_output()
+        .clone();
+    let lines = json_lines(&out.stderr);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(lines[0]["type"], "error");
+    assert_eq!(lines[0]["kind"], "usage");
+    assert!(lines[0]["message"].as_str().unwrap().contains("no text"));
+    assert_eq!(lines[1]["type"], "summary");
+    assert_eq!(lines[1]["exit_code"], 2);
+    assert_eq!(lines[1]["format"], Value::Null);
+    assert_eq!(lines[1]["pieces"], 0);
+    assert_eq!(lines[1]["complete"], false);
+    assert!(f.all_requests().is_empty());
+}
+
+#[test]
+fn doc_report_json_has_no_text_lines() {
+    let f = fake_daemon_fn(echo("history"));
+    let input = "# Title\n\nBody text.\n\n<div>raw html</div>\n";
+    let out = cmd(&f)
+        .args(["doc", "-t", "en", "--report", "json"])
+        .write_stdin(input)
+        .assert()
+        .get_output()
+        .clone();
+    let text = String::from_utf8(out.stderr.clone()).unwrap();
+    for line in text.lines() {
+        assert!(
+            !line.starts_with("note:")
+                && !line.starts_with("warning:")
+                && !line.starts_with("error:"),
+            "{line}"
+        );
+    }
+    let lines = json_lines(&out.stderr);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l["type"] == "note" && l["kind"] == "html")
+    );
+    assert_eq!(lines[0]["format"], "markdown");
+}
+
+#[test]
+fn version_is_0_2_0() {
+    Command::cargo_bin("plamo-translate")
+        .unwrap()
+        .arg("--version")
+        .assert()
+        .success()
+        .stdout("plamo-translate 0.2.0\n");
+}

@@ -112,9 +112,10 @@ plamo-translate doc -t en --format text --history-bytes 0 < notes.txt
 | `--history-last N` | `--history` のうち新しい N 組だけを読む。読み込み時の絞り込みだけで、訳したピースには効かない |
 | `--history-append` | 訳したピースを 1 つ書くたびに、原文と訳文の組を `--history` のファイルに追記する (なければ作る)。途中から再開する機能はない |
 | `--history-bytes BYTES` | ピースごとに送る履歴の大きさ (UTF-8 のバイト数、原文と訳文の合計)。既定は 8000。新しい組から古い方へ入れ、収まらなくなったところで止める。最新の 1 組は常に送る。0 で履歴を使わない |
+| `--report text\|json` | stderr の形式。既定は `text`。`json` では stderr を 1 行に 1 つの JSON (JSON Lines) で書き、最後の行に結果の要約を出す (下記)。stdout は変わらない。0.2.0 から |
 | `-t, -s, --context, --context-file, --glossary, --form` | 上の表と同じ |
 
-`TEXT`、`--no-stream`、`--json` はない。オプションは `doc` の後ろに書く。`plamo-translate -t ja doc` は単語 "doc" の翻訳になり、`plamo-translate doc` はこのサブコマンドを実行する。単語 "doc" を訳すときは `echo doc | plamo-translate -t en` のように stdin で渡す。
+`TEXT`、`--no-stream`、`--json` はない。プログラムから結果を読むときは `--report json` を使う。オプションは `doc` の後ろに書く。`plamo-translate -t ja doc` は単語 "doc" の翻訳になり、`plamo-translate doc` はこのサブコマンドを実行する。単語 "doc" を訳すときは `echo doc | plamo-translate -t en` のように stdin で渡す。
 
 - 訳先を省略して `auto` になる場合、日本語か英語かは文書全体で 1 回だけ決める。日英が混ざった文書では `-t` を指定すること
 - コードブロックなど、訳してはいけないブロックはデーモンに送らず、そのまま出力する。HTML ブロックも訳さず、`warning: line N: HTML block left untranslated` を出す。Markdown では字下げのコードブロックもコードとして扱い、`--format auto` のときだけ `warning: line N: indented block left untranslated as code (use --format text if it is prose)` を出す。字下げの文章なら `--format text` を使う
@@ -130,6 +131,22 @@ plamo-translate doc -t en --format text --history-bytes 0 < notes.txt
 - 分割したピースのラベルは `piece 3/12.2` のようになる
 
 終了コードは単体のときと同じ。0 成功、1 翻訳エラー (訳しきれなかったピースや追記の失敗を含む)、2 使い方の誤り、3 デーモンに到達できない、130 Ctrl-C。
+
+`--report json` の stderr は次の行からなる。知らない `type` や項目は無視すること。
+
+| `type` | 内容 |
+|---|---|
+| `format` | 入力の形式 (`format`: `text` / `markdown`、`detected`: 自動で判定したか) |
+| `note` | 訳さずに残したブロック (`line`、`kind`: `indented_code` / `html` / `reserved_marker`、`message`) |
+| `warning` | ピースの警告 (`piece`、`kind`: `truncated` / `empty` / `markers_lost` / `structure` / `inline` / `not_history`、`degrades`: 訳しきれなかったか、`message`)。`--verbose` に関係なくすべて出る |
+| `error` | エラー (`kind`: `daemon` / `client` / `output` / `usage` / `history_append`、`message`。`code` と `piece` がつくこともある) |
+| `summary` | 最後に 1 行だけ出る要約 |
+
+```json
+{"type":"summary","v":1,"exit_code":1,"format":"markdown","pieces":12,"degraded":1,"warnings":2,"stopped_at":null,"complete":true,"history_append_failed":false}
+```
+
+`v` は形式の版で、項目の意味が変わるときだけ上がる。`exit_code` はプロセスの終了コードと同じ。`complete` は stdout に文書の最後まで書いたか、`stopped_at` は止まったピース (止まらなければ `null`)、`degraded` は訳しきれなかったピースの数、`history_append_failed` は履歴への追記に失敗したか。入力を読む前の使い方の誤りでは `format` が `null` になる。オプションの解析や設定ファイルの読み込みに失敗したとき (終了コード 2) と、プロセスが強制終了されたときは `summary` が出ないので、`summary` がなければ失敗として扱う。`--report` のない古い CLI (0.2.0 より前) は `error: unexpected argument '--report' found` を出し、何も訳さずに終了コード 2 で終わる。
 
 ## 使い方 (MCP)
 
@@ -274,3 +291,4 @@ just bump-mlx   # scripts/bump_mlx.py で版と sha256 を更新 -> nix flake ch
 - 設定を変えたのに反映されない: Nix 管理なら再適用、それ以外は `plamo-translate daemon restart`
 - `daemon does not support translation history`: 更新前のデーモンが動いている。`plamo-translate daemon restart` を実行する
 - `plamo-translate status` の `template_verified: false`: モデルの chat template が検証済みのものと異なる。翻訳は動くが、プロンプトの形式がずれている可能性がある (モデルのロード前は `-` と表示される)
+- `error: unexpected argument '--report' found`: CLI が 0.2.0 より古い。`plamo-translate --version` で確かめ、更新する
