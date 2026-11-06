@@ -1,5 +1,6 @@
 import { createDisplayBuffer } from './display.js'
-import { utf8Bytes } from './doc.js'
+import { ABORTED, utf8Bytes } from './doc.js'
+import { isMostlyJapanese } from './input.js'
 import { splitEdges } from './segments.js'
 
 export const STREAM_WAIT_MS = 2000
@@ -10,9 +11,14 @@ export const OUTPUT_DOC_BYTES = 6000
 
 export const DEADLINE = Symbol('deadline')
 export const MISSED_REASON = '間に合わず'
+export const ABORTED_REASON = '中断'
+export { ABORTED }
 
 // An empty displayContent hides a batch, so a paragraph can be held until it is complete.
 const HOLD_INCOMPLETE = true
+// A `.catch` can arrive after its message's state was finished or dropped; the registry outlives the
+// state so the dispatch is still found, and is capped because nothing else would ever prune it.
+const MAX_DISPATCHES = 1000
 
 export function createPipeline({ flushLines }) {
   return {
@@ -23,6 +29,7 @@ export function createPipeline({ flushLines }) {
     inputActive: 0,
     takeoverActive: 0,
     wakers: [],
+    dispatches: new Map(),
   }
 }
 
@@ -65,14 +72,19 @@ function newMessage(pipe, messageId, turnId) {
     turnId,
     failures: [],
     partial: 0,
-    dispatches: new Map(),
   }
+}
+
+function isTranslatable(block) {
+  if (block.kind !== 'paragraph' && block.kind !== 'table') return false
+  const { core } = splitEdges(block.text)
+  return core !== '' && !isMostlyJapanese(core)
 }
 
 function newSlot(block, messageId) {
   let resolve
   const settled = new Promise((r) => (resolve = r))
-  const translatable = block.kind === 'paragraph' || block.kind === 'table'
+  const translatable = isTranslatable(block)
   return {
     block,
     messageId,
@@ -98,7 +110,7 @@ export function arrive(pipe, { messageId, key, delta, final, turnId }) {
   const slots = state.buffer.push(delta, final).map((block) => newSlot(block, messageId))
   state.slots.push(...slots)
   for (const slot of slots) {
-    if (slot.state === 'queued') pipe.queue.push({ slot, messageId })
+    if (slot.state === 'queued') pipe.queue.push({ slot, messageId, state })
     else slot.markSettled()
   }
   if (slots.some((s) => s.state === 'queued')) wake(pipe)
@@ -117,13 +129,21 @@ export function arrive(pipe, { messageId, key, delta, final, turnId }) {
     prevTurn,
     finishTurn,
   }
-  state.dispatches.set(key, dispatch)
+  const registryKey = dispatchKey(messageId, key)
+  pipe.dispatches.delete(registryKey)
+  pipe.dispatches.set(registryKey, dispatch)
+  if (pipe.dispatches.size > MAX_DISPATCHES) pipe.dispatches.delete(pipe.dispatches.keys().next().value)
   return dispatch
 }
 
-export function abandon(state, key) {
-  const dispatch = state.dispatches.get(key)
-  if (dispatch) dispatch.abandoned = true
+const dispatchKey = (messageId, key) => JSON.stringify([messageId, key])
+
+export function findDispatch(pipe, messageId, key) {
+  return pipe.dispatches.get(dispatchKey(messageId, key))
+}
+
+export function abandon(dispatch) {
+  dispatch.abandoned = true
 }
 
 const isWaiting = (slot) => slot.state === 'queued' || slot.state === 'running'
@@ -159,12 +179,14 @@ function emit(state, slot) {
   state.emitted++
 }
 
-// null tells the caller to answer {} for a dispatch whose output the engine no longer uses.
+// null tells the caller to answer {} for a dispatch whose output the engine no longer uses. Slots of
+// later dispatches are left to them: taking them here would show text ahead of a batch that the
+// engine may display before this one.
 export function takeReady(dispatch) {
   if (dispatch.abandoned) return null
   const { state } = dispatch
   let text = ''
-  while (state.emitted < state.slots.length) {
+  while (state.emitted < dispatch.end) {
     const slot = state.slots[state.emitted]
     if (slot.state !== 'ready' && slot.state !== 'done') break
     if (slot.failReason !== undefined) state.failures.push(slot.failReason)
@@ -178,7 +200,7 @@ export function takeReady(dispatch) {
 function removeJobs(pipe, state) {
   const removed = []
   pipe.queue = pipe.queue.filter((job) => {
-    if (job.messageId !== state.messageId) return true
+    if (job.state !== state) return true
     removed.push(job.slot)
     return false
   })
@@ -211,11 +233,15 @@ export function release(pipe, state) {
   return text
 }
 
-// The `.catch` answer: synchronous, and it shows held text instead of losing it.
-export function rescue(pipe, { messageId, key, final }) {
-  const state = pipe.messages.get(messageId)
-  if (!state) return ''
-  abandon(state, key)
+// The `.catch` answer: synchronous, and it shows held text instead of losing it. null means no
+// dispatch was found: its delta never reached the pipeline and is still the caller's to show.
+// A dispatch whose message state is already finished or dropped gets nothing: that state's text was
+// shown or given up there, and a newer state under the same message id is not its to claim.
+export function rescue(pipe, dispatch, { final }) {
+  if (!dispatch) return null
+  abandon(dispatch)
+  const { state } = dispatch
+  if (pipe.messages.get(state.messageId) !== state) return ''
   return final ? release(pipe, state) : claimAll(pipe, state)
 }
 
@@ -284,6 +310,21 @@ export function finishJob(pipe, job, result) {
   return accepted
 }
 
+// Ties the end of a job to the end of its translation, whatever happens, so the mutex is never left
+// held. Pass the translation itself, not one already cut short by untilAborted: the daemon is still
+// busy until it really ends, and its late result can still settle the slot.
+export async function runJob(pipe, job, translate) {
+  let result
+  try {
+    const value = await translate(job.slot)
+    result = value === ABORTED || !value ? { text: job.slot.block.text, failReason: ABORTED_REASON } : value
+  } catch (err) {
+    result = { text: job.slot.block.text, failReason: err?.message || 'error' }
+  }
+  finishJob(pipe, job, result)
+  return result
+}
+
 // Waiting on anything but the hook's own `$` calls counts against the dispatch budget, so every such
 // wait ends before the budget does; a streaming dispatch also must not hold its batch for long.
 export function waitBudgetMs(remainingMs, final) {
@@ -291,21 +332,37 @@ export function waitBudgetMs(remainingMs, final) {
   return final ? ms : Math.min(STREAM_WAIT_MS, ms)
 }
 
-// `sleep(ms, { signal })` is the host clock's sleep; its timer is cancelled once the promise wins, so
-// nothing is left pending after the hook returns.
-export async function boundedWait(promise, ms, sleep) {
+// `sleep(ms, { signal })` is the host clock's sleep; its timer is cancelled once the wait ends, so
+// nothing is left pending after the hook returns. `signal` (the dispatch's) ends the wait with ABORTED
+// at once, because a hook that outlives its abort is counted as overrunning. A non-finite `ms` (an
+// unmetered hook) sets no timer, since the clock only takes finite waits.
+export async function boundedWait(promise, ms, sleep, signal) {
+  if (signal?.aborted) return ABORTED
   if (ms <= 0) return DEADLINE
   const timer = new AbortController()
-  try {
-    return await Promise.race([
-      promise,
+  let onAbort
+  const contenders = [promise]
+  if (Number.isFinite(ms)) {
+    contenders.push(
       sleep(ms, { signal: timer.signal }).then(
         () => DEADLINE,
         () => DEADLINE,
       ),
-    ])
+    )
+  }
+  if (signal) {
+    contenders.push(
+      new Promise((resolve) => {
+        onAbort = () => resolve(ABORTED)
+        signal.addEventListener('abort', onAbort, { once: true })
+      }),
+    )
+  }
+  try {
+    return await Promise.race(contenders)
   } finally {
     timer.abort()
+    if (onAbort) signal.removeEventListener('abort', onAbort)
   }
 }
 

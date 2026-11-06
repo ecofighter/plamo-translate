@@ -1,7 +1,13 @@
 import { expect, test } from 'claude-code/testing'
 import {
   abandon,
+  ABORTED,
   arrive,
+  boundedWait,
+  DEADLINE,
+  findDispatch,
+  rescue,
+  runJob,
   cancelQueued,
   claimAll,
   createPipeline,
@@ -45,8 +51,8 @@ test('deltas are pushed in arrival order and index gaps do not stall', async () 
   expect(secondMayTake).toBe(true)
 
   drain(p)
-  expect(takeReady(d1)).toBe('JA:One.\n\nJA:Two.\n\n')
-  expect(takeReady(d2)).toBe('')
+  expect(takeReady(d1)).toBe('JA:One.\n\n')
+  expect(takeReady(d2)).toBe('JA:Two.\n\n')
 })
 
 test('takeReady returns the longest ready prefix once', () => {
@@ -83,7 +89,7 @@ test('an abandoned dispatch takes nothing', () => {
   const p = pipeline()
   const d1 = arrive(p, delta('m1', '```\nx\n```\n'))
   const d2 = arrive(p, delta('m1', 'Later.\n\n'))
-  abandon(d1.state, d1.key)
+  abandon(d1)
   expect(d1.abandoned).toBe(true)
   expect(d2.abandoned).toBe(false)
   expect(takeReady(d1)).toBe(null)
@@ -160,4 +166,100 @@ test('takeoverTimeoutMs caps each call at the remaining takeover time and stops 
   expect(takeoverTimeoutMs(started, started + OUTPUT_FINAL_MAX_MS - MIN_CALL_MS, 20000)).toBe(MIN_CALL_MS)
   expect(takeoverTimeoutMs(started, started + OUTPUT_FINAL_MAX_MS - MIN_CALL_MS + 1, 20000)).toBe(null)
   expect(takeoverTimeoutMs(started, started + OUTPUT_FINAL_MAX_MS + 5000, 20000)).toBe(null)
+})
+
+test('a dispatch takes only up to its own last slot; the final take collects the rest', () => {
+  const p = pipeline()
+  const d1 = arrive(p, delta('m1', '```\na\n```\n'))
+  const d2 = arrive(p, delta('m1', '```\nb\n```\n'))
+  const last = arrive(p, delta('m1', '```\nc\n```\n', true))
+  expect(takeReady(d1)).toBe('```\na\n```\n')
+  expect(takeReady(d1)).toBe('')
+  expect(takeReady(d2)).toBe('```\nb\n```\n')
+  expect(finalTake(p, last).text).toBe('```\nc\n```\n')
+})
+
+test('empty and mostly Japanese blocks are ready as written, never queued or heavy', () => {
+  const p = pipeline()
+  const japanese = 'これは日本語の段落です。'.repeat(500)
+  const d = arrive(p, delta('m1', `${japanese}\n\n| 列 | 値 |\n|---|---|\n\nEnglish.\n\n`, true))
+  expect(p.queue.map((j) => j.slot.block.text)).toEqual(['English.\n'])
+  expect(d.slots.some((s) => s.heavy)).toBe(false)
+  expect(takeReady(d)).toBe(`${japanese}\n\n| 列 | 値 |\n|---|---|\n\n`)
+  const taken = finalTake(p, d)
+  expect(taken.text).toBe('English.\n\n')
+  expect(taken.failures).toEqual(['間に合わず'])
+})
+
+test('runJob always releases the running job, even when the translation fails or is aborted', async () => {
+  const p = pipeline()
+  const d = arrive(p, delta('m1', 'Fails.\n\nAborted.\n\nWorks.\n\n'))
+
+  const failing = popIfIdle(p)!
+  await runJob(p, failing, async () => {
+    throw new Error('boom')
+  })
+  expect(p.running).toBe(null)
+  expect(failing.slot).toMatchObject({ state: 'done', text: 'Fails.\n', failReason: 'boom' })
+
+  const aborted = popIfIdle(p)!
+  await runJob(p, aborted, async () => ABORTED)
+  expect(p.running).toBe(null)
+  expect(aborted.slot).toMatchObject({ state: 'done', text: 'Aborted.\n', failReason: '中断' })
+
+  const works = popIfIdle(p)!
+  await runJob(p, works, async (slot) => translated(slot.block.text))
+  expect(p.running).toBe(null)
+  expect(takeReady(d)).toBe('Fails.\n\nAborted.\n\nJA:Works.\n\n')
+})
+
+test('rescue claims only the dispatch own message state, not a newer one under the same id', () => {
+  const p = pipeline()
+  const old = arrive(p, delta('m1', 'Old.\n\n', false, 1))
+  const oldFinal = arrive(p, delta('m1', 'End.', true, 2))
+  finalTake(p, oldFinal)
+  const fresh = arrive(p, delta('m1', '```\nnew\n```\n', false, 3))
+
+  expect(findDispatch(p, 'm1', 1)).toBe(old)
+  expect(rescue(p, findDispatch(p, 'm1', 1), { final: false })).toBe('')
+  expect(old.abandoned).toBe(true)
+  expect(takeReady(fresh)).toBe('```\nnew\n```\n')
+
+  expect(rescue(p, findDispatch(p, 'm1', 99), { final: false })).toBe(null)
+  const pending = arrive(p, delta('m1', 'Queued.\n\nheld', false, 4))
+  expect(rescue(p, pending, { final: true })).toBe('Queued.\n\nheld')
+  expect(p.messages.has('m1')).toBe(false)
+  expect(p.queue).toEqual([])
+})
+
+test('boundedWait ends with the value, the deadline, or ABORTED as soon as the signal aborts', async () => {
+  const sleeps: Array<{ ms: number; signal: AbortSignal; resolve: () => void }> = []
+  const sleep = (ms: number, { signal }: { signal: AbortSignal }) =>
+    new Promise<void>((resolve, reject) => {
+      sleeps.push({ ms, signal, resolve })
+      signal.addEventListener('abort', () => reject(new Error('aborted')))
+    })
+  const never = new Promise(() => {})
+
+  expect(await boundedWait(Promise.resolve('v'), 1000, sleep)).toBe('v')
+  expect(sleeps[0].signal.aborted).toBe(true)
+
+  const timed = boundedWait(never, 1000, sleep)
+  sleeps[1].resolve()
+  expect(await timed).toBe(DEADLINE)
+  expect(await boundedWait(never, 0, sleep)).toBe(DEADLINE)
+
+  const interrupt = new AbortController()
+  const waiting = boundedWait(never, 1000, sleep, interrupt.signal)
+  interrupt.abort()
+  expect(await waiting).toBe(ABORTED)
+  expect(sleeps[2].signal.aborted).toBe(true)
+  expect(await boundedWait(Promise.resolve('v'), 1000, sleep, interrupt.signal)).toBe(ABORTED)
+
+  const count = sleeps.length
+  let release: (v: string) => void = () => {}
+  const unmetered = boundedWait(new Promise<string>((r) => (release = r)), Infinity, sleep)
+  release('late')
+  expect(await unmetered).toBe('late')
+  expect(sleeps.length).toBe(count)
 })
