@@ -64,7 +64,6 @@ const NOTICE_TIMEOUT_MS = 8000
 const DROP_REASON = '送信をやめました。'
 const INPUT_FIRST_REASON = '入力の翻訳を優先'
 const TABLE_SHAPE_REASON = 'table shape changed'
-const PARTIAL_REASON = 'partial'
 const RESCUE_NOTICE = '表示の翻訳でエラーが起きたため英語のまま表示しました。'
 // The engine replaces the plugin's copy mid-session (a hooks worker respawn) and runs register and
 // session.start again; the switch lives in session state so that does not turn the layer off.
@@ -81,6 +80,7 @@ const notesNotice = (notes) => `${notes} か所 (コード扱いのブロック�
 const failureQuestion = (reason) => `翻訳に失敗しました (${reason})。どうしますか?`
 const crashReason = (kind) => `日英レイヤでエラーが起きたため送信を止めました (${kind})。/ja off で無効にできます。`
 const failureNotice = (n, reason) => `一部の段落を英語のまま表示しました (${n} 件: ${reason})。`
+const partialDisplayNotice = (n) => `一部の段落は訳しきれていません (${n} 件)。`
 
 const NEVER = new Promise(() => {})
 
@@ -365,6 +365,8 @@ async function translateBlockWithDoc($, ctx, block, { lead, core, trail }, { nex
   const { timeoutMs, stopReason } = await nextCall(docTimeoutMs(utf8Bytes(core)))
   if (stopReason !== undefined) return { text: block.text, failReason: stopReason, stopped: true }
   const doc = await runDoc($, ctx, { text: core, direction: 'en-ja', timeoutMs }, signal)
+  // The takeover already showed the block and logged its stop; anything more would contradict it.
+  if (signal?.aborted) return { text: block.text, failReason: ABORTED_REASON }
   if (doc.unsupported) return null
   if (!doc.ok) {
     debug($, `display: doc failed (${doc.reason}); block shown as written`)
@@ -383,7 +385,8 @@ async function translateBlockWithDoc($, ctx, block, { lead, core, trail }, { nex
 // A block that cannot be translated is shown as written: the display is the only thing at stake.
 // The pair goes to memory even when the result comes too late to be shown.
 // `nextCall(callMax)` gives each daemon call its timeout, at most `callMax`, or a reason to stop.
-async function translateBlock($, ctx, slot, { nextCall, signal }) {
+// With `deferDoc`, a block that needs doc is handed back with `requeue` and `heavy` instead.
+async function translateBlock($, ctx, slot, { nextCall, signal, deferDoc = false }) {
   const { block } = slot
   const edges = splitEdges(block.text)
   const { lead, core, trail } = edges
@@ -398,6 +401,7 @@ async function translateBlock($, ctx, slot, { nextCall, signal }) {
   }
 
   const result = await translateNow($, ctx, core, 'en-ja', () => nextCall(OUTPUT_TIMEOUT_MS))
+  if (signal?.aborted) return { text: block.text, failReason: ABORTED_REASON }
   if (result.stopped) return { text: block.text, failReason: result.reason, stopped: true }
   let failReason
   if (!result.ok) {
@@ -412,14 +416,26 @@ async function translateBlock($, ctx, slot, { nextCall, signal }) {
     failReason = TABLE_SHAPE_REASON
   }
   if (!docAvailable(ctx)) return { text: block.text, failReason }
+  if (deferDoc) {
+    debug($, `display: single call failed (${failReason}); the block is left for the final batch to translate with doc`)
+    return { requeue: true, heavy: true }
+  }
   debug($, `display: single call failed (${failReason}); translating the block with doc`)
   return (await translateBlockWithDoc($, ctx, block, edges, calls, failReason)) ?? { text: block.text, failReason }
 }
 
-// Outside a takeover a call is bounded only by its own kind's limit.
-const uncapped = (callMax) => ({ timeoutMs: callMax })
+// Outside a takeover a call is bounded only by its own kind's limit, and none starts while a prompt
+// translates: the daemon serves one request at a time.
+const yieldToInput = (pipe) => (callMax) =>
+  pipe.inputActive > 0 ? { stopReason: INPUT_FIRST_REASON } : { timeoutMs: callMax }
 
-const translateJob = ($, ctx) => (slot) => translateBlock($, ctx, slot, { nextCall: uncapped })
+// A block stopped for a prompt is not a failure: it goes back to the queue, to run after the prompt
+// or to be taken over by the final batch. A help-run leaves doc to the final batch, whose takeover is
+// bounded by its time limit and the dispatch's signal; a help-run's work outlives its dispatch.
+const translateJob = ($, ctx, { deferDoc }) => async (slot) => {
+  const result = await translateBlock($, ctx, slot, { nextCall: yieldToInput(ctx.display), deferDoc })
+  return result.stopped ? { requeue: true } : result
+}
 
 // Display translations run here, outside any dispatch, so no dispatch waits on them past its budget.
 // A newer session.start bumps the generation, and the older loop ends at its next turn.
@@ -433,8 +449,9 @@ async function runDisplayWorker($, ctx, generation) {
       await waitForWork(pipe)
       continue
     }
-    const result = await runJob(pipe, job, translateJob($, ctx))
-    if (result.failReason !== undefined) debugQuietly($, `plamo-ja-bridge: worker job failed: ${result.failReason}`)
+    const result = await runJob(pipe, job, translateJob($, ctx, { deferDoc: false }))
+    if (result.requeue) debugQuietly($, 'display: worker job put back in the queue while a prompt translates')
+    else if (result.failReason !== undefined) debugQuietly($, `plamo-ja-bridge: worker job failed: ${result.failReason}`)
   }
   debugQuietly($, 'display worker superseded by a newer session start')
 }
@@ -522,7 +539,7 @@ async function showBatch($, ctx, d, next) {
       ctx,
       next,
       ms,
-      job ? runJob(pipe, job, translateJob($, ctx)) : Promise.race([whenSettled(d), waitForWork(pipe)]),
+      job ? runJob(pipe, job, translateJob($, ctx, { deferDoc: true })) : Promise.race([whenSettled(d), waitForWork(pipe)]),
     )
     if (waited === ABORTED || d.abandoned) return {}
     if (waited === DEADLINE) {
@@ -597,20 +614,30 @@ async function finishMessage($, ctx, d, next) {
   if (previous === ABORTED || d.abandoned) return false
   if (previous === DEADLINE) debug($, 'display: an earlier batch of the message was still busy at the final deadline')
 
-  const claimed = cancelQueued(ctx.display, d.state)
-  const inFlight = runningSlot(d.state)
-  if (inFlight) {
-    const waited = await waitUntil($, ctx, next, deadline, inFlight.settled)
+  const pipe = ctx.display
+  const claimed = cancelQueued(pipe, d.state)
+  // An in-flight block either settles or, stopped for a prompt or left for doc, is put back in the
+  // queue (which wakes the pipeline); a put-back block is claimed for the takeover like the others.
+  let inFlight
+  while ((inFlight = runningSlot(d.state))) {
+    const waited = await waitUntil($, ctx, next, deadline, Promise.race([inFlight.settled, waitForWork(pipe)]))
     if (waited === ABORTED || d.abandoned) return false
-    if (waited === DEADLINE) debug($, 'display: an in-flight block missed the final deadline; shown as written')
+    if (waited === DEADLINE) {
+      debug($, 'display: an in-flight block missed the final deadline; shown as written')
+      break
+    }
   }
+  claimed.push(...cancelQueued(pipe, d.state))
+  claimed.sort((a, b) => d.state.slots.indexOf(a) - d.state.slots.indexOf(b))
   return takeOver($, ctx, d, claimed, next)
 }
 
 function noticeFailures($, failures, partial) {
   for (const reason of failures) debug($, `display: block shown as written (${reason})`)
-  const n = failures.length + partial
-  if (n > 0) $.ui.toast(failureNotice(n, failures[0] ?? PARTIAL_REASON), { timeoutMs: NOTICE_TIMEOUT_MS })
+  const notices = []
+  if (failures.length > 0) notices.push(failureNotice(failures.length, failures[0]))
+  if (partial > 0) notices.push(partialDisplayNotice(partial))
+  if (notices.length > 0) $.ui.toast(notices.join(' '), { timeoutMs: NOTICE_TIMEOUT_MS })
 }
 
 async function showFinal($, ctx, d, next) {

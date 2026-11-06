@@ -212,7 +212,8 @@ function removeJobs(pipe, state) {
 export function cancelQueued(pipe, state) {
   const slots = removeJobs(pipe, state)
   for (const slot of slots) slot.state = 'claimed'
-  return slots
+  // A job put back goes to the head of the queue; the takeover still translates in reply order.
+  return slots.sort((a, b) => state.slots.indexOf(a) - state.slots.indexOf(b))
 }
 
 export function claimAll(pipe, state) {
@@ -313,6 +314,8 @@ export function finishJob(pipe, job, result) {
 // Ties the end of a job to the end of its translation, whatever happens, so the mutex is never left
 // held. Pass the translation itself, not one already cut short by untilAborted: the daemon is still
 // busy until it really ends, and its late result can still settle the slot.
+// A result with `requeue` puts the job back unsettled, for later or for the final takeover;
+// `heavy` with it leaves the block to the takeover alone.
 export async function runJob(pipe, job, translate) {
   let result
   try {
@@ -321,8 +324,22 @@ export async function runJob(pipe, job, translate) {
   } catch (err) {
     result = { text: job.slot.block.text, failReason: err?.message || 'error' }
   }
+  if (result.requeue && requeueJob(pipe, job, result)) return result
+  if (result.requeue) result = { text: job.slot.block.text }
   finishJob(pipe, job, result)
   return result
+}
+
+// Only a slot still running is put back: one claimed or shown meanwhile belongs to that dispatch.
+function requeueJob(pipe, job, { heavy = false }) {
+  const { slot } = job
+  if (slot.emitted || slot.state !== 'running') return false
+  slot.state = 'queued'
+  if (heavy) slot.heavy = true
+  pipe.queue.unshift(job)
+  if (pipe.running === job) pipe.running = null
+  wake(pipe)
+  return true
 }
 
 // Waiting on anything but the hook's own `$` calls counts against the dispatch budget, so every such

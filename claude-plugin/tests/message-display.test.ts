@@ -490,7 +490,7 @@ test('degraded doc output is shown and noted', async ($, on) => {
   await turnOn($)
   expect(await show($, 'm1', 'Hello.\n\n')).toEqual({ displayContent: '一部だけ訳した。\n\n' })
   expect(await show($, 'm1', '', true)).toEqual({ displayContent: '' })
-  expect(h.toasts).toEqual(['一部の段落を英語のまま表示しました (1 件: partial)。'])
+  expect(h.toasts).toEqual(['一部の段落は訳しきれていません (1 件)。'])
 })
 
 test('a table whose shape changed is retried with doc', async ($, on) => {
@@ -501,5 +501,63 @@ test('a table whose shape changed is retried with doc', async ($, on) => {
   expect(await show($, 'm1', table + '\n')).toEqual({ displayContent: '| あ | い |\n|---|---|\n\n' })
   expect(h.runs.map((r) => isDoc(r))).toEqual([false, true])
   expect(await show($, 'm1', '', true)).toEqual({ displayContent: '' })
+  expect(h.toasts).toEqual([])
+})
+
+test('the notice names failed and partly translated blocks apart', async ($, on) => {
+  const h = setupTimed(on)
+  h.reply = (run) => {
+    if (run.init.stdin === 'Bad.') return { exitCode: 1, stdout: '', stderr: 'error: model_load_failed: x\n' }
+    if (isDoc(run)) return { ...docReply('一部だけ訳した。\n', { exit_code: 1, degraded: 1, pieces: 2 }), exitCode: 1 }
+    return singleReply('途中まで', 'length')
+  }
+  await turnOn($)
+  expect(await show($, 'm1', 'Bad.\n\nHello.\n\n')).toEqual({ displayContent: 'Bad.\n\n一部だけ訳した。\n\n' })
+  expect(await show($, 'm1', '', true)).toEqual({ displayContent: '' })
+  expect(h.toasts).toEqual([
+    '一部の段落を英語のまま表示しました (1 件: model_load_failed: x)。 一部の段落は訳しきれていません (1 件)。',
+  ])
+})
+
+const runKinds = (h: TimedHarness) => h.runs.map((r) => `${isDoc(r) ? 'doc' : 'single'}:${r.init.stdin}`)
+
+test('the worker starts no doc run while a prompt translates', { options: { confirm: false } }, async ($, on) => {
+  const h = setupTimed(on)
+  on('prompt.submit', ($: unknown, e: { text: string }) => ({ text: e.text }))
+  const PROMPT = '日本語の文です。'
+  h.delays.set('Hello.', 5000)
+  h.delays.set(PROMPT, 20000)
+  h.reply = (run) => {
+    if (isDoc(run)) return docReply(`DOC:${run.init.stdin}\n`)
+    if (run.init.stdin === 'Hello.') return singleReply('途中まで', 'length')
+    return singleReply(`EN:${run.init.stdin}`)
+  }
+  await turnOn($)
+  const shown = show($, 'm1', 'Hello.\n\n')
+  await pass(h, 1000)
+  const prompt = $.prompt.submit({ text: PROMPT })
+  await pass(h, 1000)
+  expect(await shown).toEqual({ displayContent: '' })
+  for (let i = 0; i < 4; i++) await pass(h, 1000)
+  expect(runKinds(h)).toEqual(['single:Hello.', `single:${PROMPT}`])
+  await pass(h, 15000)
+  expect(await prompt).toEqual({ text: `EN:${PROMPT}` })
+  await pass(h, 5000)
+  await pass(h, 5000)
+  expect(runKinds(h)).toEqual(['single:Hello.', `single:${PROMPT}`, 'single:Hello.', 'doc:Hello.'])
+  expect(h.logs.some((l) => l.includes('put back'))).toBe(true)
+  expect(await show($, 'm1', '', true)).toEqual({ displayContent: 'DOC:Hello.\n\n' })
+})
+
+test('a help-run leaves a doc retry to the final batch', async ($, on) => {
+  const h = setupTimed(on)
+  h.reply = (run) => (isDoc(run) ? docReply(`DOC:${run.init.stdin}\n`) : singleReply('途中まで', 'length'))
+  // No session start, so no worker: the batch translates its block itself.
+  await $.command.run({ command: 'ja', args: 'on' })
+  expect(await show($, 'm1', 'Hello.\n\n')).toEqual({ displayContent: '' })
+  expect(runKinds(h)).toEqual(['single:Hello.'])
+  expect(await show($, 'm1', '', true)).toEqual({ displayContent: 'DOC:Hello.\n\n' })
+  expect(runKinds(h)).toEqual(['single:Hello.', 'doc:Hello.'])
+  expect(h.runs[1].init.timeoutMs).toBeLessThanOrEqual(60000)
   expect(h.toasts).toEqual([])
 })
