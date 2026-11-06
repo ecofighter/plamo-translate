@@ -62,13 +62,13 @@ impl Default for Limits {
     }
 }
 
-pub struct Split {
+pub(crate) struct Split {
     pub segments: Vec<Segment>,
     pub notes: Vec<Note>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Segment {
+pub(crate) enum Segment {
     Keep(String),
     Translate(Unit),
 }
@@ -125,7 +125,7 @@ impl fmt::Display for Note {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Unit {
+pub(crate) struct Unit {
     parts: Vec<Part>,
     format: Format,
     crlf: bool,
@@ -179,13 +179,13 @@ impl Unit {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct Finished {
+pub(crate) struct Finished {
     pub text: String,
     pub issues: Vec<Issue>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum Issue {
+pub(crate) enum Issue {
     Structure {
         expected: String,
         got: String,
@@ -215,7 +215,7 @@ impl fmt::Display for Issue {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum FinishError {
+pub(crate) enum FinishError {
     Empty,
     Placeholders,
 }
@@ -450,7 +450,7 @@ fn contains_marker_like(s: &str) -> bool {
     })
 }
 
-pub fn split(input: &str, format: Format, limits: &Limits) -> Split {
+pub(crate) fn split(input: &str, format: Format, limits: &Limits) -> Split {
     let mut builder = Builder::new(input);
     match format {
         Format::Text => plain::split(input, &mut builder),
@@ -466,7 +466,7 @@ pub fn split(input: &str, format: Format, limits: &Limits) -> Split {
 
 /// Cuts `unit` once into `[Translate, Keep?, Translate]`, keeping placeholder ids;
 /// `None` if no cut leaves translatable text on both sides.
-pub fn split_unit(unit: &Unit) -> Option<Vec<Segment>> {
+pub(crate) fn split_unit(unit: &Unit) -> Option<Vec<Segment>> {
     cut::split_unit(unit)
 }
 

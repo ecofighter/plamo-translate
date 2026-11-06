@@ -1,17 +1,19 @@
 //! Translates a sequence of units through the daemon: history, retries and splitting.
-//! The driver works only through `DocUnit` and `Item`; only `doc/mod.rs` names the
-//! `segment::*` types (the adapter).
+//! The core (`drive`) works only through `DocUnit` and `Item`, so its tests can script
+//! units; only the adapter (`impl DocUnit for Unit`, `prepare`, `translate`) names the
+//! segmenter's types.
 
-use crate::ExitCode;
-use crate::translate::{Progress, write_daemon_error, write_error};
+use crate::history::select_history;
+use crate::report::{ProgressEvent, Report, Sink, Stop, StopCause, Warning, WarningKind};
+use crate::segment::{self, FinishError, Format, Issue, Limits, Note, Segment, Unit};
 use futures::StreamExt;
 use plamo_client::{
     Client, Error, ErrorCode, Event, HistoryEntry, TranslateRequest, append_history,
     check_history_eligible, drop_oldest_half,
 };
-use plamo_doc::select_history;
-use std::io::Write;
+use std::future::Future;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// A piece of the document that is sent to the daemon.
 pub(crate) trait DocUnit: Sized {
@@ -47,10 +49,11 @@ pub(crate) enum Item<U> {
     Unit(U),
 }
 
-pub(crate) type SplitFn<'a, U> = &'a dyn Fn(&U) -> Option<Vec<Item<U>>>;
+// `Sync` keeps the `translate` future `Send`.
+pub(crate) type SplitFn<'a, U> = &'a (dyn Fn(&U) -> Option<Vec<Item<U>>> + Sync);
 
 #[derive(Debug)]
-pub(crate) enum Attempt {
+pub enum Attempt {
     Done {
         text: String,
         finish_reason: Option<String>,
@@ -63,34 +66,87 @@ pub(crate) enum Attempt {
     Client(Error),
 }
 
-pub(crate) trait Backend {
-    async fn require_history(&self) -> Result<(), Error>;
-    async fn attempt(&self, req: &TranslateRequest, progress: &mut Progress) -> Attempt;
+// Written as `impl Future + Send` rather than `async fn` so that `translate` is `Send`
+// for any `Sync` backend.
+pub trait Backend: Sync {
+    fn require_history(&self) -> impl Future<Output = Result<(), Error>> + Send;
+    /// Forwards `Stage`/`Generated` to `sink.progress` for every daemon progress/delta event.
+    fn attempt<S: Sink>(
+        &self,
+        req: &TranslateRequest,
+        sink: &mut S,
+    ) -> impl Future<Output = Attempt> + Send;
 }
 
-pub(crate) struct ClientBackend<'a>(pub &'a Client);
+pub struct ClientBackend<'a> {
+    client: &'a Client,
+    event_timeout: Option<Duration>,
+}
+
+impl<'a> ClientBackend<'a> {
+    pub fn new(client: &'a Client) -> Self {
+        Self {
+            client,
+            event_timeout: None,
+        }
+    }
+
+    /// Limits each connect, the preflight, and each wait for the next daemon event to `d`.
+    /// A long document stays alive as long as the daemon keeps sending events.
+    pub fn with_event_timeout(self, d: Duration) -> Self {
+        Self {
+            event_timeout: Some(d),
+            ..self
+        }
+    }
+
+    async fn limit<F: Future>(&self, f: F) -> Result<F::Output, Error> {
+        match self.event_timeout {
+            None => Ok(f.await),
+            Some(d) => tokio::time::timeout(d, f).await.map_err(|_| {
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("no event from the daemon for {d:?}"),
+                ))
+            }),
+        }
+    }
+}
 
 impl Backend for ClientBackend<'_> {
     async fn require_history(&self) -> Result<(), Error> {
-        self.0.require_history().await
+        self.limit(self.client.require_history()).await?
     }
 
-    async fn attempt(&self, req: &TranslateRequest, progress: &mut Progress) -> Attempt {
-        let mut events = match self.0.translate_unchecked(req).await {
-            Ok(events) => events,
-            Err(e) => return Attempt::Client(e),
+    async fn attempt<S: Sink>(&self, req: &TranslateRequest, sink: &mut S) -> Attempt {
+        let mut events = match self.limit(self.client.translate_unchecked(req)).await {
+            Ok(Ok(events)) => events,
+            Ok(Err(e)) | Err(e) => return Attempt::Client(e),
         };
         let mut received = 0usize;
-        while let Some(event) = events.next().await {
+        loop {
+            let event = match self.limit(events.next()).await {
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(e) => return Attempt::Client(e),
+            };
             match event {
                 Ok(Event::Progress {
                     stage,
                     done_bytes,
                     total_bytes,
-                }) => progress.show(&stage, done_bytes, total_bytes),
+                }) => {
+                    sink.progress(&ProgressEvent::Stage {
+                        stage,
+                        done_bytes,
+                        total_bytes,
+                    })
+                    .await
+                }
                 Ok(Event::Delta { text }) => {
                     received += text.chars().count();
-                    progress.line(&format!("{received} chars"));
+                    sink.progress(&ProgressEvent::Generated { chars: received })
+                        .await;
                 }
                 Ok(Event::Done {
                     text,
@@ -117,9 +173,129 @@ impl Backend for ClientBackend<'_> {
     }
 }
 
-pub(crate) struct Job<U> {
-    /// target_lang, source_lang, context, glossary, form; text and history are filled per request.
-    pub base: TranslateRequest,
+/// A document split into verbatim text and translation units, ready for `translate`.
+pub struct Document {
+    format: Format,
+    detected: bool,
+    notes: Vec<Note>,
+    segments: Vec<Segment>,
+}
+
+/// `format: None` detects the format from the input.
+pub fn prepare(input: &str, format: Option<Format>, limits: &Limits) -> Document {
+    let detected = format.is_none();
+    let format = format.unwrap_or_else(|| segment::detect_format(input));
+    let split = segment::split(input, format, limits);
+    Document {
+        format,
+        detected,
+        notes: split.notes,
+        segments: split.segments,
+    }
+}
+
+impl Document {
+    pub fn format(&self) -> Format {
+        self.format
+    }
+
+    pub fn format_detected(&self) -> bool {
+        self.detected
+    }
+
+    pub fn notes(&self) -> &[Note] {
+        &self.notes
+    }
+
+    pub fn pieces(&self) -> usize {
+        self.units().count()
+    }
+
+    /// The text sent for every unit, joined by "\n"; input for picking the target language.
+    pub fn translatable_text(&self) -> String {
+        self.units().map(Unit::text).collect::<Vec<_>>().join("\n")
+    }
+
+    fn units(&self) -> impl Iterator<Item = &Unit> {
+        self.segments.iter().filter_map(|s| match s {
+            Segment::Translate(u) => Some(u),
+            Segment::Keep(_) => None,
+        })
+    }
+}
+
+pub struct Job {
+    /// target_lang, source_lang, context, glossary and form are used; text, history,
+    /// max_tokens and stream are set per request.
+    pub request: TranslateRequest,
+    pub seed: Vec<HistoryEntry>,
+    pub history_bytes: usize,
+    pub record: Option<PathBuf>,
+}
+
+/// Translates `document` and writes it to `sink` in document order. Cancel by dropping
+/// the future. A document without pieces is written as is, without contacting the daemon.
+pub async fn translate<B: Backend, S: Sink>(
+    backend: &B,
+    document: Document,
+    job: Job,
+    sink: &mut S,
+) -> Report {
+    let batch = Batch {
+        request: job.request,
+        seed: job.seed,
+        history_bytes: job.history_bytes,
+        record: job.record,
+        items: document.segments.into_iter().map(into_item).collect(),
+    };
+    drive(backend, batch, &split_adapter, sink).await
+}
+
+impl DocUnit for Unit {
+    fn source(&self) -> String {
+        Unit::source(self).to_owned()
+    }
+
+    fn text(&self) -> String {
+        Unit::text(self)
+    }
+
+    fn finish(&self, raw: &str) -> Result<Outcome, UnitError> {
+        match Unit::finish(self, raw) {
+            Ok(finished) => Ok(Outcome {
+                text: finished.text,
+                issues: finished
+                    .issues
+                    .iter()
+                    .map(|i| UnitIssue {
+                        structure: matches!(i, Issue::Structure { .. }),
+                        message: i.to_string(),
+                    })
+                    .collect(),
+            }),
+            Err(FinishError::Empty) => Err(UnitError::Empty),
+            Err(FinishError::Placeholders) => Err(UnitError::Markers),
+        }
+    }
+
+    fn history_pair(&self, raw: &str) -> Option<(String, String)> {
+        Unit::history_pair(self, raw)
+    }
+}
+
+fn into_item(segment: Segment) -> Item<Unit> {
+    match segment {
+        Segment::Keep(s) => Item::Keep(s),
+        Segment::Translate(u) => Item::Unit(u),
+    }
+}
+
+fn split_adapter(unit: &Unit) -> Option<Vec<Item<Unit>>> {
+    segment::split_unit(unit).map(|segments| segments.into_iter().map(into_item).collect())
+}
+
+pub(crate) struct Batch<U> {
+    pub request: TranslateRequest,
     pub seed: Vec<HistoryEntry>,
     pub history_bytes: usize,
     pub record: Option<PathBuf>,
@@ -137,9 +313,9 @@ pub(crate) fn max_tokens_for(text: &str) -> u32 {
     u32::try_from(tokens).unwrap_or(u32::MAX)
 }
 
-struct Run<'w> {
-    out: &'w mut dyn Write,
-    err: &'w mut dyn Write,
+struct Run<'s, S> {
+    sink: &'s mut S,
+    warnings: Vec<Warning>,
     pool: Vec<HistoryEntry>,
     record: Option<PathBuf>,
     /// Top-level pieces with at least one degraded part.
@@ -148,46 +324,45 @@ struct Run<'w> {
     append_failed: bool,
 }
 
-/// Stops the run; the caller prints the specific error before.
-struct Abort(i32);
-
-impl Run<'_> {
-    fn write(&mut self, s: &str, progress: &mut Progress) -> Result<(), Abort> {
-        let res = self
-            .out
-            .write_all(s.as_bytes())
-            .and_then(|()| self.out.flush());
-        res.map_err(|e| {
-            progress.clear();
-            let _ = writeln!(self.err, "error: cannot write stdout: {e}");
-            Abort(ExitCode::Translation as i32)
+impl<S: Sink> Run<'_, S> {
+    async fn write(&mut self, s: &str, piece: Option<&str>) -> Result<(), Stop> {
+        self.sink.write(s).await.map_err(|e| Stop {
+            piece: piece.map(str::to_owned),
+            cause: StopCause::Output(e),
         })
     }
 
-    fn warn(&mut self, label: &str, msg: &str, progress: &mut Progress) {
-        progress.clear();
-        let _ = writeln!(self.err, "warning: piece {label}: {msg}");
-    }
-
-    fn degrade(&mut self, label: &str, msg: &str, progress: &mut Progress) {
-        self.warn(label, msg, progress);
-        self.piece_degraded = true;
+    async fn warn(&mut self, label: &str, kind: WarningKind, message: String) {
+        let warning = Warning {
+            piece: label.to_owned(),
+            kind,
+            message,
+        };
+        self.sink.warn(&warning).await;
+        if kind.degrades() {
+            self.piece_degraded = true;
+        }
+        self.warnings.push(warning);
     }
 
     /// Adds the pair to the pool (and the history file) if the piece qualifies as history.
-    fn record<U: DocUnit>(
+    async fn record<U: DocUnit>(
         &mut self,
         unit: &U,
         raw: &str,
         finish_reason: Option<&str>,
         label: &str,
-        progress: &mut Progress,
     ) {
         let Some((source, translation)) = unit.history_pair(raw) else {
             return;
         };
         if let Err(why) = check_history_eligible(finish_reason, &translation) {
-            self.warn(label, &format!("not used as history: {why}"), progress);
+            self.warn(
+                label,
+                WarningKind::NotHistory,
+                format!("not used as history: {why}"),
+            )
+            .await;
             return;
         }
         let entry = HistoryEntry {
@@ -198,13 +373,9 @@ impl Run<'_> {
             && let Some(path) = &self.record
             && let Err(e) = append_history(path, &entry)
         {
-            progress.clear();
-            let _ = writeln!(
-                self.err,
-                "error: cannot append to history {}: {e}",
-                path.display()
-            );
+            let message = format!("cannot append to history {}: {e}", path.display());
             self.append_failed = true;
+            self.warn(label, WarningKind::HistoryAppend, message).await;
         }
         self.pool.push(entry);
     }
@@ -225,88 +396,70 @@ fn push_items<U>(stack: &mut Vec<Entry<U>>, items: Vec<Item<U>>) {
     }
 }
 
-/// Translates `job.items` one unit at a time and writes the reassembled document to `out`.
-/// Warnings and errors go to `err`; returns the process exit code.
-pub(crate) async fn drive<U: DocUnit, B: Backend>(
+/// Translates `batch.items` one unit at a time and writes the reassembled document to `sink`.
+pub(crate) async fn drive<U: DocUnit, B: Backend, S: Sink>(
     backend: &B,
-    job: Job<U>,
+    batch: Batch<U>,
     split: SplitFn<'_, U>,
-    out: &mut dyn Write,
-    err: &mut dyn Write,
-    progress: &mut Progress,
-) -> i32 {
-    let code = drive_inner(backend, job, split, out, err, progress).await;
-    progress.clear();
-    code
-}
-
-async fn drive_inner<U: DocUnit, B: Backend>(
-    backend: &B,
-    job: Job<U>,
-    split: SplitFn<'_, U>,
-    out: &mut dyn Write,
-    err: &mut dyn Write,
-    progress: &mut Progress,
-) -> i32 {
-    let n = job
+    sink: &mut S,
+) -> Report {
+    let n = batch
         .items
         .iter()
         .filter(|i| matches!(i, Item::Unit(_)))
         .count();
-    let preflighted = n > 0 && (job.history_bytes > 0 || job.record.is_some());
+    let preflighted = n > 0 && (batch.history_bytes > 0 || batch.record.is_some());
     if preflighted && let Err(e) = backend.require_history().await {
-        progress.clear();
-        return write_error(err, &e);
+        return Report {
+            pieces: n,
+            stop: Some(Stop {
+                piece: None,
+                cause: StopCause::Client(e),
+            }),
+            ..Default::default()
+        };
     }
     let mut run = Run {
-        out,
-        err,
-        pool: job.seed,
-        record: job.record,
+        sink,
+        warnings: Vec::new(),
+        pool: batch.seed,
+        record: batch.record,
         degraded: 0,
         piece_degraded: false,
         append_failed: false,
     };
     let ctx = Ctx {
         backend,
-        base: &job.base,
+        base: &batch.request,
         split,
-        history_bytes: job.history_bytes,
+        history_bytes: batch.history_bytes,
         preflighted,
     };
     let mut index = 0usize;
-    for item in job.items {
+    let mut stop = None;
+    for item in batch.items {
         let result = match item {
-            Item::Keep(s) => run.write(&s, progress),
+            Item::Keep(s) => run.write(&s, None).await,
             Item::Unit(u) => {
                 index += 1;
-                let result = ctx
-                    .piece(&mut run, u, &format!("{index}/{n}"), progress)
-                    .await;
+                let result = ctx.piece(&mut run, u, index, n).await;
                 if std::mem::take(&mut run.piece_degraded) {
                     run.degraded += 1;
                 }
                 result
             }
         };
-        if let Err(Abort(code)) = result {
-            return code;
+        if let Err(s) = result {
+            stop = Some(s);
+            break;
         }
     }
-    progress.clear();
-    let mut code = ExitCode::Ok as i32;
-    if run.degraded > 0 {
-        let _ = writeln!(
-            run.err,
-            "error: {} of {n} pieces were not fully translated; see the warnings above",
-            run.degraded
-        );
-        code = ExitCode::Translation as i32;
+    Report {
+        pieces: n,
+        degraded: run.degraded,
+        warnings: run.warnings,
+        stop,
     }
-    if run.append_failed {
-        code = ExitCode::Translation as i32;
-    }
-    code
 }
 
 struct Ctx<'a, B, U> {
@@ -322,19 +475,20 @@ impl<B: Backend, U: DocUnit> Ctx<'_, B, U> {
     ///
     /// One original unit costs at most 2h+3 requests (h = its holes): each marker failure
     /// removes a hole by splitting at it, plus at most one structure split.
-    async fn piece(
+    async fn piece<S: Sink>(
         &self,
-        run: &mut Run<'_>,
+        run: &mut Run<'_, S>,
         unit: U,
-        top_label: &str,
-        progress: &mut Progress,
-    ) -> Result<(), Abort> {
+        index: usize,
+        total: usize,
+    ) -> Result<(), Stop> {
+        let top_label = format!("{index}/{total}");
         let mut stack = vec![Entry::Unit(unit, false)];
         let mut sub = 0usize;
         while let Some(entry) = stack.pop() {
             let (u, sretry) = match entry {
                 Entry::Keep(s) => {
-                    run.write(&s, progress)?;
+                    run.write(&s, Some(&top_label)).await?;
                     continue;
                 }
                 Entry::Unit(u, sretry) => (u, sretry),
@@ -343,7 +497,11 @@ impl<B: Backend, U: DocUnit> Ctx<'_, B, U> {
                 sub += 1;
                 format!("{top_label}.{sub}")
             } else {
-                top_label.to_owned()
+                top_label.clone()
+            };
+            let stop = |cause| Stop {
+                piece: Some(label.clone()),
+                cause,
             };
             let text = u.text();
             let mut req = self.base.clone();
@@ -353,10 +511,15 @@ impl<B: Backend, U: DocUnit> Ctx<'_, B, U> {
             req.history = select_history(&run.pool, self.history_bytes);
             loop {
                 debug_assert!(req.history.is_empty() || self.preflighted);
-                progress.prefix.clear();
-                progress.line(&format!("[{label}]"));
-                progress.prefix = format!("[{label}] ");
-                let attempt = self.backend.attempt(&req, progress).await;
+                run.sink
+                    .progress(&ProgressEvent::Piece {
+                        label: label.clone(),
+                        index,
+                        total,
+                        chars: req.text.chars().count(),
+                    })
+                    .await;
+                let attempt = self.backend.attempt(&req, &mut *run.sink).await;
                 match attempt {
                     Attempt::Done {
                         text: raw,
@@ -370,12 +533,13 @@ impl<B: Backend, U: DocUnit> Ctx<'_, B, U> {
                             .finish(&raw)
                             .map(|f| f.text)
                             .unwrap_or_else(|_| u.source());
-                        run.write(&kept, progress)?;
-                        run.degrade(
+                        run.write(&kept, Some(&label)).await?;
+                        run.warn(
                             &label,
-                            "translation truncated (finish_reason: length)",
-                            progress,
-                        );
+                            WarningKind::Truncated,
+                            "translation truncated (finish_reason: length)".into(),
+                        )
+                        .await;
                         break;
                     }
                     Attempt::Done {
@@ -384,23 +548,26 @@ impl<B: Backend, U: DocUnit> Ctx<'_, B, U> {
                     } => {
                         match u.finish(&raw) {
                             Err(UnitError::Empty) => {
-                                run.write(&u.source(), progress)?;
-                                run.degrade(
+                                run.write(&u.source(), Some(&label)).await?;
+                                run.warn(
                                     &label,
-                                    "empty translation; left untranslated",
-                                    progress,
-                                );
+                                    WarningKind::Empty,
+                                    "empty translation; left untranslated".into(),
+                                )
+                                .await;
                             }
                             Err(UnitError::Markers) => {
                                 if let Some(items) = (self.split)(&u) {
                                     push_items(&mut stack, items);
                                 } else {
-                                    run.write(&u.source(), progress)?;
-                                    run.degrade(
+                                    run.write(&u.source(), Some(&label)).await?;
+                                    run.warn(
                                         &label,
-                                        "verbatim-block markers lost or reordered; left untranslated",
-                                        progress,
-                                    );
+                                        WarningKind::MarkersLost,
+                                        "verbatim-block markers lost or reordered; left untranslated"
+                                            .into(),
+                                    )
+                                    .await;
                                 }
                             }
                             Ok(f) => {
@@ -411,18 +578,18 @@ impl<B: Backend, U: DocUnit> Ctx<'_, B, U> {
                                 {
                                     push_items(&mut stack, items);
                                 } else {
-                                    run.write(&f.text, progress)?;
+                                    run.write(&f.text, Some(&label)).await?;
                                     for issue in &f.issues {
-                                        run.warn(&label, &issue.message, progress);
+                                        let kind = if issue.structure {
+                                            WarningKind::Structure
+                                        } else {
+                                            WarningKind::Inline
+                                        };
+                                        run.warn(&label, kind, issue.message.clone()).await;
                                     }
                                     if f.issues.is_empty() {
-                                        run.record(
-                                            &u,
-                                            &raw,
-                                            finish_reason.as_deref(),
-                                            &label,
-                                            progress,
-                                        );
+                                        run.record(&u, &raw, finish_reason.as_deref(), &label)
+                                            .await;
                                     }
                                 }
                             }
@@ -432,25 +599,20 @@ impl<B: Backend, U: DocUnit> Ctx<'_, B, U> {
                     Attempt::ContextTooLong(_) if !req.history.is_empty() => {
                         drop_oldest_half(&mut req.history);
                     }
-                    Attempt::ContextTooLong(m) => {
+                    Attempt::ContextTooLong(message) => {
                         if let Some(items) = (self.split)(&u) {
                             push_items(&mut stack, items);
                             break;
                         }
-                        progress.clear();
-                        let code = write_daemon_error(run.err, &ErrorCode::ContextTooLong, &m);
-                        return Err(stop(run, code, &label));
+                        return Err(stop(StopCause::Daemon {
+                            code: ErrorCode::ContextTooLong,
+                            message,
+                        }));
                     }
                     Attempt::Daemon { code, message } => {
-                        progress.clear();
-                        let code = write_daemon_error(run.err, &code, &message);
-                        return Err(stop(run, code, &label));
+                        return Err(stop(StopCause::Daemon { code, message }));
                     }
-                    Attempt::Client(e) => {
-                        progress.clear();
-                        let code = write_error(run.err, &e);
-                        return Err(stop(run, code, &label));
-                    }
+                    Attempt::Client(e) => return Err(stop(StopCause::Client(e))),
                 }
             }
         }
@@ -458,19 +620,11 @@ impl<B: Backend, U: DocUnit> Ctx<'_, B, U> {
     }
 }
 
-fn stop(run: &mut Run<'_>, code: i32, label: &str) -> Abort {
-    let _ = writeln!(
-        run.err,
-        "error: stopped at piece {label}; stdout holds everything translated before it"
-    );
-    Abort(code)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
+    use std::sync::Mutex;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct T {
@@ -517,45 +671,116 @@ mod tests {
         }
     }
 
+    /// A `Sync` counter with the read accessor the assertions use.
+    #[derive(Default)]
+    struct Counter(Mutex<usize>);
+
+    impl Counter {
+        fn get(&self) -> usize {
+            *self.0.lock().unwrap()
+        }
+        fn bump(&self) {
+            *self.0.lock().unwrap() += 1;
+        }
+    }
+
     #[derive(Default)]
     struct ScriptedBackend {
-        script: RefCell<VecDeque<Attempt>>,
-        requests: RefCell<Vec<TranslateRequest>>,
-        preflights: Cell<usize>,
-        preflight_result: RefCell<Option<Error>>,
+        script: Mutex<VecDeque<Attempt>>,
+        requests: Mutex<Vec<TranslateRequest>>,
+        preflights: Counter,
+        preflight_result: Mutex<Option<Error>>,
     }
 
     impl ScriptedBackend {
         fn new(script: Vec<Attempt>) -> Self {
             Self {
-                script: RefCell::new(script.into()),
+                script: Mutex::new(script.into()),
                 ..Default::default()
             }
         }
         fn requests(&self) -> Vec<TranslateRequest> {
-            self.requests.borrow().clone()
+            self.requests.lock().unwrap().clone()
         }
     }
 
     impl Backend for ScriptedBackend {
         async fn require_history(&self) -> Result<(), Error> {
-            self.preflights.set(self.preflights.get() + 1);
+            self.preflights.bump();
             assert!(
-                self.requests.borrow().is_empty(),
+                self.requests.lock().unwrap().is_empty(),
                 "preflight after a request"
             );
-            match self.preflight_result.borrow_mut().take() {
+            match self.preflight_result.lock().unwrap().take() {
                 Some(e) => Err(e),
                 None => Ok(()),
             }
         }
-        async fn attempt(&self, req: &TranslateRequest, _: &mut Progress) -> Attempt {
-            self.requests.borrow_mut().push(req.clone());
+        async fn attempt<S: Sink>(&self, req: &TranslateRequest, _: &mut S) -> Attempt {
+            self.requests.lock().unwrap().push(req.clone());
             self.script
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .pop_front()
                 .expect("script exhausted")
         }
+    }
+
+    #[derive(Default)]
+    struct RecordingSink {
+        out: String,
+        err: String,
+        events: Vec<ProgressEvent>,
+    }
+
+    impl Sink for RecordingSink {
+        async fn write(&mut self, text: &str) -> std::io::Result<()> {
+            self.out.push_str(text);
+            Ok(())
+        }
+        async fn warn(&mut self, w: &Warning) {
+            let line = match w.kind {
+                WarningKind::HistoryAppend => format!("error: {w}\n"),
+                _ => format!("warning: {w}\n"),
+            };
+            self.err.push_str(&line);
+        }
+        async fn progress(&mut self, event: &ProgressEvent) {
+            self.events.push(event.clone());
+        }
+    }
+
+    /// Mirrors the CLI's exit code and trailing stderr lines for a finished run.
+    fn render(report: &Report) -> (i32, String) {
+        let mut err = String::new();
+        let code = match &report.stop {
+            Some(stop) => {
+                err.push_str(&format!("error: {}\n", stop.cause));
+                if let Some(label) = &stop.piece {
+                    err.push_str(&format!(
+                        "error: stopped at piece {label}; stdout holds everything translated before it\n"
+                    ));
+                }
+                match stop.cause {
+                    StopCause::Client(Error::DaemonUnreachable { .. }) => 3,
+                    _ => 1,
+                }
+            }
+            None => {
+                if report.degraded > 0 {
+                    err.push_str(&format!(
+                        "error: {} of {} pieces were not fully translated; see the warnings above\n",
+                        report.degraded, report.pieces
+                    ));
+                }
+                if report.degraded > 0 || report.history_append_failed() {
+                    1
+                } else {
+                    0
+                }
+            }
+        };
+        (code, err)
     }
 
     fn stop_done(s: &str) -> Attempt {
@@ -583,9 +808,9 @@ mod tests {
         }
     }
 
-    fn job(items: Vec<Item<T>>) -> Job<T> {
-        Job {
-            base: TranslateRequest {
+    fn job(items: Vec<Item<T>>) -> Batch<T> {
+        Batch {
+            request: TranslateRequest {
                 target_lang: "ja".into(),
                 stream: true,
                 ..Default::default()
@@ -616,24 +841,21 @@ mod tests {
     }
 
     struct Ran {
+        report: Report,
         code: i32,
         out: String,
         err: String,
     }
 
-    async fn run(backend: &ScriptedBackend, job: Job<T>, split: SplitFn<'_, T>) -> Ran {
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let mut progress = Progress {
-            enabled: false,
-            dirty: false,
-            prefix: String::new(),
-        };
-        let code = drive(backend, job, split, &mut out, &mut err, &mut progress).await;
+    async fn run(backend: &ScriptedBackend, job: Batch<T>, split: SplitFn<'_, T>) -> Ran {
+        let mut sink = RecordingSink::default();
+        let report = drive(backend, job, split, &mut sink).await;
+        let (code, trailer) = render(&report);
         Ran {
+            report,
             code,
-            out: String::from_utf8(out).unwrap(),
-            err: String::from_utf8(err).unwrap(),
+            out: sink.out,
+            err: sink.err + &trailer,
         }
     }
 
@@ -681,7 +903,7 @@ mod tests {
     #[tokio::test]
     async fn preflight_failure_writes_nothing() {
         let b = ScriptedBackend::new(vec![]);
-        *b.preflight_result.borrow_mut() = Some(Error::HistoryUnsupported);
+        *b.preflight_result.lock().unwrap() = Some(Error::HistoryUnsupported);
         let mut items = vec![Item::Keep("lead\n".into())];
         items.extend(units(&["a"]));
         let r = run(&b, job(items), &no_split).await;
@@ -816,38 +1038,23 @@ mod tests {
         );
     }
 
-    struct FailingWriter;
+    struct FailingSink;
 
-    impl Write for FailingWriter {
-        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+    impl Sink for FailingSink {
+        async fn write(&mut self, _: &str) -> std::io::Result<()> {
             Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
         }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
+        async fn warn(&mut self, _: &Warning) {}
+        async fn progress(&mut self, _: &ProgressEvent) {}
     }
 
     #[tokio::test]
     async fn stdout_write_error_aborts() {
         let b = ScriptedBackend::new(vec![stop_done("A"), stop_done("B")]);
-        let mut err = Vec::new();
-        let mut progress = Progress {
-            enabled: false,
-            dirty: false,
-            prefix: String::new(),
-        };
-        let code = drive(
-            &b,
-            job(units(&["a", "b"])),
-            &no_split,
-            &mut FailingWriter,
-            &mut err,
-            &mut progress,
-        )
-        .await;
-        let err = String::from_utf8(err).unwrap();
+        let report = drive(&b, job(units(&["a", "b"])), &no_split, &mut FailingSink).await;
+        let (code, err) = render(&report);
         assert_eq!(code, 1);
-        assert!(err.contains("error: cannot write stdout: "), "{err}");
+        assert!(err.contains("error: cannot write output: "), "{err}");
         assert_eq!(b.requests().len(), 1);
     }
 
@@ -990,7 +1197,13 @@ mod tests {
         let r = run(&b, job(units(&["a", "b", "c"])), &no_split).await;
         assert_eq!(r.code, 3);
         assert_eq!(r.out, "A");
-        assert!(r.err.contains("plamo-translate daemon install"));
+        assert!(matches!(
+            r.report.stop,
+            Some(Stop {
+                cause: StopCause::Client(Error::DaemonUnreachable { .. }),
+                ..
+            })
+        ));
         assert!(r.err.contains("stopped at piece 2/3"));
     }
 
@@ -1005,11 +1218,8 @@ mod tests {
         j.record = Some(path.clone());
         let r = run(&b, j, &no_split).await;
         assert_eq!(r.code, 1);
-        let lines: Vec<HistoryEntry> = std::fs::read_to_string(&path)
-            .unwrap()
-            .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect();
+        let lines: Vec<HistoryEntry> =
+            plamo_client::parse_history(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let (s, tr) = t("a").history_pair(" A \n").unwrap();
         assert_eq!(lines, vec![pair("s", "t"), pair(&s, &tr), pair("c", "C")]);
     }
@@ -1073,12 +1283,8 @@ mod tests {
 
     /// Serves one connection: reads the request line, writes `lines`, then closes.
     fn serve_once(lines: &'static [&'static str]) -> (tempfile::TempDir, PathBuf) {
-        use std::io::{BufRead, BufReader};
-        let dir = tempfile::Builder::new()
-            .prefix("pt")
-            .tempdir_in("/tmp")
-            .unwrap();
-        let socket = dir.path().join("d.sock");
+        use std::io::{BufRead, BufReader, Write};
+        let (dir, socket) = socket_dir();
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         std::thread::spawn(move || {
             let (mut conn, _) = listener.accept().unwrap();
@@ -1096,13 +1302,8 @@ mod tests {
     async fn client_attempt(lines: &'static [&'static str]) -> Attempt {
         let (_dir, socket) = serve_once(lines);
         let client = Client::new(socket);
-        let mut progress = Progress {
-            enabled: false,
-            dirty: false,
-            prefix: String::new(),
-        };
-        ClientBackend(&client)
-            .attempt(&TranslateRequest::default(), &mut progress)
+        ClientBackend::new(&client)
+            .attempt(&TranslateRequest::default(), &mut RecordingSink::default())
             .await
     }
 
@@ -1146,13 +1347,8 @@ mod tests {
     async fn client_backend_reports_unreachable() {
         let client = Client::new("/nonexistent/plamo-translate-test.sock".into())
             .with_connect_timeout(std::time::Duration::from_millis(50));
-        let mut progress = Progress {
-            enabled: false,
-            dirty: false,
-            prefix: String::new(),
-        };
-        let a = ClientBackend(&client)
-            .attempt(&TranslateRequest::default(), &mut progress)
+        let a = ClientBackend::new(&client)
+            .attempt(&TranslateRequest::default(), &mut RecordingSink::default())
             .await;
         assert!(
             matches!(a, Attempt::Client(Error::DaemonUnreachable { .. })),
@@ -1178,5 +1374,191 @@ mod tests {
             r.err
         );
         assert_eq!(b.requests()[1].history, vec![]);
+    }
+
+    /// A short directory for a Unix socket (macOS caps socket paths near 104 bytes).
+    fn socket_dir() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::Builder::new()
+            .prefix("pt")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket = dir.path().join("d.sock");
+        (dir, socket)
+    }
+
+    fn public_job(history_bytes: usize) -> Job {
+        Job {
+            request: TranslateRequest {
+                target_lang: "ja".into(),
+                ..Default::default()
+            },
+            seed: vec![],
+            history_bytes,
+            record: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn sink_receives_piece_and_generated_events() {
+        let (_dir, socket) = serve_once(&[
+            r#"{"type":"progress","stage":"loading"}"#,
+            r#"{"type":"delta","text":"He"}"#,
+            r#"{"type":"delta","text":"llo"}"#,
+            r#"{"type":"done","text":"Hello","finish_reason":"stop"}"#,
+        ]);
+        let client = Client::new(socket);
+        let doc = prepare("Hi there.\n", Some(Format::Text), &Limits::default());
+        let chars = doc.translatable_text().chars().count();
+        let mut sink = RecordingSink::default();
+        let report = translate(&ClientBackend::new(&client), doc, public_job(0), &mut sink).await;
+        assert!(report.clean(), "{report:?}");
+        assert_eq!(sink.out, "Hello\n");
+        assert_eq!(
+            sink.events,
+            vec![
+                ProgressEvent::Piece {
+                    label: "1/1".into(),
+                    index: 1,
+                    total: 1,
+                    chars,
+                },
+                ProgressEvent::Stage {
+                    stage: "loading".into(),
+                    done_bytes: None,
+                    total_bytes: None,
+                },
+                ProgressEvent::Generated { chars: 2 },
+                ProgressEvent::Generated { chars: 5 },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn report_counts_degraded_once_per_piece() {
+        let b = ScriptedBackend::new(vec![
+            length_done("TRUNC"),
+            length_done("X1"),
+            length_done("Y1"),
+        ]);
+        let r = run(&b, job(units(&["x|y"])), &bar_split).await;
+        assert_eq!(r.report.pieces, 1);
+        assert_eq!(r.report.degraded, 1);
+        let kinds: Vec<(&str, WarningKind)> = r
+            .report
+            .warnings
+            .iter()
+            .map(|w| (w.piece.as_str(), w.kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("1/1.1", WarningKind::Truncated),
+                ("1/1.2", WarningKind::Truncated)
+            ]
+        );
+        assert!(r.report.complete());
+        assert!(!r.report.clean());
+        assert!(!r.report.history_append_failed());
+    }
+
+    #[test]
+    fn prepare_none_detects_format_and_reports_notes() {
+        let input = "# Title\n\nSome prose.\n\n<div>html text</div>\n";
+        let doc = prepare(input, None, &Limits::default());
+        assert_eq!(doc.format(), Format::Markdown);
+        assert!(doc.format_detected());
+        assert_eq!(
+            doc.notes(),
+            [Note {
+                line: 5,
+                kind: crate::NoteKind::HtmlText
+            }]
+        );
+        assert!(doc.pieces() > 0);
+        assert!(doc.translatable_text().contains("Some prose."));
+        assert!(!doc.translatable_text().contains("html text"));
+
+        let doc = prepare(input, Some(Format::Text), &Limits::default());
+        assert_eq!(doc.format(), Format::Text);
+        assert!(!doc.format_detected());
+    }
+
+    #[tokio::test]
+    async fn translate_with_zero_pieces_writes_keeps_without_backend() {
+        let input = "```\nfn main() {}\n```\n";
+        let doc = prepare(input, Some(Format::Markdown), &Limits::default());
+        assert_eq!(doc.pieces(), 0);
+        assert_eq!(doc.translatable_text(), "");
+        let b = ScriptedBackend::new(vec![]);
+        let mut sink = RecordingSink::default();
+        let report = translate(&b, doc, public_job(8000), &mut sink).await;
+        assert!(report.clean(), "{report:?}");
+        assert_eq!(report.pieces, 0);
+        assert_eq!(sink.out, input);
+        assert_eq!(b.preflights.get(), 0);
+        assert!(b.requests().is_empty());
+        assert!(sink.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn client_backend_event_timeout_yields_timed_out() {
+        let (_dir, socket) = socket_dir();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            let (_conn, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let client = Client::new(socket);
+        let a = ClientBackend::new(&client)
+            .with_event_timeout(Duration::from_millis(50))
+            .attempt(&TranslateRequest::default(), &mut RecordingSink::default())
+            .await;
+        assert!(
+            matches!(&a, Attempt::Client(Error::Io(e)) if e.kind() == std::io::ErrorKind::TimedOut),
+            "{a:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_backend_event_timeout_resets_per_event() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (_dir, socket) = socket_dir();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            let (conn, _) = listener.accept().await.unwrap();
+            let (read, mut write) = conn.into_split();
+            let mut line = String::new();
+            BufReader::new(read).read_line(&mut line).await.unwrap();
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                write
+                    .write_all(b"{\"type\":\"delta\",\"text\":\"x\"}\n")
+                    .await
+                    .unwrap();
+            }
+            write
+                .write_all(
+                    b"{\"type\":\"done\",\"text\":\"xxxxxxxxxx\",\"finish_reason\":\"stop\"}\n",
+                )
+                .await
+                .unwrap();
+        });
+        let client = Client::new(socket);
+        let a = ClientBackend::new(&client)
+            .with_event_timeout(Duration::from_millis(100))
+            .attempt(&TranslateRequest::default(), &mut RecordingSink::default())
+            .await;
+        assert!(matches!(&a, Attempt::Done { .. }), "{a:?}");
+    }
+
+    #[test]
+    fn translate_future_is_send() {
+        fn assert_send<T: Send>(_: &T) {}
+        let client = Client::new("/nonexistent/plamo-translate-test.sock".into());
+        let backend = ClientBackend::new(&client);
+        let doc = prepare("Hello.\n", None, &Limits::default());
+        let mut sink = RecordingSink::default();
+        let future = translate(&backend, doc, public_job(8000), &mut sink);
+        assert_send(&future);
     }
 }

@@ -1,12 +1,14 @@
-mod driver;
-
 use crate::EXIT_INTERRUPTED;
 use crate::ExitCode;
-use crate::translate::{Progress, RequestOpts, load_opts, read_history, usage_error};
+use crate::translate::{
+    Progress, RequestOpts, load_opts, read_history, usage_error, write_daemon_error, write_error,
+};
 use clap::Args;
-use driver::{ClientBackend, DocUnit, Item, Job, Outcome, UnitError, UnitIssue, drive};
 use plamo_client::{Client, Config, TranslateRequest, resolve_target};
-use plamo_doc::{FinishError, Format, Issue, Limits, NoteKind, Segment, Unit};
+use plamo_doc::{
+    ClientBackend, Format, Job, Limits, NoteKind, ProgressEvent, Report, Sink, StopCause, Warning,
+    WarningKind, prepare, translate,
+};
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 
@@ -42,49 +44,6 @@ pub struct DocArgs {
     history_bytes: usize,
 }
 
-impl DocUnit for Unit {
-    fn source(&self) -> String {
-        Unit::source(self).to_owned()
-    }
-
-    fn text(&self) -> String {
-        Unit::text(self)
-    }
-
-    fn finish(&self, raw: &str) -> Result<Outcome, UnitError> {
-        match Unit::finish(self, raw) {
-            Ok(finished) => Ok(Outcome {
-                text: finished.text,
-                issues: finished
-                    .issues
-                    .iter()
-                    .map(|i| UnitIssue {
-                        structure: matches!(i, Issue::Structure { .. }),
-                        message: i.to_string(),
-                    })
-                    .collect(),
-            }),
-            Err(FinishError::Empty) => Err(UnitError::Empty),
-            Err(FinishError::Placeholders) => Err(UnitError::Markers),
-        }
-    }
-
-    fn history_pair(&self, raw: &str) -> Option<(String, String)> {
-        Unit::history_pair(self, raw)
-    }
-}
-
-fn into_item(segment: Segment) -> Item<Unit> {
-    match segment {
-        Segment::Keep(s) => Item::Keep(s),
-        Segment::Translate(u) => Item::Unit(u),
-    }
-}
-
-fn split_adapter(unit: &Unit) -> Option<Vec<Item<Unit>>> {
-    plamo_doc::split_unit(unit).map(|segments| segments.into_iter().map(into_item).collect())
-}
-
 pub async fn run(client: &Client, config: &Config, args: DocArgs) -> i32 {
     let mut input = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut input) {
@@ -110,17 +69,17 @@ pub async fn run(client: &Client, config: &Config, args: DocArgs) -> i32 {
         None => Vec::new(),
     };
     let record = args.history.filter(|_| args.history_append);
-    let auto = args.format == FormatArg::Auto;
     let format = match args.format {
-        FormatArg::Auto => plamo_doc::detect_format(&input),
-        FormatArg::Text => Format::Text,
-        FormatArg::Markdown => Format::Markdown,
+        FormatArg::Auto => None,
+        FormatArg::Text => Some(Format::Text),
+        FormatArg::Markdown => Some(Format::Markdown),
     };
-    let split = plamo_doc::split(&input, format, &Limits::default());
+    let doc = prepare(&input, format, &Limits::default());
+    let auto = doc.format_detected();
 
     let mut stderr = std::io::stderr();
     if auto {
-        let name = match format {
+        let name = match doc.format() {
             Format::Text => "text",
             Format::Markdown => "markdown",
         };
@@ -129,7 +88,7 @@ pub async fn run(client: &Client, config: &Config, args: DocArgs) -> i32 {
             "note: input format: {name} (auto-detected; use --format to override)"
         );
     }
-    for note in &split.notes {
+    for note in doc.notes() {
         let line = note.line;
         match note.kind {
             NoteKind::IndentedCode if auto => {
@@ -151,16 +110,9 @@ pub async fn run(client: &Client, config: &Config, args: DocArgs) -> i32 {
         }
     }
 
-    let units: Vec<String> = split
-        .segments
-        .iter()
-        .filter_map(|s| match s {
-            Segment::Translate(u) => Some(u.text()),
-            Segment::Keep(_) => None,
-        })
-        .collect();
     let mut stdout = std::io::stdout();
-    if units.is_empty() {
+    // Before resolving the target: with nothing to translate, "auto" has no text to look at.
+    if doc.pieces() == 0 {
         let written = stdout
             .write_all(input.as_bytes())
             .and_then(|()| stdout.flush());
@@ -175,10 +127,10 @@ pub async fn run(client: &Client, config: &Config, args: DocArgs) -> i32 {
 
     let target_lang = match opts.to {
         Some(t) => t,
-        None => resolve_target(&units.join("\n"), &config.default_target),
+        None => resolve_target(&doc.translatable_text(), &config.default_target),
     };
     let job = Job {
-        base: TranslateRequest {
+        request: TranslateRequest {
             text: String::new(),
             target_lang,
             source_lang: opts.from,
@@ -192,27 +144,100 @@ pub async fn run(client: &Client, config: &Config, args: DocArgs) -> i32 {
         seed,
         history_bytes: args.history_bytes,
         record,
-        items: split.segments.into_iter().map(into_item).collect(),
     };
-    let mut progress = Progress {
-        enabled: std::io::stderr().is_terminal(),
-        dirty: false,
-        prefix: String::new(),
+    let mut sink = CliSink {
+        stdout,
+        stderr,
+        progress: Progress {
+            enabled: std::io::stderr().is_terminal(),
+            dirty: false,
+            prefix: String::new(),
+        },
     };
-    let backend = ClientBackend(client);
-    tokio::select! {
-        code = drive(
-            &backend,
-            job,
-            &split_adapter,
-            &mut stdout,
-            &mut stderr,
-            &mut progress,
-        ) => code,
-        _ = tokio::signal::ctrl_c() => {
-            progress.clear();
-            EXIT_INTERRUPTED
+    let backend = ClientBackend::new(client);
+    let report = {
+        let translating = translate(&backend, doc, job, &mut sink);
+        tokio::select! {
+            report = translating => Some(report),
+            _ = tokio::signal::ctrl_c() => None,
         }
+    };
+    sink.progress.clear();
+    match report {
+        Some(report) => finish(&report, &mut sink.stderr),
+        None => EXIT_INTERRUPTED,
+    }
+}
+
+struct CliSink {
+    stdout: std::io::Stdout,
+    stderr: std::io::Stderr,
+    progress: Progress,
+}
+
+impl Sink for CliSink {
+    async fn write(&mut self, text: &str) -> std::io::Result<()> {
+        self.stdout
+            .write_all(text.as_bytes())
+            .and_then(|()| self.stdout.flush())
+    }
+
+    async fn warn(&mut self, warning: &Warning) {
+        self.progress.clear();
+        let prefix = match warning.kind {
+            WarningKind::HistoryAppend => "error",
+            _ => "warning",
+        };
+        let _ = writeln!(self.stderr, "{prefix}: {warning}");
+    }
+
+    async fn progress(&mut self, event: &ProgressEvent) {
+        match event {
+            ProgressEvent::Piece { label, .. } => {
+                self.progress.prefix.clear();
+                self.progress.line(&format!("[{label}]"));
+                self.progress.prefix = format!("[{label}] ");
+            }
+            ProgressEvent::Stage {
+                stage,
+                done_bytes,
+                total_bytes,
+            } => self.progress.show(stage, *done_bytes, *total_bytes),
+            ProgressEvent::Generated { chars } => self.progress.line(&format!("{chars} chars")),
+        }
+    }
+}
+
+/// Prints the trailing error lines of a finished run and returns the exit code.
+fn finish(report: &Report, stderr: &mut dyn Write) -> i32 {
+    match &report.stop {
+        Some(stop) => {
+            let code = match &stop.cause {
+                StopCause::Client(e) => write_error(stderr, e),
+                StopCause::Daemon { code, message } => write_daemon_error(stderr, code, message),
+                StopCause::Output(e) => {
+                    let _ = writeln!(stderr, "error: cannot write stdout: {e}");
+                    ExitCode::Translation as i32
+                }
+            };
+            if let Some(label) = &stop.piece {
+                let _ = writeln!(
+                    stderr,
+                    "error: stopped at piece {label}; stdout holds everything translated before it"
+                );
+            }
+            code
+        }
+        None if report.degraded > 0 => {
+            let _ = writeln!(
+                stderr,
+                "error: {} of {} pieces were not fully translated; see the warnings above",
+                report.degraded, report.pieces
+            );
+            ExitCode::Translation as i32
+        }
+        None if report.history_append_failed() => ExitCode::Translation as i32,
+        None => ExitCode::Ok as i32,
     }
 }
 
