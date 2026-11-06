@@ -4,6 +4,14 @@ export function containsJapanese(text) {
   return JAPANESE.test(text)
 }
 
+// Sub-agent hand-backs, task notifications and other machine-sent prompts often quote Japanese,
+// and asking about each one would stall the session.
+const TYPED_ORIGINS = new Set(['composer', 'bridge', 'sdk'])
+
+export function isTypedByUser(e) {
+  return !e.isMeta && (e.origin === undefined || TYPED_ORIGINS.has(e.origin.kind))
+}
+
 export function isPassthroughCommand(text) {
   return /^\s*[/!]/.test(text)
 }

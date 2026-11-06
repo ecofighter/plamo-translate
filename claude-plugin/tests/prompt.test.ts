@@ -91,6 +91,34 @@ test('english passes through', async ($, on) => {
   expect(h.runs.length).toBe(0)
 })
 
+test('prompts the user did not type pass through', async ($, on) => {
+  const h = setup(on)
+  await turnOn($)
+  for (const kind of ['peer', 'task-notification', 'scheduled-trigger', 'unclassified']) {
+    const e = { text: '計画の報告です', origin: { kind } }
+    expect(await $.prompt.submit(e)).toEqual({ text: e.text })
+  }
+  expect(h.runs.length).toBe(0)
+  expect(h.questions.length).toBe(0)
+})
+
+test('prompts the user typed are translated', async ($, on) => {
+  const h = setup(on)
+  await turnOn($)
+  for (const kind of ['composer', 'bridge', 'sdk']) {
+    h.answers.push(LABELS.send)
+    expect(await $.prompt.submit({ text: '直して', origin: { kind } })).toEqual({ text: 'EN<直して>' })
+  }
+  expect(h.questions.length).toBe(3)
+})
+
+test('meta prompts pass through', async ($, on) => {
+  const h = setup(on)
+  await turnOn($)
+  expect(await $.prompt.submit({ text: '直して', isMeta: true })).toEqual({ text: '直して' })
+  expect(h.runs.length).toBe(0)
+})
+
 test('fence-only Japanese passes through', async ($, on) => {
   const h = setup(on)
   await turnOn($)

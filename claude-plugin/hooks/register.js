@@ -7,6 +7,7 @@ import {
   decideSubmission,
   isMostlyJapanese,
   isPassthroughCommand,
+  isTypedByUser,
   LABELS,
   withFences,
 } from './lib/input.js'
@@ -19,10 +20,33 @@ const OUTPUT_TIMEOUT_MS = 20000
 // so a paragraph can be held until it is complete.
 const HOLD_INCOMPLETE = true
 const DROP_REASON = '送信をやめました。'
+// The engine replaces the plugin's copy mid-session (a hooks worker respawn) and runs register and
+// session.start again; the switch lives in session state so that does not turn the layer off.
+const ENABLED = { plugin: 'plamo-ja-bridge', key: 'enabled' }
+const COMMAND = {
+  name: 'ja',
+  description: '日英レイヤ (plamo-translate) のオン・オフ',
+  argumentHint: '[on|off|status]',
+}
 
 const confirmQuestion = (en) => `英訳を確認してください。\n\n${en}\n\nこの英訳で送りますか?`
 const failureQuestion = (reason) => `翻訳に失敗しました (${reason})。どうしますか?`
 const crashReason = (kind) => `日英レイヤでエラーが起きたため送信を止めました (${kind})。/ja off で無効にできます。`
+
+async function loadEnabled($, ctx) {
+  const { value } = await $.state.get(ENABLED)
+  ctx.enabled = value ?? ctx.cfg.enabledByDefault
+  return ctx.enabled
+}
+
+async function isEnabled($, ctx) {
+  return ctx.enabled ?? (await loadEnabled($, ctx))
+}
+
+async function setEnabled($, ctx, value) {
+  ctx.enabled = value
+  await $.state.set(ENABLED, value)
+}
 
 async function historyPath($) {
   const tmp = ((await $.env.get('TMPDIR')) ?? '/tmp').replace(/\/$/, '')
@@ -129,22 +153,30 @@ async function renderBlock($, ctx, block) {
 }
 
 export function register(on, options) {
-  const ctx = { cfg: resolveConfig(options), memory: createMemory(), queue: Promise.resolve() }
+  const ctx = { cfg: resolveConfig(options), memory: createMemory(), queue: Promise.resolve(), enabled: undefined }
   const displayBuffers = new Map()
-  let enabled = ctx.cfg.enabledByDefault
 
-  const stateLabel = () => (enabled ? 'オン' : 'オフ')
+  const stateLabel = () => (ctx.enabled ? 'オン' : 'オフ')
 
   on('session.start', async ($, e, next) => {
     ctx.memory.clear()
-    enabled = ctx.cfg.enabledByDefault
-    await $.command.register({
-      name: 'ja',
-      description: '日英レイヤ (plamo-translate) のオン・オフ',
-      argumentHint: '[on|off|status]',
-    })
-    $.ui.status(enabled ? STATUS_TEXT : undefined)
+    await loadEnabled($, ctx)
+    await $.command.register(COMMAND)
+    $.ui.status(ctx.enabled ? STATUS_TEXT : undefined)
     return next(e)
+  })
+
+  // /ja has gone missing mid-session (only /reload-plugins brought it back); each main turn restores it
+  // and the status line.
+  on('turn.start', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId !== undefined) return result
+    try {
+      const commands = await $.command.list()
+      if (!commands.some((c) => c.name === COMMAND.name)) await $.command.register(COMMAND)
+      $.ui.status((await isEnabled($, ctx)) ? STATUS_TEXT : undefined)
+    } catch {}
+    return result
   })
 
   // session.start does not fire after /clear or /resume, and the old conversation's pairs no longer apply.
@@ -159,15 +191,17 @@ export function register(on, options) {
   on('command.run', { command: 'ja' }, async ($, e) => {
     const arg = (e.args ?? '').trim()
     if (arg === 'status') {
+      await isEnabled($, ctx)
       return { text: `日英レイヤ: ${stateLabel()} / 対訳 ${ctx.memory.size()} 組 / 翻訳: ${ctx.cfg.translator}` }
     }
-    enabled = arg === 'on' ? true : arg === 'off' ? false : !enabled
-    $.ui.status(enabled ? STATUS_TEXT : undefined)
+    const current = await isEnabled($, ctx)
+    await setEnabled($, ctx, arg === 'on' ? true : arg === 'off' ? false : !current)
+    $.ui.status(ctx.enabled ? STATUS_TEXT : undefined)
     return { text: `日英レイヤ: ${stateLabel()}` }
   })
 
   on('prompt.submit', async ($, e, next) => {
-    if (!enabled || isPassthroughCommand(e.text)) return next(e)
+    if (!isTypedByUser(e) || isPassthroughCommand(e.text) || !(await isEnabled($, ctx))) return next(e)
     return submitJapanese($, ctx, e, next)
   }).catch(async ($, e, next) => {
     if (next.called) return next(e)
@@ -176,7 +210,7 @@ export function register(on, options) {
 
   on('classic.MessageDisplay', async ($, e, next) => {
     const held = displayBuffers.get(e.message_id)
-    if (!enabled) {
+    if (!(await isEnabled($, ctx))) {
       if (!held) return next(e)
       displayBuffers.delete(e.message_id)
       return { displayContent: held.takeAll().map((b) => b.text).join('') + e.delta }
