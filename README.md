@@ -123,7 +123,7 @@ plamo-translate doc -t en --format text --history-bytes 0 < notes.txt
 - 参照形式のリンク (`[text][ref]` など) は、出力ではインラインのリンクに書き換わる
 - 出力はピースを訳し終えるたびに書く。改行は足さない。訳す対象のない文書は、デーモンに接続せずそのまま出力する
 - 打ち切られたピース、空の訳、内部のマーカーが壊れたピースは、原文のまま (打ち切りは訳の途中まで) 書き、`warning: piece N/M: …` を出す。最後に `error: K of M pieces were not fully translated; see the warnings above` を出して終了コード 1 で終わる。構造やインライン要素の違いは警告だけで、終了コードには影響しない
-- 途中でエラーになると `error: stopped at piece N/M; stdout holds everything translated before it` を出して止まる。stdout にはそのピースの前までの出力が欠けなく残る
+- 途中でエラーになると `error: stopped at piece N/M; stdout holds everything translated before it` を出して止まる。stdout にはそのピースの前までの出力が欠けなく残る。stdout への書き込みに失敗したときと、履歴の事前確認で止まったときは、この行を出さない
 - `--history` で渡した履歴は、文書のそれより前の部分と同じ扱いで、新しい組に押し出されると送られなくなる。毎回効かせたい用語は `--glossary` で指定する
 - 履歴を使うので、ピースごとに 2〜3 秒ほど余計にかかる (既定の `--history-bytes` のとき)。履歴を使うときはデーモンの対応を最初に確かめる
 - 単体のときと違い、文書に `<|plamo:` が含まれていてもよい。エスケープした形で送り、訳は元のまま戻る。ただしエスケープ済みの形や内部のマーカーのテキストをすでに含むブロックは訳さず、`warning: line N: block left untranslated: contains reserved marker text` を出す
@@ -194,7 +194,7 @@ Claude Desktop の Code タブのローカルセッションは、このファ�
 
 ## Claude Code の日英レイヤ (`plamo-ja-bridge`)
 
-Claude Code の mod。日本語で入力すると英訳して Claude に送り、Claude の英語の応答を段落ごとに和訳して表示する。Claude には英文だけが届き、transcript にも英文が残る。翻訳には `plamo-translate` CLI を使うので、CLI とデーモンを先に導入しておく。文書ファイルを訳す skill (下記) も含む。動作はターミナルの Claude Code v2.1.317 で確かめた。Claude Desktop の Code タブでは確かめていない。
+Claude Code の mod。日本語で入力すると英訳して Claude に送り、Claude の英語の応答を段落ごとに和訳して表示する。Claude には英文だけが届き、transcript にも英文が残る。翻訳には `plamo-translate` CLI を使うので、CLI とデーモンを先に導入しておく。文書ファイルを訳す skill (下記) も含む。Claude Code v2.1.319 以降が必要 (hooks の API の版による)。Claude Desktop の Code タブでは確かめていない。
 
 ### 導入
 
