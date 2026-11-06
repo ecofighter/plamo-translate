@@ -3,6 +3,8 @@ import { createMemory, dropOldestHalf, isEligiblePair, toJsonl } from './lib/mem
 import { buildArgs, parseResult } from './lib/cli.js'
 import { splitEdges, splitFences } from './lib/segments.js'
 import {
+  CONFIRM_PREVIEW_CHARS,
+  confirmPreview,
   containsJapanese,
   decideSubmission,
   isMostlyJapanese,
@@ -12,7 +14,7 @@ import {
   withFences,
 } from './lib/input.js'
 import { tableShapeMatches } from './lib/display.js'
-import { ABORTED, untilAborted } from './lib/doc.js'
+import { ABORTED, buildDocArgs, docTimeoutMs, parseDocRun, untilAborted, utf8Bytes } from './lib/doc.js'
 import {
   abandon,
   arrive,
@@ -45,7 +47,14 @@ import {
 } from './lib/pipeline.js'
 
 const STATUS_TEXT = 'ja⇄en'
+const DOC_STATUS_TEXT = 'ja⇄en 英訳中…'
 const INPUT_TIMEOUT_MS = 60000
+const INPUT_DOC_BYTES = 3000
+const LOG_CHUNK_CHARS = 1900
+const SHOW_FULL = '全文を表示'
+const DOC_TOO_OLD_NOTICE = '長文の分割翻訳には plamo-translate 0.2.0 以降が必要です。更新してください。'
+// Failures a run split into pieces can get past; a timeout is not one, since doc would only take longer.
+const DOC_RETRY_REASONS = new Set(['empty translation', 'reserved token in translation'])
 const OUTPUT_TIMEOUT_MS = 20000
 const NOTICE_TIMEOUT_MS = 8000
 const DROP_REASON = '送信をやめました。'
@@ -62,7 +71,9 @@ const COMMAND = {
   argumentHint: '[on|off|status]',
 }
 
-const confirmQuestion = (en) => `英訳を確認してください。\n\n${en}\n\nこの英訳で送りますか?`
+const partialNotice = (degraded, pieces) =>
+  `一部 (${degraded}/${pieces} ピース) は英訳しきれていません (日本語のまま、または訳が途中で切れています)。`
+const notesNotice = (notes) => `${notes} か所 (コード扱いのブロックなど) は訳さずに残しました。`
 const failureQuestion = (reason) => `翻訳に失敗しました (${reason})。どうしますか?`
 const crashReason = (kind) => `日英レイヤでエラーが起きたため送信を止めました (${kind})。/ja off で無効にできます。`
 const failureNotice = (n, reason) => `一部の段落を英語のまま表示しました (${n} 件: ${reason})。`
@@ -155,6 +166,61 @@ function translateInput($, ctx, text, signal) {
   return untilAborted(run, signal)
 }
 
+const docAvailable = (ctx) => ctx.cfg.useDoc && !ctx.docTooOld
+
+// Settles when the process ends, even after the caller stopped waiting: the history file stays claimed
+// while the daemon may still read it.
+async function execDoc($, ctx, { text, direction, timeoutMs }) {
+  const [from, to] = direction === 'ja-en' ? ['ja', 'en'] : ['en', 'ja']
+  const history = ctx.memory.select(direction, { maxPairs: ctx.cfg.historyPairs, maxChars: ctx.cfg.historyChars })
+  const slot = history.length > 0 ? acquireHistorySlot(ctx) : undefined
+  let run
+  try {
+    let historyFile
+    if (slot !== undefined) {
+      historyFile = await historyPath($, slot)
+      await $.fs.write(historyFile, toJsonl(history))
+    }
+    try {
+      run = await $.process.run([ctx.cfg.translator, ...buildDocArgs({ from, to, form: ctx.cfg.form, historyFile })], {
+        stdin: text,
+        timeoutMs,
+      })
+    } catch (err) {
+      return { ok: false, reason: err?.message || 'timeout' }
+    }
+  } finally {
+    if (slot !== undefined) ctx.historySlots.delete(slot)
+  }
+  const result = parseDocRun(run)
+  if (result.tooOld) {
+    // Both directions may find out at once; the user needs to hear it only once.
+    if (!ctx.docTooOld) $.ui.toast(DOC_TOO_OLD_NOTICE)
+    ctx.docTooOld = true
+  }
+  return result
+}
+
+// `pauseDisplay` holds new display work until the process ends, as a prompt's single calls do.
+function runDoc($, ctx, { text, direction, timeoutMs, pauseDisplay = false }, signal) {
+  if (!docAvailable(ctx)) return Promise.resolve({ ok: false, unsupported: true })
+  if (pauseDisplay) beginInput(ctx.display)
+  const run = execDoc($, ctx, { text, direction, timeoutMs }).finally(() => {
+    if (pauseDisplay) endInput(ctx.display)
+  })
+  return untilAborted(run, signal).then((r) => (r === ABORTED ? { ok: false, reason: 'interrupted' } : r))
+}
+
+async function translateInputDoc($, ctx, text, signal) {
+  $.ui.status(DOC_STATUS_TEXT)
+  try {
+    const timeoutMs = docTimeoutMs(utf8Bytes(text))
+    return await runDoc($, ctx, { text, direction: 'ja-en', timeoutMs, pauseDisplay: true }, signal)
+  } finally {
+    $.ui.status(STATUS_TEXT)
+  }
+}
+
 async function ask($, question, options, signal) {
   try {
     const answer = await untilAborted($.ui.ask(question, options), signal)
@@ -164,10 +230,81 @@ async function ask($, question, options, signal) {
   }
 }
 
+// The host draws about 2000 characters of a log line; a cut never splits a surrogate pair.
+function logChunks($, text) {
+  for (let i = 0; i < text.length; ) {
+    let end = Math.min(i + LOG_CHUNK_CHARS, text.length)
+    if (end < text.length && /[\ud800-\udbff]/.test(text[end - 1])) end -= 1
+    $.ui.log(text.slice(i, end))
+    i = end
+  }
+}
+
+async function confirmEnglish($, english, notices, signal) {
+  const question = (notices.length > 0 ? notices.join('\n') + '\n\n' : '') + confirmPreview(english)
+  const choices = [LABELS.send, LABELS.original, LABELS.cancel]
+  if (english.length <= CONFIRM_PREVIEW_CHARS) return ask($, question, choices, signal)
+  const answer = await ask($, question, [...choices, SHOW_FULL], signal)
+  if (answer !== SHOW_FULL) return answer
+  logChunks($, english)
+  return ask($, question, choices, signal)
+}
+
+async function askFailure($, e, next, reason) {
+  const answer = await ask($, failureQuestion(reason), [LABELS.original, LABELS.cancel], next.signal)
+  return answer === LABELS.original ? next(e) : { drop: DROP_REASON }
+}
+
+function send(ctx, e, next, segments, english, answer, rememberTranslation) {
+  const decision = decideSubmission(answer)
+  if (decision === 'drop') return { drop: DROP_REASON }
+  if (decision === 'send-original') return next(e)
+  if (decision === 'send-translation') {
+    rememberTranslation()
+    return next({ ...e, text: english })
+  }
+  const hasFence = segments.some((s) => s.kind === 'fence')
+  const ja = e.text.trim()
+  const en = decision.custom.trim()
+  if (!hasFence && isEligiblePair(ja, en, 'stop')) ctx.memory.add({ ja, en })
+  return next({ ...e, text: withFences(decision.custom, segments) })
+}
+
+// A doc run that stopped part way is a failure: its report names pieces, not source offsets, so the
+// rest cannot be joined on. `failReason` is what the question shows when doc gives no translation.
+async function sendDocResult($, ctx, e, next, segments, doc, failReason) {
+  if (!doc.ok) return askFailure($, e, next, failReason)
+  const english = doc.text
+  const notices = []
+  if (doc.degraded > 0) notices.push(partialNotice(doc.degraded, doc.pieces))
+  if (doc.notes > 0) notices.push(notesNotice(doc.notes))
+  const answer =
+    ctx.cfg.confirm || notices.length > 0 ? await confirmEnglish($, english, notices, next.signal) : LABELS.send
+  return send(ctx, e, next, segments, english, answer, () => {
+    const ja = e.text.trim()
+    const en = english.trim()
+    const clean = notices.length === 0 && !segments.some((s) => s.kind === 'fence')
+    const small = ja.length + en.length <= Math.floor(ctx.cfg.historyChars / 2)
+    if (clean && small && isEligiblePair(ja, en, 'stop')) ctx.memory.add({ ja, en })
+  })
+}
+
+const worthDoc = (result) =>
+  result.contextTooLong || result.reason.startsWith('finish_reason ') || DOC_RETRY_REASONS.has(result.reason)
+
 async function submitJapanese($, ctx, e, next) {
   const segments = splitFences(e.text)
   const needsTranslation = (s) => s.kind === 'text' && containsJapanese(s.text)
   if (!segments.some(needsTranslation)) return next(e)
+
+  const japaneseBytes = segments.filter(needsTranslation).reduce((n, s) => n + utf8Bytes(s.text), 0)
+  if (japaneseBytes > INPUT_DOC_BYTES && docAvailable(ctx)) {
+    debug($, `input: ${japaneseBytes} bytes of Japanese; translating the prompt with doc`)
+    const doc = await translateInputDoc($, ctx, e.text, next.signal)
+    if (next.signal.aborted) return { drop: DROP_REASON }
+    // An old CLI leaves the single calls, which still translate a long prompt piece by piece.
+    if (!doc.unsupported) return sendDocResult($, ctx, e, next, segments, doc, doc.reason)
+  }
 
   const pairs = []
   let english = ''
@@ -180,29 +317,21 @@ async function submitJapanese($, ctx, e, next) {
     const result = await translateInput($, ctx, core, next.signal)
     if (result === ABORTED) return { drop: DROP_REASON }
     if (!result.ok) {
-      const answer = await ask($, failureQuestion(result.reason), [LABELS.original, LABELS.cancel], next.signal)
-      return answer === LABELS.original ? next(e) : { drop: DROP_REASON }
+      if (!worthDoc(result) || !docAvailable(ctx)) return askFailure($, e, next, result.reason)
+      debug($, `input: single call failed (${result.reason}); translating the prompt with doc`)
+      const doc = await translateInputDoc($, ctx, e.text, next.signal)
+      if (next.signal.aborted) return { drop: DROP_REASON }
+      return sendDocResult($, ctx, e, next, segments, doc, result.reason)
     }
     const translation = result.text.trim()
     pairs.push({ ja: core, en: translation, finishReason: result.finishReason })
     english += lead + translation + trail
   }
 
-  const answer = ctx.cfg.confirm
-    ? await ask($, confirmQuestion(english), [LABELS.send, LABELS.original, LABELS.cancel], next.signal)
-    : LABELS.send
-  const decision = decideSubmission(answer)
-  if (decision === 'drop') return { drop: DROP_REASON }
-  if (decision === 'send-original') return next(e)
-  if (decision === 'send-translation') {
+  const answer = ctx.cfg.confirm ? await confirmEnglish($, english, [], next.signal) : LABELS.send
+  return send(ctx, e, next, segments, english, answer, () => {
     for (const p of pairs) if (isEligiblePair(p.ja, p.en, p.finishReason)) ctx.memory.add({ ja: p.ja, en: p.en })
-    return next({ ...e, text: english })
-  }
-  const hasFence = segments.some((s) => s.kind === 'fence')
-  const ja = e.text.trim()
-  const en = decision.custom.trim()
-  if (!hasFence && isEligiblePair(ja, en, 'stop')) ctx.memory.add({ ja, en })
-  return next({ ...e, text: withFences(decision.custom, segments) })
+  })
 }
 
 // A block that cannot be translated is shown as written: the display is the only thing at stake.
@@ -429,6 +558,7 @@ export function register(on, options) {
     enabledLoad: undefined,
     display: createPipeline({ flushLines: cfg.flushLines }),
     historySlots: new Set(),
+    docTooOld: false,
     workerGen: 0,
     sleepRefusalLogged: false,
     shownSeq: new WeakMap(),
@@ -440,6 +570,7 @@ export function register(on, options) {
   on('session.start', async ($, e, next) => {
     ctx.memory.clear()
     ctx.sleepRefusalLogged = false
+    ctx.docTooOld = false
     startDisplayWorker($, ctx)
     await loadEnabled($, ctx)
     await $.command.register(COMMAND)

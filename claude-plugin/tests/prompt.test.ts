@@ -1,5 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import { decideSubmission, LABELS } from '../hooks/lib/input.js'
+import { docTimeoutMs, utf8Bytes } from '../hooks/lib/doc.js'
 
 type Run = { argv: string[]; init: { stdin?: string; timeoutMs?: number } }
 
@@ -211,13 +212,13 @@ test('failure can be cancelled', async ($, on) => {
   expect(await submit($, '直して')).toEqual({ drop: '送信をやめました。' })
 })
 
-test('context_too_long without history fails once', async ($, on) => {
+test('context_too_long without history fails once, then once with doc', async ($, on) => {
   const h = setup(on)
   h.translate = () => ({ exitCode: 1, stdout: '', stderr: 'error: context_too_long: x\n' })
   h.answers.push(LABELS.cancel)
   await turnOn($)
   expect(await submit($, '長い文')).toEqual({ drop: '送信をやめました。' })
-  expect(h.runs.length).toBe(1)
+  expect(h.runs.length).toBe(2)
   expect(h.questions[0]).toBe('翻訳に失敗しました (context_too_long: x)。どうしますか?')
 })
 
@@ -381,4 +382,218 @@ test('a takeover does not rerun a block while a prompt translates', async ($, on
   expect(h.toasts).toEqual(['一部の段落を英語のまま表示しました (1 件: 入力の翻訳を優先)。'])
   await h.clock.advance(10000)
   expect(await prompt).toEqual({ text: 'EN<二つ目>' })
+})
+
+interface DocHarness {
+  runs: Run[]
+  writes: Array<{ path: string; content: string }>
+  questions: Array<{ question: string; labels: string[] }>
+  answers: string[]
+  toasts: string[]
+  logs: string[]
+  statuses: Array<string | undefined>
+  single: (run: Run) => { exitCode: number; stdout: string; stderr: string }
+  doc: (run: Run) => { exitCode: number; stdout: string; stderr: string }
+}
+
+const reportLine = (o: object) => JSON.stringify(o) + '\n'
+const docSummary = (o: object = {}) =>
+  reportLine({ type: 'summary', v: 1, exit_code: 0, complete: true, degraded: 0, pieces: 1, ...o })
+const docOk = (stdout: string) => ({ exitCode: 0, stdout, stderr: docSummary() })
+const truncated = (text: string) =>
+  JSON.stringify({ type: 'done', text, finish_reason: 'length', model: 'm', revision: 'r', usage: {} }) + '\n'
+
+// The fake branches on the subcommand: `doc` runs answer through `doc`, single calls through `single`.
+function setupDoc(on: any): DocHarness {
+  const h: DocHarness = {
+    runs: [],
+    writes: [],
+    questions: [],
+    answers: [],
+    toasts: [],
+    logs: [],
+    statuses: [],
+    single: (run) => ({ exitCode: 0, stdout: done(`EN<${run.init.stdin}>`), stderr: '' }),
+    doc: (run) => docOk(`DOC<${run.init.stdin}>\n`),
+  }
+  mock.env(on, { TMPDIR: '/tmp/' })
+  on('session.start', () => ({ cwd: '/work' }))
+  on('command.register', () => ({ value: undefined }))
+  on('ui.status', ($: unknown, e: { text?: string }) => {
+    h.statuses.push(e.text)
+    return { value: undefined }
+  })
+  on('ui.toast', ($: unknown, e: { text: string }) => {
+    h.toasts.push(e.text)
+    return { value: undefined }
+  })
+  on('ui.log', ($: unknown, e: { text: string; to?: string }) => {
+    if (e.to !== 'debug') h.logs.push(e.text)
+    return { value: undefined }
+  })
+  on('session.id', () => ({ value: 'sess1' }))
+  on('fs.write', ($: unknown, e: { path: string; content?: string; text?: string; data?: string }) => {
+    h.writes.push({ path: e.path, content: e.content ?? e.text ?? e.data ?? '' })
+    return { value: undefined }
+  })
+  on('process.run', ($: unknown, e: Run) => {
+    h.runs.push(e)
+    return { value: e.argv[1] === 'doc' ? h.doc(e) : h.single(e) }
+  })
+  on('tool.call', ($: unknown, e: { questions: Array<{ question: string; options?: Array<{ label: string } | string> }> }) => {
+    const { question, options = [] } = e.questions[0]
+    h.questions.push({ question, labels: options.map((o) => (typeof o === 'string' ? o : o.label)) })
+    return { result: { answers: { [question]: h.answers.shift() ?? LABELS.send } } }
+  })
+  on('prompt.submit', ($: unknown, e: { text: string }) => ({ text: e.text }))
+  return h
+}
+
+const LONG_JA = '長い段落の文章をここに書きます。'.repeat(70)
+const docRuns = (h: DocHarness) => h.runs.filter((r) => r.argv[1] === 'doc')
+const lastHistory = (h: DocHarness) =>
+  h.writes[h.writes.length - 1].content.trim().split('\n').map((l) => JSON.parse(l))
+
+test('a long prompt goes to doc', async ($, on) => {
+  const h = setupDoc(on)
+  const english = 'The long paragraph. '.repeat(100)
+  h.doc = () => docOk(english)
+  await turnOn($)
+  expect(utf8Bytes(LONG_JA)).toBeGreaterThan(3000)
+  expect(await submit($, LONG_JA)).toEqual({ text: english })
+  expect(h.runs.length).toBe(1)
+  expect(h.runs[0].argv).toEqual(['plamo-translate', 'doc', '--report', 'json', '-s', 'ja', '-t', 'en', '--format', 'markdown'])
+  expect(h.runs[0].init.stdin).toBe(LONG_JA)
+  expect(h.runs[0].init.timeoutMs).toBe(docTimeoutMs(utf8Bytes(LONG_JA)))
+  expect(h.questions[0].question).toContain('中略')
+  expect(h.statuses).toContain('ja⇄en 英訳中…')
+  expect(h.statuses[h.statuses.length - 1]).toBe('ja⇄en')
+})
+
+test('doc gets --history from memory, never --history-append', async ($, on) => {
+  const h = setupDoc(on)
+  await turnOn($)
+  await submit($, '直して')
+  await submit($, LONG_JA)
+  const run = docRuns(h)[0]
+  expect(run.argv.slice(-2)).toEqual(['--history', '/tmp/plamo-ja-bridge-sess1.jsonl'])
+  expect(run.argv).not.toContain('--history-append')
+  expect(run.argv).not.toContain('--history-last')
+  expect(lastHistory(h)).toEqual([{ source: '直して', translation: 'EN<直して>' }])
+})
+
+test('a truncated translation falls back to doc', async ($, on) => {
+  const h = setupDoc(on)
+  h.single = () => ({ exitCode: 0, stdout: truncated('Fix'), stderr: '' })
+  h.doc = () => docOk('Fix it.\n\n```\nx()\n```\n')
+  await turnOn($)
+  const text = '直して\n\n```\nx()\n```\n'
+  expect(await submit($, text)).toEqual({ text: 'Fix it.\n\n```\nx()\n```\n' })
+  expect(h.runs.map((r) => r.argv[1])).toEqual(['--json', 'doc'])
+  expect(docRuns(h)[0].init.stdin).toBe(text)
+})
+
+test('a partial doc translation always asks, even with confirm off', { options: { confirm: false } }, async ($, on) => {
+  const h = setupDoc(on)
+  h.doc = () => ({
+    exitCode: 1,
+    stdout: 'Partly translated.\n',
+    stderr: reportLine({ type: 'note', message: 'kept as code' }) + docSummary({ exit_code: 1, degraded: 1, pieces: 3 }),
+  })
+  h.answers.push(LABELS.send)
+  await turnOn($)
+  expect(await submit($, LONG_JA)).toEqual({ text: 'Partly translated.\n' })
+  expect(h.questions.length).toBe(1)
+  expect(h.questions[0].question).toBe(
+    '一部 (1/3 ピース) は英訳しきれていません (日本語のまま、または訳が途中で切れています)。\n' +
+      '1 か所 (コード扱いのブロックなど) は訳さずに残しました。\n\n' +
+      CONFIRM_Q('Partly translated.\n'),
+  )
+  expect(h.questions[0].labels).toEqual([LABELS.send, LABELS.original, LABELS.cancel])
+
+  h.doc = () => docOk('Clean.\n')
+  expect(await submit($, LONG_JA)).toEqual({ text: 'Clean.\n' })
+  expect(h.questions.length).toBe(1)
+})
+
+test('doc stopping mid-run asks to send the original with the single-call reason', async ($, on) => {
+  const h = setupDoc(on)
+  h.single = () => ({ exitCode: 0, stdout: truncated('Fix'), stderr: '' })
+  h.doc = () => ({
+    exitCode: 3,
+    stdout: 'First piece.\n',
+    stderr:
+      reportLine({ type: 'error', kind: 'daemon', code: 'internal', message: 'boom' }) +
+      docSummary({ exit_code: 3, complete: false }),
+  })
+  h.answers.push(LABELS.original, LABELS.cancel)
+  await turnOn($)
+  expect(await submit($, '直して')).toEqual({ text: '直して' })
+  expect(h.questions[0].question).toBe('翻訳に失敗しました (finish_reason length)。どうしますか?')
+  expect(h.questions[0].labels).toEqual([LABELS.original, LABELS.cancel])
+
+  expect(await submit($, LONG_JA)).toEqual({ drop: '送信をやめました。' })
+  expect(h.questions[1].question).toBe('翻訳に失敗しました (internal: boom)。どうしますか?')
+  expect(h.questions[1].labels).toEqual([LABELS.original, LABELS.cancel])
+})
+
+test('an old CLI disables doc for the session', async ($, on) => {
+  const h = setupDoc(on)
+  h.doc = () => ({ exitCode: 2, stdout: '', stderr: "error: unexpected argument '--report' found\n" })
+  await turnOn($)
+  expect(await submit($, LONG_JA)).toEqual({ text: `EN<${LONG_JA}>` })
+  expect(await submit($, LONG_JA)).toEqual({ text: `EN<${LONG_JA}>` })
+  h.single = () => ({ exitCode: 0, stdout: truncated('Fix'), stderr: '' })
+  h.answers.push(LABELS.cancel)
+  expect(await submit($, '直して')).toEqual({ drop: '送信をやめました。' })
+  expect(h.questions[2].question).toBe('翻訳に失敗しました (finish_reason length)。どうしますか?')
+  expect(docRuns(h).length).toBe(1)
+  expect(h.toasts).toEqual(['長文の分割翻訳には plamo-translate 0.2.0 以降が必要です。更新してください。'])
+
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  h.answers.push(LABELS.cancel)
+  await submit($, '直して')
+  expect(docRuns(h).length).toBe(2)
+  expect(h.toasts.length).toBe(2)
+})
+
+test('a small clean doc result is remembered, a large one is not', async ($, on) => {
+  const h = setupDoc(on)
+  await turnOn($)
+  h.doc = () => docOk('A long paragraph.\n')
+  await submit($, LONG_JA)
+  h.doc = () => docOk('Too long. '.repeat(250))
+  await submit($, LONG_JA + '二つ目')
+  h.doc = () => ({ exitCode: 1, stdout: 'Partly.\n', stderr: docSummary({ exit_code: 1, degraded: 1, pieces: 3 }) })
+  await submit($, LONG_JA + '三つ目')
+  await submit($, '次')
+  expect(lastHistory(h)).toEqual([{ source: LONG_JA, translation: 'A long paragraph.' }])
+})
+
+test('useDoc false keeps the per-segment path', { options: { useDoc: false } }, async ($, on) => {
+  const h = setupDoc(on)
+  await turnOn($)
+  expect(await submit($, LONG_JA)).toEqual({ text: `EN<${LONG_JA}>` })
+  h.single = () => ({ exitCode: 0, stdout: truncated('Fix'), stderr: '' })
+  h.answers.push(LABELS.cancel)
+  expect(await submit($, '直して')).toEqual({ drop: '送信をやめました。' })
+  expect(h.questions[1].question).toBe('翻訳に失敗しました (finish_reason length)。どうしますか?')
+  expect(docRuns(h).length).toBe(0)
+})
+
+test('the confirm dialog offers the full text for a long translation', async ($, on) => {
+  const h = setupDoc(on)
+  const english = Array.from({ length: 400 }, (_, i) => `Sentence ${i}.`).join(' ')
+  h.single = () => ({ exitCode: 0, stdout: done(english), stderr: '' })
+  h.answers.push('全文を表示', LABELS.send)
+  await turnOn($)
+  expect(english.length).toBeGreaterThan(1900 * 2)
+  expect(await submit($, '直して')).toEqual({ text: english })
+  expect(h.questions.length).toBe(2)
+  expect(h.questions[0].question).toContain('中略')
+  expect(h.questions[0].labels).toEqual([LABELS.send, LABELS.original, LABELS.cancel, '全文を表示'])
+  expect(h.questions[1].labels).toEqual([LABELS.send, LABELS.original, LABELS.cancel])
+  expect(h.logs.join('')).toBe(english)
+  expect(h.logs.length).toBe(Math.ceil(english.length / 1900))
+  for (const chunk of h.logs) expect(chunk.length).toBeLessThanOrEqual(1900)
 })
