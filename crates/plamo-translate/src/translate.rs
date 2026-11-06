@@ -9,25 +9,31 @@ use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Args)]
+pub struct RequestOpts {
+    /// Target language (default: from config, "auto" picks en/ja)
+    #[arg(short = 't', long = "to")]
+    pub to: Option<String>,
+    /// Source language
+    #[arg(short = 's', long = "from")]
+    pub from: Option<String>,
+    #[arg(long, conflicts_with = "context_file")]
+    pub context: Option<String>,
+    #[arg(long, value_name = "FILE")]
+    pub context_file: Option<PathBuf>,
+    /// TSV glossary file (repeatable)
+    #[arg(long, value_name = "FILE")]
+    pub glossary: Vec<PathBuf>,
+    /// polite or plain (target ja only; validated by the daemon)
+    #[arg(long)]
+    pub form: Option<String>,
+}
+
+#[derive(Args)]
 pub struct TranslateArgs {
     /// Text to translate (read from stdin when omitted)
     text: Option<String>,
-    /// Target language (default: from config, "auto" picks en/ja)
-    #[arg(short = 't', long = "to")]
-    to: Option<String>,
-    /// Source language
-    #[arg(short = 's', long = "from")]
-    from: Option<String>,
-    #[arg(long, conflicts_with = "context_file")]
-    context: Option<String>,
-    #[arg(long, value_name = "FILE")]
-    context_file: Option<PathBuf>,
-    /// TSV glossary file (repeatable)
-    #[arg(long, value_name = "FILE")]
-    glossary: Vec<PathBuf>,
-    /// polite or plain (target ja only; validated by the daemon)
-    #[arg(long)]
-    form: Option<String>,
+    #[command(flatten)]
+    opts: RequestOpts,
     #[arg(long)]
     no_stream: bool,
     /// Print the final done event as one JSON line
@@ -44,13 +50,23 @@ pub struct TranslateArgs {
     history_last: Option<u32>,
 }
 
+/// Request options with their files read; `to` stays unresolved because
+/// "auto" depends on the text.
+pub(crate) struct LoadedOpts {
+    pub to: Option<String>,
+    pub from: Option<String>,
+    pub context: Option<String>,
+    pub glossary: Vec<GlossaryEntry>,
+    pub form: Option<String>,
+}
+
 struct Prepared {
     req: TranslateRequest,
     /// The history file to append the result to (`--history-append`).
     record: Option<PathBuf>,
 }
 
-fn usage_error(msg: impl std::fmt::Display) -> i32 {
+pub(crate) fn usage_error(msg: impl std::fmt::Display) -> i32 {
     eprintln!("error: {msg}");
     ExitCode::Usage as i32
 }
@@ -61,7 +77,11 @@ fn read_glossary(path: &Path) -> Result<Vec<GlossaryEntry>, String> {
     parse_glossary(&s).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-fn read_history(path: &Path, append: bool, last: Option<u32>) -> Result<Vec<HistoryEntry>, String> {
+pub(crate) fn read_history(
+    path: &Path,
+    append: bool,
+    last: Option<u32>,
+) -> Result<Vec<HistoryEntry>, String> {
     if path.as_os_str() == "-" {
         return Err(
             "--history does not read stdin (stdin is reserved for TEXT); pass a file path".into(),
@@ -82,6 +102,32 @@ fn read_history(path: &Path, append: bool, last: Option<u32>) -> Result<Vec<Hist
     Ok(history)
 }
 
+pub(crate) fn load_opts(config: &Config, opts: RequestOpts) -> Result<LoadedOpts, String> {
+    let context = match opts.context_file {
+        Some(p) => Some(
+            std::fs::read_to_string(&p)
+                .map_err(|e| format!("cannot read context file {}: {e}", p.display()))?,
+        ),
+        None => opts.context,
+    };
+    let mut lists = Vec::new();
+    if let Some(p) = &config.glossary_file
+        && p.exists()
+    {
+        lists.push(read_glossary(p)?);
+    }
+    for p in &opts.glossary {
+        lists.push(read_glossary(p)?);
+    }
+    Ok(LoadedOpts {
+        to: opts.to,
+        from: opts.from,
+        context,
+        glossary: merge_glossaries(lists),
+        form: opts.form,
+    })
+}
+
 fn build_request(config: &Config, args: TranslateArgs) -> Result<Prepared, String> {
     let text = match args.text {
         Some(t) => t,
@@ -96,28 +142,13 @@ fn build_request(config: &Config, args: TranslateArgs) -> Result<Prepared, Strin
     if text.trim().is_empty() {
         return Err("no text given (pass TEXT or pipe stdin)".into());
     }
-    let context = match args.context_file {
-        Some(p) => Some(
-            std::fs::read_to_string(&p)
-                .map_err(|e| format!("cannot read context file {}: {e}", p.display()))?,
-        ),
-        None => args.context,
-    };
-    let mut lists = Vec::new();
-    if let Some(p) = &config.glossary_file
-        && p.exists()
-    {
-        lists.push(read_glossary(p)?);
-    }
-    for p in &args.glossary {
-        lists.push(read_glossary(p)?);
-    }
+    let opts = load_opts(config, args.opts)?;
     let history = match &args.history {
         Some(p) => read_history(p, args.history_append, args.history_last)?,
         None => Vec::new(),
     };
     let record = args.history.filter(|_| args.history_append);
-    let target_lang = match args.to {
+    let target_lang = match opts.to {
         Some(t) => t,
         None => resolve_target(&text, &config.default_target),
     };
@@ -125,11 +156,11 @@ fn build_request(config: &Config, args: TranslateArgs) -> Result<Prepared, Strin
         req: TranslateRequest {
             text,
             target_lang,
-            source_lang: args.from,
-            context,
+            source_lang: opts.from,
+            context: opts.context,
             history,
-            glossary: merge_glossaries(lists),
-            form: args.form,
+            glossary: opts.glossary,
+            form: opts.form,
             stream: !args.no_stream,
             max_tokens: None,
         },
@@ -137,32 +168,39 @@ fn build_request(config: &Config, args: TranslateArgs) -> Result<Prepared, Strin
     })
 }
 
-fn report_error(err: &Error) -> i32 {
+pub(crate) fn report_error(err: &Error) -> i32 {
+    write_error(&mut std::io::stderr(), err)
+}
+
+/// `report_error` to an arbitrary writer, so callers can capture the message.
+pub(crate) fn write_error(w: &mut dyn Write, err: &Error) -> i32 {
     match err {
         Error::DaemonUnreachable {
             socket_path,
             source,
         } => {
-            eprintln!(
+            let _ = writeln!(
+                w,
                 "error: cannot reach daemon at {}: {source}\nhint: run `plamo-translate daemon install` to set it up",
                 socket_path.display()
             );
             ExitCode::Unreachable as i32
         }
         other => {
-            eprintln!("error: {other}");
+            let _ = writeln!(w, "error: {other}");
             ExitCode::Translation as i32
         }
     }
 }
 
-struct Progress {
-    enabled: bool,
-    dirty: bool,
+pub(crate) struct Progress {
+    pub(crate) enabled: bool,
+    pub(crate) dirty: bool,
+    pub(crate) prefix: String,
 }
 
 impl Progress {
-    fn show(&mut self, stage: &str, done: Option<u64>, total: Option<u64>) {
+    pub(crate) fn show(&mut self, stage: &str, done: Option<u64>, total: Option<u64>) {
         if !self.enabled {
             return;
         }
@@ -171,11 +209,18 @@ impl Progress {
             ("downloading", ..) => "downloading".to_string(),
             _ => "loading model…".to_string(),
         };
-        eprint!("\r\x1b[K{line}");
+        self.line(&line);
+    }
+
+    pub(crate) fn line(&mut self, s: &str) {
+        if !self.enabled {
+            return;
+        }
+        eprint!("\r\x1b[K{}{s}", self.prefix);
         self.dirty = true;
     }
 
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         if self.dirty {
             eprint!("\r\x1b[K");
             self.dirty = false;
@@ -234,6 +279,7 @@ async fn translate(client: &Client, prepared: &Prepared, json: bool, no_stream: 
     let mut progress = Progress {
         enabled: std::io::stderr().is_terminal(),
         dirty: false,
+        prefix: String::new(),
     };
     let stdout = std::io::stdout();
     let mut last_byte: Option<u8> = None;
@@ -320,8 +366,13 @@ fn record_history(path: &Path, source: &str, finish_reason: Option<&str>, text: 
     }
 }
 
-fn report_daemon_error(code: &ErrorCode, message: &str) -> i32 {
-    eprintln!("error: {}: {message}", snake_case(&format!("{code:?}")));
+pub(crate) fn report_daemon_error(code: &ErrorCode, message: &str) -> i32 {
+    write_daemon_error(&mut std::io::stderr(), code, message)
+}
+
+/// `report_daemon_error` to an arbitrary writer.
+pub(crate) fn write_daemon_error(w: &mut dyn Write, code: &ErrorCode, message: &str) -> i32 {
+    let _ = writeln!(w, "error: {}: {message}", snake_case(&format!("{code:?}")));
     ExitCode::Translation as i32
 }
 
@@ -381,6 +432,7 @@ async fn load_model(client: &Client) -> i32 {
     let mut progress = Progress {
         enabled: std::io::stderr().is_terminal(),
         dirty: false,
+        prefix: String::new(),
     };
     while let Some(item) = events.next().await {
         match item {

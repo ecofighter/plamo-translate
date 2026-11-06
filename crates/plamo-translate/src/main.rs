@@ -1,4 +1,5 @@
 mod daemon;
+mod doc;
 mod translate;
 
 use clap::{Parser, Subcommand};
@@ -37,6 +38,8 @@ struct Cli {
 enum Command {
     /// Show the daemon status
     Status,
+    /// Translate a document (plain text or Markdown) from stdin, piece by piece
+    Doc(doc::DocArgs),
     /// Manage the model
     Model {
         #[command(subcommand)]
@@ -86,6 +89,7 @@ async fn main() {
     let code = match cli.command {
         None => translate::run(&client, &config, cli.translate).await,
         Some(Command::Status) => translate::status(&client).await,
+        Some(Command::Doc(args)) => doc::run(&client, &config, args).await,
         Some(Command::Model {
             action: ModelAction::Pull,
         }) => translate::pull(&client).await,

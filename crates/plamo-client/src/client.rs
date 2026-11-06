@@ -67,6 +67,12 @@ impl Client {
         if !req.history.is_empty() {
             self.require_history().await?;
         }
+        self.translate_unchecked(req).await
+    }
+
+    /// Sends a translate request without the history preflight; the caller must have
+    /// called `require_history()` on this daemon if `req.history` is non-empty.
+    pub async fn translate_unchecked(&self, req: &TranslateRequest) -> Result<EventStream, Error> {
         let line = serde_json::to_string(req).map_err(|e| Error::Protocol(e.to_string()))?;
         self.request(line).await
     }

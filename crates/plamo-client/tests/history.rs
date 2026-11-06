@@ -122,3 +122,17 @@ async fn no_preflight_without_history() {
     assert_eq!(requests.len(), 1);
     assert_eq!(op(&requests[0]), "translate");
 }
+
+#[tokio::test]
+async fn translate_unchecked_skips_preflight_even_with_history() {
+    let fake = fake_daemon(&[DONE]);
+    let client = Client::new(fake.socket.clone());
+    let mut events = client.translate_unchecked(&request(true)).await.unwrap();
+    let last = events.next().await.unwrap().unwrap();
+    assert!(matches!(last, Event::Done { .. }));
+    let requests = fake.task.await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(op(&requests[0]), "translate");
+    let sent: Value = serde_json::from_str(&requests[0]).unwrap();
+    assert_eq!(sent["history"][0]["source"], "a");
+}

@@ -96,6 +96,41 @@ plamo-translate daemon uninstall [--purge [--yes]]   # --purge はモデル、�
 
 `stop` はプロセスを止めるだけで、ソケットは残る。次の接続で自動的に起動する。
 
+### 文書の翻訳 (`plamo-translate doc`)
+
+プレーンテキストと Markdown の文書を stdin から読み、区切りのよい部分 (ピース) ごとに訳して stdout に書く。直前までの訳を履歴としてピースごとに渡すので、長い文書でも用語や文体がそろう。
+
+```sh
+cat doc.md | plamo-translate doc -t ja > doc.ja.md
+plamo-translate doc -t en --format text --history-bytes 0 < notes.txt
+```
+
+| オプション | 内容 |
+|---|---|
+| `--format auto\|text\|markdown` | 入力の形式。既定は `auto` で、内容から判定して stderr に `note: input format: markdown (auto-detected; use --format to override)` を出す。この `note:` は `auto` のときだけ出る |
+| `--history FILE` | 履歴の JSONL (形式は上と同じ)。文書の前の部分として扱い、最初のピースから履歴に入る。stdin は文書用なので `-` は指定できない |
+| `--history-last N` | `--history` のうち新しい N 組だけを読む。読み込み時の絞り込みだけで、訳したピースには効かない |
+| `--history-append` | 訳したピースを 1 つ書くたびに、原文と訳文の組を `--history` のファイルに追記する (なければ作る)。途中から再開する機能はない |
+| `--history-bytes BYTES` | ピースごとに送る履歴の大きさ (UTF-8 のバイト数、原文と訳文の合計)。既定は 8000。新しい組から古い方へ入れ、収まらなくなったところで止める。最新の 1 組は常に送る。0 で履歴を使わない |
+| `-t, -s, --context, --context-file, --glossary, --form` | 上の表と同じ |
+
+`TEXT`、`--no-stream`、`--json` はない。オプションは `doc` の後ろに書く。`plamo-translate -t ja doc` は単語 "doc" の翻訳になり、`plamo-translate doc` はこのサブコマンドを実行する。単語 "doc" を訳すときは `echo doc | plamo-translate -t en` のように stdin で渡す。
+
+- 訳先を省略して `auto` になる場合、日本語か英語かは文書全体で 1 回だけ決める。日英が混ざった文書では `-t` を指定すること
+- コードブロックなど、訳してはいけないブロックはデーモンに送らず、そのまま出力する。HTML ブロックも訳さず、`warning: line N: HTML block left untranslated` を出す。Markdown では字下げのコードブロックもコードとして扱い、`--format auto` のときだけ `warning: line N: indented block left untranslated as code (use --format text if it is prose)` を出す。字下げの文章なら `--format text` を使う
+- 参照形式のリンク (`[text][ref]` など) は、出力ではインラインのリンクに書き換わる
+- 出力はピースを訳し終えるたびに書く。改行は足さない。訳す対象のない文書は、デーモンに接続せずそのまま出力する
+- 打ち切られたピース、空の訳、内部のマーカーが壊れたピースは、原文のまま (打ち切りは訳の途中まで) 書き、`warning: piece N/M: …` を出す。最後に `error: K of M pieces were not fully translated; see the warnings above` を出して終了コード 1 で終わる。構造やインライン要素の違いは警告だけで、終了コードには影響しない
+- 途中でエラーになると `error: stopped at piece N/M; stdout holds everything translated before it` を出して止まる。stdout にはそのピースの前までの出力が欠けなく残る
+- `--history` で渡した履歴は、文書のそれより前の部分と同じ扱いで、新しい組に押し出されると送られなくなる。毎回効かせたい用語は `--glossary` で指定する
+- 履歴を使うので、ピースごとに 2〜3 秒ほど余計にかかる (既定の `--history-bytes` のとき)。履歴を使うときはデーモンの対応を最初に確かめる
+- 単体のときと違い、文書に `<|plamo:` が含まれていてもよい。エスケープした形で送り、訳は元のまま戻る。ただしエスケープ済みの形や内部のマーカーのテキストをすでに含むブロックは訳さず、`warning: line N: block left untranslated: contains reserved marker text` を出す
+- `context_too_long` になったときは、そのピースの履歴を半分に減らして再試行し、それでも収まらなければピースを分割する。`--history-last` で減らす必要はない
+- `--history-append` が記録するのは、警告なしに訳せたピースだけ。記録する原文は実際に送ったテキストで、コードブロックは `<!--pt:kN-->` のマーカーに置き換え、参照形式のリンクはインラインに書き、`<|plamo:` はエスケープした形になる
+- 分割したピースのラベルは `piece 3/12.2` のようになる
+
+終了コードは単体のときと同じ。0 成功、1 翻訳エラー (訳しきれなかったピースや追記の失敗を含む)、2 使い方の誤り、3 デーモンに到達できない、130 Ctrl-C。
+
 ## 使い方 (MCP)
 
 Claude Code (CLI) では次のコマンドで登録する。
