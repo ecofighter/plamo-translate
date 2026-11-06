@@ -111,11 +111,17 @@ async function historyPath($, slot) {
   return `${tmp}/plamo-ja-bridge-${await $.session.id()}${suffix}.jsonl`
 }
 
+const fixedTimeout = (timeoutMs) => () => ({ timeoutMs })
+
 // Runs one translation, shrinking the history on context_too_long the way the MCP server does.
-async function translateNow($, ctx, text, direction, timeoutMs) {
+// `nextCall()` is asked before every daemon call, reruns included: `{ timeoutMs }` for the call, or
+// `{ stopReason }` to start no further call.
+async function translateNow($, ctx, text, direction, nextCall) {
   const [from, to] = direction === 'ja-en' ? ['ja', 'en'] : ['en', 'ja']
   let history = ctx.memory.select(direction, { maxPairs: ctx.cfg.historyPairs, maxChars: ctx.cfg.historyChars })
   for (;;) {
+    const { timeoutMs, stopReason } = nextCall()
+    if (stopReason !== undefined) return { ok: false, reason: stopReason, contextTooLong: false, stopped: true }
     const slot = history.length > 0 ? acquireHistorySlot(ctx) : undefined
     let run
     try {
@@ -145,7 +151,7 @@ async function translateNow($, ctx, text, direction, timeoutMs) {
 // time, and the prompt is what the user is waiting on.
 function translateInput($, ctx, text, signal) {
   beginInput(ctx.display)
-  const run = translateNow($, ctx, text, 'ja-en', INPUT_TIMEOUT_MS).finally(() => endInput(ctx.display))
+  const run = translateNow($, ctx, text, 'ja-en', fixedTimeout(INPUT_TIMEOUT_MS)).finally(() => endInput(ctx.display))
   return untilAborted(run, signal)
 }
 
@@ -201,29 +207,37 @@ async function submitJapanese($, ctx, e, next) {
 
 // A block that cannot be translated is shown as written: the display is the only thing at stake.
 // The pair goes to memory even when the result comes too late to be shown.
-async function translateBlock($, ctx, slot, { timeoutMs }) {
+async function translateBlock($, ctx, slot, { nextCall }) {
   const { block } = slot
   const { lead, core, trail } = splitEdges(block.text)
   if (core === '' || isMostlyJapanese(core)) return { text: block.text }
-  const result = await translateNow($, ctx, core, 'en-ja', timeoutMs)
-  if (!result.ok) return { text: block.text, failReason: result.reason }
+  const result = await translateNow($, ctx, core, 'en-ja', nextCall)
+  if (!result.ok) return { text: block.text, failReason: result.reason, stopped: result.stopped === true }
   const ja = result.text.trim()
   if (block.kind === 'table' && !tableShapeMatches(core, ja)) return { text: block.text, failReason: TABLE_SHAPE_REASON }
   if (isEligiblePair(core, ja, result.finishReason)) ctx.memory.add({ ja, en: core })
   return { text: lead + ja + trail }
 }
 
-const translateJob = ($, ctx) => (slot) => translateBlock($, ctx, slot, { timeoutMs: OUTPUT_TIMEOUT_MS })
+const translateJob = ($, ctx) => (slot) =>
+  translateBlock($, ctx, slot, { nextCall: fixedTimeout(OUTPUT_TIMEOUT_MS) })
 
 // Display translations run here, outside any dispatch, so no dispatch waits on them past its budget.
 // A newer session.start bumps the generation, and the older loop ends at its next turn.
+// Failures get their own debug line: a host that refuses `$` calls from a returned session.start
+// hook shows up as every worker job failing.
 async function runDisplayWorker($, ctx, generation) {
   const pipe = ctx.display
   while (generation === ctx.workerGen) {
     const job = popIfIdle(pipe)
-    if (job) await runJob(pipe, job, translateJob($, ctx))
-    else await waitForWork(pipe)
+    if (!job) {
+      await waitForWork(pipe)
+      continue
+    }
+    const result = await runJob(pipe, job, translateJob($, ctx))
+    if (result.failReason !== undefined) debug($, `plamo-ja-bridge: worker job failed: ${result.failReason}`)
   }
+  debug($, 'display worker superseded by a newer session start')
 }
 
 function startDisplayWorker($, ctx) {
@@ -233,9 +247,16 @@ function startDisplayWorker($, ctx) {
 }
 
 // A host that cannot time a wait leaves it to its promise and the signal; reading that as an expired
-// deadline would show every block untranslated.
-function hostSleep($, ms, options) {
-  return $.clock.sleep(ms, options).catch(() => NEVER)
+// deadline would show every block untranslated. The first such refusal in a session is logged, since
+// it also covers a host cancelling the wait.
+function hostSleep($, ctx, ms, options) {
+  return $.clock.sleep(ms, options).catch((err) => {
+    if (!options?.signal?.aborted && !ctx.sleepRefusalLogged) {
+      ctx.sleepRefusalLogged = true
+      debug($, `display: the host clock refused a wait (${err?.message || 'error'}); waits now end only with their work or the signal`)
+    }
+    return NEVER
+  })
 }
 
 function clockNow($, signal) {
@@ -251,11 +272,20 @@ async function dispatchDeadline($, next, final) {
   return now + waitBudgetMs(next.budget.remainingMs, final)
 }
 
-async function waitUntil($, next, deadline, promise) {
+async function waitMs($, next, deadline) {
   const now = await clockNow($, next.signal)
   if (now === ABORTED) return ABORTED
-  const ms = Math.min(deadline - now, next.budget.remainingMs - BUDGET_MARGIN_MS)
-  return boundedWait(promise, ms, (sleepMs, options) => hostSleep($, sleepMs, options), next.signal)
+  return Math.min(deadline - now, next.budget.remainingMs - BUDGET_MARGIN_MS)
+}
+
+function waitFor($, ctx, next, ms, promise) {
+  return boundedWait(promise, ms, (sleepMs, options) => hostSleep($, ctx, sleepMs, options), next.signal)
+}
+
+async function waitUntil($, ctx, next, deadline, promise) {
+  const ms = await waitMs($, next, deadline)
+  if (ms === ABORTED) return ABORTED
+  return waitFor($, ctx, next, ms, promise)
 }
 
 // Once a dispatch has shown text, an earlier one of the same message shows nothing more: the engine
@@ -272,19 +302,31 @@ async function showBatch($, ctx, d, next) {
   const pipe = ctx.display
   const deadline = await dispatchDeadline($, next, false)
   if (deadline === ABORTED) return {}
-  const previous = await waitUntil($, next, deadline, d.prevTurn)
+  const previous = await waitUntil($, ctx, next, deadline, d.prevTurn)
   if (previous === ABORTED || d.abandoned) return {}
   if (previous === DEADLINE) debug($, 'display: an earlier batch of the message was still busy at the deadline')
 
+  const heldBack = 'display: deadline reached; untranslated blocks are held for a later batch'
   while (hasUnsettled(d)) {
+    // Checked before popping: a help-run started with no time left would only run on after return.
+    const ms = await waitMs($, next, deadline)
+    if (ms === ABORTED || next.signal.aborted || d.abandoned) return {}
+    if (ms <= 0) {
+      debug($, heldBack)
+      break
+    }
     const job = popIfIdle(pipe)
     if (job) debug($, 'display: help-run, translating the next queued block in the batch')
-    const waited = job
-      ? await waitUntil($, next, deadline, runJob(pipe, job, translateJob($, ctx)))
-      : await waitUntil($, next, deadline, Promise.race([whenSettled(d), waitForWork(pipe)]))
+    const waited = await waitFor(
+      $,
+      ctx,
+      next,
+      ms,
+      job ? runJob(pipe, job, translateJob($, ctx)) : Promise.race([whenSettled(d), waitForWork(pipe)]),
+    )
     if (waited === ABORTED || d.abandoned) return {}
     if (waited === DEADLINE) {
-      debug($, 'display: deadline reached; untranslated blocks are held for a later batch')
+      debug($, heldBack)
       break
     }
   }
@@ -302,24 +344,36 @@ async function takeOver($, ctx, d, slots, next) {
   if (slots.length === 0) return true
   const pipe = ctx.display
   beginTakeover(pipe)
+  const started = Date.now()
+  // Asked before every daemon call, history-halving reruns included, so the takeover stays within
+  // its time and starts nothing while a prompt translates.
+  const nextCall = () => {
+    if (pipe.inputActive > 0) return { stopReason: INPUT_FIRST_REASON }
+    const timeoutMs = takeoverTimeoutMs(started, Date.now(), OUTPUT_TIMEOUT_MS)
+    return timeoutMs === null ? { stopReason: MISSED_REASON } : { timeoutMs }
+  }
+  const stopped = (reason, left) => debug($, `display: takeover stopped (${reason}); ${left} block(s) shown as written`)
   try {
-    const started = Date.now()
     for (const [i, slot] of slots.entries()) {
-      if (next.signal.aborted || d.abandoned) return false
-      const timeoutMs = takeoverTimeoutMs(started, Date.now(), OUTPUT_TIMEOUT_MS)
-      const stopReason = pipe.inputActive > 0 ? INPUT_FIRST_REASON : timeoutMs === null ? MISSED_REASON : undefined
-      if (stopReason !== undefined) {
-        debug($, `display: takeover stopped (${stopReason}); ${slots.length - i} block(s) shown as written`)
-        for (const rest of slots.slice(i)) settle(rest, { text: rest.block.text, failReason: stopReason })
-        return true
+      if (next.signal.aborted || d.abandoned) {
+        stopped(next.signal.aborted ? 'aborted' : 'abandoned', slots.length - i)
+        return false
       }
       let result
       try {
-        result = await untilAborted(translateBlock($, ctx, slot, { timeoutMs }), next.signal)
+        result = await untilAborted(translateBlock($, ctx, slot, { nextCall }), next.signal)
       } catch (err) {
         result = { text: slot.block.text, failReason: err?.message || 'error' }
       }
-      if (result === ABORTED) return false
+      if (result === ABORTED) {
+        stopped('aborted', slots.length - i)
+        return false
+      }
+      if (result.stopped) {
+        stopped(result.failReason, slots.length - i)
+        for (const rest of slots.slice(i)) settle(rest, { text: rest.block.text, failReason: result.failReason })
+        return true
+      }
       settle(slot, result)
     }
     return true
@@ -332,14 +386,14 @@ async function takeOver($, ctx, d, slots, next) {
 async function finishMessage($, ctx, d, next) {
   const deadline = await dispatchDeadline($, next, true)
   if (deadline === ABORTED) return false
-  const previous = await waitUntil($, next, deadline, d.prevTurn)
+  const previous = await waitUntil($, ctx, next, deadline, d.prevTurn)
   if (previous === ABORTED || d.abandoned) return false
   if (previous === DEADLINE) debug($, 'display: an earlier batch of the message was still busy at the final deadline')
 
   const claimed = cancelQueued(ctx.display, d.state)
   const inFlight = runningSlot(d.state)
   if (inFlight) {
-    const waited = await waitUntil($, next, deadline, inFlight.settled)
+    const waited = await waitUntil($, ctx, next, deadline, inFlight.settled)
     if (waited === ABORTED || d.abandoned) return false
     if (waited === DEADLINE) debug($, 'display: an in-flight block missed the final deadline; shown as written')
   }
@@ -376,6 +430,7 @@ export function register(on, options) {
     display: createPipeline({ flushLines: cfg.flushLines }),
     historySlots: new Set(),
     workerGen: 0,
+    sleepRefusalLogged: false,
     shownSeq: new WeakMap(),
     finishing: new WeakSet(),
   }
@@ -384,6 +439,7 @@ export function register(on, options) {
 
   on('session.start', async ($, e, next) => {
     ctx.memory.clear()
+    ctx.sleepRefusalLogged = false
     startDisplayWorker($, ctx)
     await loadEnabled($, ctx)
     await $.command.register(COMMAND)
@@ -430,7 +486,10 @@ export function register(on, options) {
   })
 
   on('prompt.submit', async ($, e, next) => {
-    if (!isTypedByUser(e) || isPassthroughCommand(e.text) || !(await isEnabled($, ctx))) return next(e)
+    if (!isTypedByUser(e) || isPassthroughCommand(e.text)) return next(e)
+    const enabled = await untilAborted(isEnabled($, ctx), next.signal)
+    if (enabled === ABORTED) return { drop: DROP_REASON }
+    if (!enabled) return next(e)
     return submitJapanese($, ctx, e, next)
   }).catch(async ($, e, next) => {
     if (next.called) return next(e)
@@ -438,7 +497,11 @@ export function register(on, options) {
   })
 
   on('classic.MessageDisplay', async ($, e, next) => {
-    if (ctx.enabled === undefined && (await untilAborted(loadEnabledOnce($, ctx), next.signal)) === ABORTED) return {}
+    if (ctx.enabled === undefined) {
+      // The read may be another dispatch's, so waiting on it is metered like any other wait.
+      const loaded = await waitFor($, ctx, next, next.budget.remainingMs - BUDGET_MARGIN_MS, loadEnabledOnce($, ctx))
+      if (loaded === ABORTED || loaded === DEADLINE) return {}
+    }
     if (!ctx.enabled) {
       const state = ctx.display.messages.get(e.message_id)
       if (!state) return next(e)
@@ -463,15 +526,18 @@ export function register(on, options) {
     if (!d) {
       if (next.called) return next(e)
       const state = pipe.messages.get(e.message_id)
+      debug($, `display: rescue (${next.error?.kind}) before the batch arrived; held text and the batch shown as written`)
       $.ui.toast(RESCUE_NOTICE)
       return { displayContent: (state ? release(pipe, state) : '') + e.delta }
     }
     if (overtaken(ctx, d)) {
       abandon(d)
+      debug($, `display: rescue (${next.error?.kind}) of an overtaken batch; a later batch shows its text`)
       return { displayContent: '' }
     }
     const text = rescue(pipe, d, { final: e.final })
     markShown(ctx, d)
+    debug($, `display: rescue (${next.error?.kind}); ${text.length} held character(s) shown as written`)
     $.ui.toast(RESCUE_NOTICE)
     return { displayContent: text }
   })

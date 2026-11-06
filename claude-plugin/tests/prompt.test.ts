@@ -271,23 +271,40 @@ interface ClockedHarness {
   runs: Run[]
   finished: string[]
   answers: string[]
-  slow: (run: Run) => boolean
+  toasts: string[]
+  tooLong: Set<string>
+  slow: (run: Run) => boolean | number
 }
 
 // The fakes answer on the mock clock: the harness holds every hook to its budget in real time.
-function setupClocked(on: any, slow: (run: Run) => boolean): ClockedHarness {
-  const h: ClockedHarness = { clock: mock.clock(on), runs: [], finished: [], answers: [], slow }
+// `slow` answers true for a 30 s run, or the run's length in milliseconds.
+function setupClocked(on: any, slow: (run: Run) => boolean | number): ClockedHarness {
+  const h: ClockedHarness = {
+    clock: mock.clock(on),
+    runs: [],
+    finished: [],
+    answers: [],
+    toasts: [],
+    tooLong: new Set(),
+    slow,
+  }
   mock.env(on, { TMPDIR: '/tmp/' })
   on('session.start', () => ({ cwd: '/work' }))
   on('command.register', () => ({ value: undefined }))
   on('ui.status', () => ({ value: undefined }))
+  on('ui.toast', ($: unknown, e: { text: string }) => {
+    h.toasts.push(e.text)
+    return { value: undefined }
+  })
   on('session.id', () => ({ value: 'sess1' }))
   on('fs.write', () => ({ value: undefined }))
   on('process.run', async ($: unknown, e: Run) => {
     h.runs.push(e)
-    if (h.slow(e)) await h.clock.sleep(30000)
+    const delay = h.slow(e)
+    if (delay) await h.clock.sleep(delay === true ? 30000 : delay)
     const text = e.init.stdin ?? ''
     h.finished.push(text)
+    if (h.tooLong.has(text)) return { value: { exitCode: 1, stdout: '', stderr: 'error: context_too_long: x\n' } }
     const translation = e.argv[e.argv.indexOf('-s') + 1] === 'ja' ? `EN<${text}>` : `JA:${text}`
     return { value: { exitCode: 0, stdout: done(translation), stderr: '' } }
   })
@@ -301,16 +318,16 @@ function setupClocked(on: any, slow: (run: Run) => boolean): ClockedHarness {
 }
 
 let displayIndex = 0
-const display = ($: any, delta: string) =>
+const display = ($: any, delta: string, message_id = 'm1', final = false) =>
   $.classic.MessageDisplay({
     hook_event_name: 'MessageDisplay',
     session_id: 's',
     transcript_path: '/t',
     cwd: '/w',
     turn_id: 't1',
-    message_id: 'm1',
+    message_id,
     index: displayIndex++,
-    final: false,
+    final,
     delta,
   })
 
@@ -342,4 +359,26 @@ test('a prompt translation pauses the display worker', async ($, on) => {
   expect(await prompt).toEqual({ text: 'EN<直して>' })
   await h.clock.settle()
   expect(h.runs.map((r) => r.init.stdin)).toEqual(['直して', 'A.'])
+})
+
+test('a takeover does not rerun a block while a prompt translates', async ($, on) => {
+  const delays: Record<string, number> = { 'Slow.': 100000, 'Long.': 30000, '二つ目': 40000 }
+  const h = setupClocked(on, (run) => delays[run.init.stdin ?? ''] ?? 0)
+  h.tooLong.add('Long.')
+  await turnOn($)
+  await submit($, '一つ目')
+  const busy = display($, 'Slow.\n\n', 'm0')
+  await h.clock.settle()
+  await h.clock.advance(2000)
+  expect(await busy).toEqual({ displayContent: '' })
+  const last = display($, 'Long.', 'm1', true)
+  await h.clock.settle()
+  const prompt = submit($, '二つ目')
+  await h.clock.settle()
+  await h.clock.advance(30000)
+  expect(await last).toEqual({ displayContent: 'Long.' })
+  expect(h.runs.filter((r) => r.init.stdin === 'Long.').length).toBe(1)
+  expect(h.toasts).toEqual(['一部の段落を英語のまま表示しました (1 件: 入力の翻訳を優先)。'])
+  await h.clock.advance(10000)
+  expect(await prompt).toEqual({ text: 'EN<二つ目>' })
 })

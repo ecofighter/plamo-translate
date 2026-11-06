@@ -185,6 +185,7 @@ interface ClockedHarness {
   runs: Run[]
   events: string[]
   toasts: string[]
+  logs: string[]
   slow: Set<string>
   failing: Set<string>
 }
@@ -196,6 +197,7 @@ function setupClocked(on: any): ClockedHarness {
     runs: [],
     events: [],
     toasts: [],
+    logs: [],
     slow: new Set(['Slow.']),
     failing: new Set(),
   }
@@ -207,6 +209,10 @@ function setupClocked(on: any): ClockedHarness {
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', ($: unknown, e: { text: string }) => {
     h.toasts.push(e.text)
+    return { value: undefined }
+  })
+  on('ui.log', ($: unknown, e: { text: string }) => {
+    h.logs.push(e.text)
     return { value: undefined }
   })
   on('session.id', () => ({ value: 'sess1' }))
@@ -312,6 +318,11 @@ test("a new turn drops an unfinished message's queued blocks", async ($, on) => 
 
 test('a repeated session start keeps one worker', async ($, on) => {
   const h = setup(on)
+  const logs: string[] = []
+  on('ui.log', ($: unknown, e: { text: string }) => {
+    logs.push(e.text)
+    return { value: undefined }
+  })
   await turnOn($)
   await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
   await show($, 'm1', 'Seed.\n\n')
@@ -319,4 +330,21 @@ test('a repeated session start keeps one worker', async ($, on) => {
   const [a, b] = await Promise.all([show($, 'm1', 'First.\n\n'), show($, 'm1', 'Second.\n\n')])
   expect([a, b]).toEqual([{ displayContent: 'JA:First.\n\n' }, { displayContent: 'JA:Second.\n\n' }])
   expect(h.events).toEqual(['write', 'run', 'write', 'run'])
+  expect(logs.filter((l) => l.includes('display worker superseded')).length).toBe(1)
+})
+
+test('a failed worker job leaves a debug line', async ($, on) => {
+  const h = setupClocked(on)
+  h.failing.add('Bad.')
+  await turnOn($)
+  expect(await show($, 'm1', 'Bad.\n\n')).toEqual({ displayContent: 'Bad.\n\n' })
+  expect(h.logs).toContain('plamo-ja-bridge: worker job failed: model_load_failed: x')
+})
+
+test('a rescued batch leaves a debug line and a notice', async ($, on) => {
+  const h = setupClocked(on)
+  on('state.get', () => ({ deny: 'broken' }))
+  expect(await show($, 'm1', 'Hello.\n\n')).toEqual({ displayContent: 'Hello.\n\n' })
+  expect(h.toasts).toEqual(['表示の翻訳でエラーが起きたため英語のまま表示しました。'])
+  expect(h.logs.some((l) => l.includes('rescue'))).toBe(true)
 })
