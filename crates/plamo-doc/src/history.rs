@@ -3,7 +3,7 @@ use plamo_client::HistoryEntry;
 /// Picks the history sent with one request: the newest pair always (unless the budget is 0),
 /// then older pairs while the total `source.len() + translation.len()` stays within
 /// `budget_bytes`. The result is a contiguous suffix of `pool`, oldest first.
-pub(crate) fn select_history(pool: &[HistoryEntry], budget_bytes: usize) -> Vec<HistoryEntry> {
+pub fn select_history(pool: &[HistoryEntry], budget_bytes: usize) -> Vec<HistoryEntry> {
     if budget_bytes == 0 {
         return Vec::new();
     }

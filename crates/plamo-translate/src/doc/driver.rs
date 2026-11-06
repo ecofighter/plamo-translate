@@ -2,7 +2,6 @@
 //! The driver works only through `DocUnit` and `Item`; only `doc/mod.rs` names the
 //! `segment::*` types (the adapter).
 
-use super::history::select_history;
 use crate::ExitCode;
 use crate::translate::{Progress, write_daemon_error, write_error};
 use futures::StreamExt;
@@ -10,6 +9,7 @@ use plamo_client::{
     Client, Error, ErrorCode, Event, HistoryEntry, TranslateRequest, append_history,
     check_history_eligible, drop_oldest_half,
 };
+use plamo_doc::select_history;
 use std::io::Write;
 use std::path::PathBuf;
 

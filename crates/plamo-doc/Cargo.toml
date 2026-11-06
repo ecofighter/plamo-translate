@@ -1,0 +1,16 @@
+[package]
+name = "plamo-doc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+plamo-client = { path = "../plamo-client" }
+futures = "0.3"
+pulldown-cmark = { version = "0.13", default-features = false }
+tokio = { version = "1", features = ["time"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros", "time", "net", "io-util"] }

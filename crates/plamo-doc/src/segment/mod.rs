@@ -25,18 +25,19 @@ mod plain;
 use std::fmt;
 use std::ops::Range;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, clap::ValueEnum)]
-pub enum FormatArg {
-    #[default]
-    Auto,
-    Text,
-    Markdown,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
     Text,
     Markdown,
+}
+
+impl Format {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Format::Text => "text",
+            Format::Markdown => "markdown",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -94,6 +95,33 @@ pub enum NoteKind {
     IndentedCode,
     HtmlText,
     ReservedMarker,
+}
+
+impl NoteKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NoteKind::IndentedCode => "indented_code",
+            NoteKind::HtmlText => "html",
+            NoteKind::ReservedMarker => "reserved_marker",
+        }
+    }
+}
+
+impl fmt::Display for Note {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let line = self.line;
+        match self.kind {
+            NoteKind::IndentedCode => write!(
+                f,
+                "line {line}: indented block left untranslated as code (use --format text if it is prose)"
+            ),
+            NoteKind::HtmlText => write!(f, "line {line}: HTML block left untranslated"),
+            NoteKind::ReservedMarker => write!(
+                f,
+                "line {line}: block left untranslated: contains reserved marker text"
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1244,16 +1272,5 @@ pub(super) mod tests {
         };
         assert_eq!(finished.issues.len(), 1);
         assert!(finished.text.is_empty());
-    }
-
-    #[test]
-    fn format_arg_defaults_to_auto() {
-        use clap::ValueEnum;
-        assert_eq!(FormatArg::default(), FormatArg::Auto);
-        let names: Vec<String> = FormatArg::value_variants()
-            .iter()
-            .map(|v| v.to_possible_value().unwrap().get_name().to_owned())
-            .collect();
-        assert_eq!(names, ["auto", "text", "markdown"]);
     }
 }

@@ -619,6 +619,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "plamo-doc"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "plamo-client",
+ "pulldown-cmark",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "plamo-translate"
 version = "0.1.0"
 dependencies = [
@@ -628,9 +639,9 @@ dependencies = [
  "insta",
  "libc",
  "plamo-client",
+ "plamo-doc",
  "plist",
  "predicates",
- "pulldown-cmark",
  "serde_json",
  "tempfile",
  "tokio",

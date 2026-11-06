@@ -1,6 +1,4 @@
 mod driver;
-mod history;
-mod segment;
 
 use crate::EXIT_INTERRUPTED;
 use crate::ExitCode;
@@ -8,17 +6,25 @@ use crate::translate::{Progress, RequestOpts, load_opts, read_history, usage_err
 use clap::Args;
 use driver::{ClientBackend, DocUnit, Item, Job, Outcome, UnitError, UnitIssue, drive};
 use plamo_client::{Client, Config, TranslateRequest, resolve_target};
-use segment::{Format, FormatArg, Issue, Limits, NoteKind, Segment};
+use plamo_doc::{FinishError, Format, Issue, Limits, NoteKind, Segment, Unit};
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, clap::ValueEnum)]
+enum FormatArg {
+    #[default]
+    Auto,
+    Text,
+    Markdown,
+}
 
 #[derive(Args)]
 pub struct DocArgs {
     #[command(flatten)]
     opts: RequestOpts,
     /// Input format
-    #[arg(long, value_enum, default_value_t = segment::FormatArg::Auto)]
-    format: segment::FormatArg,
+    #[arg(long, value_enum, default_value_t = FormatArg::Auto)]
+    format: FormatArg,
     /// JSONL history that seeds the run: {"source": ..., "translation": ...} per line, oldest first
     #[arg(long, value_name = "FILE")]
     history: Option<PathBuf>,
@@ -36,17 +42,17 @@ pub struct DocArgs {
     history_bytes: usize,
 }
 
-impl DocUnit for segment::Unit {
+impl DocUnit for Unit {
     fn source(&self) -> String {
-        segment::Unit::source(self).to_owned()
+        Unit::source(self).to_owned()
     }
 
     fn text(&self) -> String {
-        segment::Unit::text(self)
+        Unit::text(self)
     }
 
     fn finish(&self, raw: &str) -> Result<Outcome, UnitError> {
-        match segment::Unit::finish(self, raw) {
+        match Unit::finish(self, raw) {
             Ok(finished) => Ok(Outcome {
                 text: finished.text,
                 issues: finished
@@ -58,25 +64,25 @@ impl DocUnit for segment::Unit {
                     })
                     .collect(),
             }),
-            Err(segment::FinishError::Empty) => Err(UnitError::Empty),
-            Err(segment::FinishError::Placeholders) => Err(UnitError::Markers),
+            Err(FinishError::Empty) => Err(UnitError::Empty),
+            Err(FinishError::Placeholders) => Err(UnitError::Markers),
         }
     }
 
     fn history_pair(&self, raw: &str) -> Option<(String, String)> {
-        segment::Unit::history_pair(self, raw)
+        Unit::history_pair(self, raw)
     }
 }
 
-fn into_item(segment: Segment) -> Item<segment::Unit> {
+fn into_item(segment: Segment) -> Item<Unit> {
     match segment {
         Segment::Keep(s) => Item::Keep(s),
         Segment::Translate(u) => Item::Unit(u),
     }
 }
 
-fn split_adapter(unit: &segment::Unit) -> Option<Vec<Item<segment::Unit>>> {
-    segment::split_unit(unit).map(|segments| segments.into_iter().map(into_item).collect())
+fn split_adapter(unit: &Unit) -> Option<Vec<Item<Unit>>> {
+    plamo_doc::split_unit(unit).map(|segments| segments.into_iter().map(into_item).collect())
 }
 
 pub async fn run(client: &Client, config: &Config, args: DocArgs) -> i32 {
@@ -106,11 +112,11 @@ pub async fn run(client: &Client, config: &Config, args: DocArgs) -> i32 {
     let record = args.history.filter(|_| args.history_append);
     let auto = args.format == FormatArg::Auto;
     let format = match args.format {
-        FormatArg::Auto => segment::detect_format(&input),
+        FormatArg::Auto => plamo_doc::detect_format(&input),
         FormatArg::Text => Format::Text,
         FormatArg::Markdown => Format::Markdown,
     };
-    let split = segment::split(&input, format, &Limits::default());
+    let split = plamo_doc::split(&input, format, &Limits::default());
 
     let mut stderr = std::io::stderr();
     if auto {
@@ -207,5 +213,21 @@ pub async fn run(client: &Client, config: &Config, args: DocArgs) -> i32 {
             progress.clear();
             EXIT_INTERRUPTED
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_arg_defaults_to_auto() {
+        use clap::ValueEnum;
+        assert_eq!(FormatArg::default(), FormatArg::Auto);
+        let names: Vec<String> = FormatArg::value_variants()
+            .iter()
+            .map(|v| v.to_possible_value().unwrap().get_name().to_owned())
+            .collect();
+        assert_eq!(names, ["auto", "text", "markdown"]);
     }
 }
