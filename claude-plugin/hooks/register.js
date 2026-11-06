@@ -226,6 +226,8 @@ function runDoc($, ctx, { text, direction, timeoutMs, pauseDisplay = false }, si
   }
   if (paused) beginInput(ctx.display)
   const run = execDoc($, ctx, { text, direction, timeoutMs }).finally(resumeDisplay)
+  // The display worker has no dispatch, so nothing can abort its run.
+  if (!signal) return run
   return untilAborted(run, signal).then((r) => {
     if (r !== ABORTED) return r
     resumeDisplay()
@@ -357,22 +359,67 @@ async function submitJapanese($, ctx, e, next) {
   })
 }
 
-// A block that cannot be translated is shown as written: the display is the only thing at stake.
-// The pair goes to memory even when the result comes too late to be shown.
-async function translateBlock($, ctx, slot, { nextCall }) {
-  const { block } = slot
-  const { lead, core, trail } = splitEdges(block.text)
-  if (core === '' || isMostlyJapanese(core)) return { text: block.text }
-  const result = await translateNow($, ctx, core, 'en-ja', nextCall)
-  if (!result.ok) return { text: block.text, failReason: result.reason, stopped: result.stopped === true }
-  const ja = result.text.trim()
-  if (block.kind === 'table' && !tableShapeMatches(core, ja)) return { text: block.text, failReason: TABLE_SHAPE_REASON }
-  if (isEligiblePair(core, ja, result.finishReason)) ctx.memory.add({ ja, en: core })
-  return { text: lead + ja + trail }
+// Returns null when doc turned out to be unavailable, so the caller decides what to show.
+// `singleReason` is what a failed doc run reports, when a single call failed first.
+async function translateBlockWithDoc($, ctx, block, { lead, core, trail }, { nextCall, signal }, singleReason) {
+  const { timeoutMs, stopReason } = await nextCall(docTimeoutMs(utf8Bytes(core)))
+  if (stopReason !== undefined) return { text: block.text, failReason: stopReason, stopped: true }
+  const doc = await runDoc($, ctx, { text: core, direction: 'en-ja', timeoutMs }, signal)
+  if (doc.unsupported) return null
+  if (!doc.ok) {
+    debug($, `display: doc failed (${doc.reason}); block shown as written`)
+    return { text: block.text, failReason: singleReason ?? doc.reason }
+  }
+  const ja = doc.text.trim()
+  if (block.kind === 'table' && !tableShapeMatches(core, ja)) {
+    return { text: block.text, failReason: singleReason ?? TABLE_SHAPE_REASON }
+  }
+  const partial = (doc.degraded ?? 0) > 0
+  const small = core.length + ja.length <= Math.floor(ctx.cfg.historyChars / 2)
+  if (!partial && doc.notes === 0 && small && isEligiblePair(core, ja, 'stop')) ctx.memory.add({ ja, en: core })
+  return { text: lead + ja + trail, partial }
 }
 
-const translateJob = ($, ctx) => (slot) =>
-  translateBlock($, ctx, slot, { nextCall: fixedTimeout(OUTPUT_TIMEOUT_MS) })
+// A block that cannot be translated is shown as written: the display is the only thing at stake.
+// The pair goes to memory even when the result comes too late to be shown.
+// `nextCall(callMax)` gives each daemon call its timeout, at most `callMax`, or a reason to stop.
+async function translateBlock($, ctx, slot, { nextCall, signal }) {
+  const { block } = slot
+  const edges = splitEdges(block.text)
+  const { lead, core, trail } = edges
+  if (core === '' || isMostlyJapanese(core)) return { text: block.text }
+  const calls = { nextCall, signal }
+
+  if (slot.heavy && docAvailable(ctx)) {
+    debug($, `display: ${utf8Bytes(core)} bytes in one block; translating it with doc`)
+    const doc = await translateBlockWithDoc($, ctx, block, edges, calls, undefined)
+    if (doc) return doc
+    debug($, 'display: doc is unavailable; translating the long block with a single call')
+  }
+
+  const result = await translateNow($, ctx, core, 'en-ja', () => nextCall(OUTPUT_TIMEOUT_MS))
+  if (result.stopped) return { text: block.text, failReason: result.reason, stopped: true }
+  let failReason
+  if (!result.ok) {
+    if (!worthDoc(result)) return { text: block.text, failReason: result.reason }
+    failReason = result.reason
+  } else {
+    const ja = result.text.trim()
+    if (block.kind !== 'table' || tableShapeMatches(core, ja)) {
+      if (isEligiblePair(core, ja, result.finishReason)) ctx.memory.add({ ja, en: core })
+      return { text: lead + ja + trail }
+    }
+    failReason = TABLE_SHAPE_REASON
+  }
+  if (!docAvailable(ctx)) return { text: block.text, failReason }
+  debug($, `display: single call failed (${failReason}); translating the block with doc`)
+  return (await translateBlockWithDoc($, ctx, block, edges, calls, failReason)) ?? { text: block.text, failReason }
+}
+
+// Outside a takeover a call is bounded only by its own kind's limit.
+const uncapped = (callMax) => ({ timeoutMs: callMax })
+
+const translateJob = ($, ctx) => (slot) => translateBlock($, ctx, slot, { nextCall: uncapped })
 
 // Display translations run here, outside any dispatch, so no dispatch waits on them past its budget.
 // A newer session.start bumps the generation, and the older loop ends at its next turn.
@@ -507,11 +554,11 @@ async function takeOver($, ctx, d, slots, next) {
     }
     // Asked before every daemon call, history-halving reruns included, so the takeover stays within
     // its time and starts nothing while a prompt translates.
-    const nextCall = async () => {
+    const nextCall = async (callMax) => {
       const now = await clockNow($, next.signal)
       if (now === ABORTED) return { stopReason: ABORTED_REASON }
       if (pipe.inputActive > 0) return { stopReason: INPUT_FIRST_REASON }
-      const timeoutMs = takeoverTimeoutMs(started, now, OUTPUT_TIMEOUT_MS)
+      const timeoutMs = takeoverTimeoutMs(started, now, callMax)
       return timeoutMs === null ? { stopReason: MISSED_REASON } : { timeoutMs }
     }
     for (const [i, slot] of slots.entries()) {
@@ -521,7 +568,7 @@ async function takeOver($, ctx, d, slots, next) {
       }
       let result
       try {
-        result = await untilAborted(translateBlock($, ctx, slot, { nextCall }), next.signal)
+        result = await untilAborted(translateBlock($, ctx, slot, { nextCall, signal: next.signal }), next.signal)
       } catch (err) {
         result = { text: slot.block.text, failReason: err?.message || 'error' }
       }

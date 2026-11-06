@@ -1,4 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
+import { docTimeoutMs, utf8Bytes } from '../hooks/lib/doc.js'
 
 type Run = { argv: string[]; init: { stdin?: string; timeoutMs?: number } }
 
@@ -435,4 +436,70 @@ test('a streaming batch starts no help-run with too little time left', async ($,
   expect(await second).toEqual({ displayContent: 'JA:Slow.\n\n' })
   expect(h.runs.map((r) => r.init.stdin)).toEqual(['Slow.'])
   expect(await show($, 'm1', '', true)).toEqual({ displayContent: 'JA:Next.\n\n' })
+})
+
+const reportLine = (o: object) => JSON.stringify(o) + '\n'
+const docReply = (stdout: string, summary: object = {}): Reply => ({
+  exitCode: 0,
+  stdout,
+  stderr: reportLine({ type: 'summary', v: 1, exit_code: 0, complete: true, degraded: 0, pieces: 1, ...summary }),
+})
+const singleReply = (text: string, finish_reason = 'stop'): Reply => ({
+  exitCode: 0,
+  stdout: JSON.stringify({ type: 'done', text, finish_reason, model: 'm', revision: 'r', usage: {} }) + '\n',
+  stderr: '',
+})
+const isDoc = (run: Run) => run.argv[1] === 'doc'
+const DOC_ARGV = ['plamo-translate', 'doc', '--report', 'json', '-s', 'en', '-t', 'ja', '--format', 'markdown']
+
+test('a truncated block falls back to doc', async ($, on) => {
+  const h = setupTimed(on)
+  h.reply = (run) => (isDoc(run) ? docReply(`DOC:${run.init.stdin}\n`) : singleReply('途中まで', 'length'))
+  await turnOn($)
+  expect(await show($, 'm1', 'Hello.\n\n')).toEqual({ displayContent: 'DOC:Hello.\n\n' })
+  expect(h.runs.map((r) => isDoc(r))).toEqual([false, true])
+  expect(h.runs[1].argv).toEqual(DOC_ARGV)
+  expect(h.runs[1].init.stdin).toBe('Hello.')
+  expect(h.runs[1].init.timeoutMs).toBe(docTimeoutMs(utf8Bytes('Hello.')))
+  expect(await show($, 'm1', '', true)).toEqual({ displayContent: '' })
+  expect(h.toasts).toEqual([])
+})
+
+test('an oversize block is translated with doc by the final batch', async ($, on) => {
+  const h = setupTimed(on)
+  h.reply = (run) => (isDoc(run) ? docReply('長い段落の訳。\n') : singleReply(`JA:${run.init.stdin}`))
+  await turnOn($)
+  const long = 'This sentence makes the paragraph long. '.repeat(200).trim()
+  expect(utf8Bytes(long)).toBeGreaterThan(6000)
+  expect(await show($, 'm1', long + '\n\n')).toEqual({ displayContent: '' })
+  expect(h.runs).toEqual([])
+  expect(await show($, 'm1', '', true)).toEqual({ displayContent: '長い段落の訳。\n\n' })
+  expect(h.runs.length).toBe(1)
+  expect(h.runs[0].argv).toEqual(DOC_ARGV)
+  expect(h.runs[0].init.stdin).toBe(long)
+  expect(h.runs[0].init.timeoutMs).toBeLessThanOrEqual(60000)
+  expect(h.toasts).toEqual([])
+})
+
+test('degraded doc output is shown and noted', async ($, on) => {
+  const h = setupTimed(on)
+  h.reply = (run) =>
+    isDoc(run)
+      ? { ...docReply('一部だけ訳した。\n', { exit_code: 1, degraded: 1, pieces: 2 }), exitCode: 1 }
+      : singleReply('途中まで', 'length')
+  await turnOn($)
+  expect(await show($, 'm1', 'Hello.\n\n')).toEqual({ displayContent: '一部だけ訳した。\n\n' })
+  expect(await show($, 'm1', '', true)).toEqual({ displayContent: '' })
+  expect(h.toasts).toEqual(['一部の段落を英語のまま表示しました (1 件: partial)。'])
+})
+
+test('a table whose shape changed is retried with doc', async ($, on) => {
+  const h = setupTimed(on)
+  h.reply = (run) => (isDoc(run) ? docReply('| あ | い |\n|---|---|\n') : singleReply('| あ い |\n|---|---|'))
+  await turnOn($)
+  const table = '| a | b |\n|---|---|\n'
+  expect(await show($, 'm1', table + '\n')).toEqual({ displayContent: '| あ | い |\n|---|---|\n\n' })
+  expect(h.runs.map((r) => isDoc(r))).toEqual([false, true])
+  expect(await show($, 'm1', '', true)).toEqual({ displayContent: '' })
+  expect(h.toasts).toEqual([])
 })
