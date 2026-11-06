@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::time::Instant;
 
-pub const DOCUMENT_DESCRIPTION: &str = "Translate a whole plain-text or Markdown document with the local PLaMo-3-translate model, piece by piece with rolling history so terms stay consistent. Code blocks and HTML are kept verbatim; the output keeps the source structure. Pass the document as text (it then appears in this conversation twice: as the argument and as the result), or as input_path (absolute) to avoid that; pass output_path (absolute) to write the result to a file and get a short summary instead of the text (an existing output_path needs overwrite=true; a stale output_path.part from an earlier failed call is replaced). Use history_path + history_append to keep terminology across several calls on the same document. target_lang, source_lang, context, glossary and form work as in translate. The result's first content block is the translation (or the write summary); a second block with note:/warning: lines describes pieces that could not be translated fully (their source text is kept in place) and is not part of the translation. If the call fails part-way, the error names the piece and the translated part is returned in the second block (text mode) or left in output_path.part (file mode). A document takes seconds per piece; the call fails if the daemon sends nothing for PLAMO_TRANSLATE_MCP_TIMEOUT_SECS (default 300) or runs longer than PLAMO_TRANSLATE_MCP_DOC_TIMEOUT_SECS (default 3600).";
+pub const DOCUMENT_DESCRIPTION: &str = "Translate a whole plain-text or Markdown document with the local PLaMo-3-translate model, piece by piece with rolling history so terms stay consistent. Code blocks and HTML are kept verbatim; the output keeps the source structure. Pass the document as text (it then appears in this conversation twice: as the argument and as the result), or as input_path (absolute) to avoid that; pass output_path (absolute) to write the result to a file and get a short summary instead of the text (an existing output_path needs overwrite=true; a stale output_path.part from an earlier failed call is replaced). Use history_path + history_append to keep terminology across several calls on the same document. target_lang, source_lang, context, glossary and form work as in translate. The result's first content block is the translation (or the write summary); a second block with note:/warning: lines describes pieces that could not be translated fully (their source text is kept in place) and is not part of the translation. If the translation stops at a piece, the error names it and the text translated before it is returned in the second block (text mode) or left in output_path.part (file mode); a stop at a label like 3/5.2 (a part of piece 3) also includes the finished parts of piece 3, so continue from the end of that partial text, not from a piece count. A total timeout or a cancellation returns no text (file mode still leaves output_path.part). A document takes seconds per piece; the call fails if the daemon sends nothing for PLAMO_TRANSLATE_MCP_TIMEOUT_SECS (default 300) or runs longer than PLAMO_TRANSLATE_MCP_DOC_TIMEOUT_SECS (default 3600).";
 
 const DEFAULT_HISTORY_BYTES: u32 = 8000;
 /// Keeps the advisory block readable for a model; the rest is only counted.
@@ -362,17 +362,7 @@ fn stopped(stop: &Stop, out: Out, part: Option<&Path>, event_timeout: Duration) 
     let mut message = stop_cause_text(&stop.cause, event_timeout);
     if let Some(label) = &stop.piece {
         message.push_str(&format!("; stopped at piece {label}"));
-        let translated_before = piece_number(label).saturating_sub(1);
-        match (part, &out) {
-            (Some(part), _) => {
-                message.push_str(&format!("; the pieces before it are in {}", part.display()))
-            }
-            // Nothing translated yet: there is no partial to point at or remainder to continue from.
-            (None, Out::Text(partial)) if translated_before == 0 || partial.is_empty() => {}
-            (None, _) => message.push_str(&format!(
-                "; the {translated_before} pieces before it follow in the next content block; to continue, call again with the untranslated remainder"
-            )),
-        }
+        message.push_str(&partial_hint(label, part, &out));
     }
     let mut blocks = vec![ContentBlock::text(message)];
     if let Out::Text(partial) = out
@@ -381,6 +371,35 @@ fn stopped(stop: &Stop, out: Out, part: Option<&Path>, event_timeout: Duration) 
         blocks.push(ContentBlock::text(partial));
     }
     CallToolResult::error(blocks)
+}
+
+/// Where the text translated before the stop is, and how to continue from it. A label with a
+/// sub-piece (`K/M.s`) means the partial text also holds the finished parts of piece K, so
+/// it is described by what it covers rather than by a count of whole pieces.
+fn partial_hint(label: &str, part: Option<&Path>, out: &Out) -> String {
+    let in_sub_piece = label.contains('.');
+    let translated_before = piece_number(label).saturating_sub(1);
+    match (part, out) {
+        (Some(part), _) if in_sub_piece => format!(
+            "; everything translated before it is in {}, which also holds the finished parts of piece {}",
+            part.display(),
+            piece_number(label)
+        ),
+        (Some(part), _) => format!("; the pieces before it are in {}", part.display()),
+        // Nothing translated yet: there is no partial to point at or remainder to continue from.
+        (None, Out::Text(partial))
+            if partial.is_empty() || (!in_sub_piece && translated_before == 0) =>
+        {
+            String::new()
+        }
+        (None, _) if in_sub_piece => format!(
+            "; everything translated before it follows in the next content block (it also holds the finished parts of piece {}); to continue, call again with the input that follows what that text translates",
+            piece_number(label)
+        ),
+        (None, _) => format!(
+            "; the {translated_before} pieces before it follow in the next content block; to continue, call again with the untranslated remainder"
+        ),
+    }
 }
 
 /// K of a "K/M" or "K/M.s" label.
@@ -637,5 +656,37 @@ mod tests {
         let capped = cap(lines);
         assert_eq!(capped.len(), 51);
         assert_eq!(capped[50], "note: ... and 3 more");
+    }
+
+    fn text_stop(label: &str) -> Stop {
+        Stop {
+            piece: Some(label.into()),
+            cause: StopCause::Client(Error::Io(std::io::Error::other("x"))),
+        }
+    }
+
+    fn first_text(result: &CallToolResult) -> String {
+        serde_json::to_value(&result.content[0]).unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn sub_piece_stop_does_not_promise_whole_pieces() {
+        let out = Out::Text("X1\n\nX2a".into());
+        let result = stopped(&text_stop("2/3.2"), out, None, Duration::from_secs(1));
+        let text = first_text(&result);
+        assert!(text.contains("stopped at piece 2/3.2"), "{text}");
+        assert!(text.contains("everything translated before it"), "{text}");
+        assert!(text.contains("finished parts of piece 2"), "{text}");
+        assert!(!text.contains("1 pieces"), "{text}");
+    }
+
+    #[test]
+    fn sub_piece_stop_in_the_first_piece_still_points_at_the_partial() {
+        let out = Out::Text("X1a".into());
+        let result = stopped(&text_stop("1/3.2"), out, None, Duration::from_secs(1));
+        assert!(first_text(&result).contains("follows in the next content block"));
     }
 }
